@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.cuda.amp import GradScaler, autocast
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 import sys
@@ -282,6 +282,14 @@ def main() -> None:
         default="scannetpp",
         choices=["scannetpp", "eth3d", "7scenes", "hiroom", "dtu"],
     )
+    parser.add_argument(
+        "--datasets",
+        type=str,
+        nargs="+",
+        default=None,
+        choices=["scannetpp", "eth3d", "7scenes", "hiroom", "dtu"],
+        help="Train on multiple benchmark datasets with one shared adapter. Overrides --dataset.",
+    )
     parser.add_argument("--samples_per_scene", type=int, default=4)
     parser.add_argument("--seeds_list", type=int, nargs="+", default=None)
     parser.add_argument("--batch_size", type=int, default=2)
@@ -376,23 +384,28 @@ def main() -> None:
     config.training.device = str(device)
     print(f"Using device: {device}")
     print("\nConfiguration:")
-    print(f"  Dataset: {args.dataset}")
+    train_dataset_names = args.datasets if args.datasets is not None else [args.dataset]
+    print(f"  Dataset(s): {' '.join(train_dataset_names)}")
     print(f"  Teacher views: {config.data.num_views}")
     print(f"  Student views: 4 (indices: {config.data.student_indices})")
     print(f"  Output layers: {config.model.output_layers}")
 
     samples_per_scene = len(args.seeds_list) if args.seeds_list is not None else args.samples_per_scene
     print("\nCreating dataset...")
-    train_dataset = BenchmarkFreeGeometryDataset(
-        dataset_name=args.dataset,
-        num_views=config.data.num_views,
-        image_size=config.data.image_size,
-        student_indices=config.data.student_indices,
-        augment=config.data.augment,
-        samples_per_scene=samples_per_scene,
-        seed=config.training.seed,
-        seeds_list=args.seeds_list,
-    )
+    train_datasets = [
+        BenchmarkFreeGeometryDataset(
+            dataset_name=dataset_name,
+            num_views=config.data.num_views,
+            image_size=config.data.image_size,
+            student_indices=config.data.student_indices,
+            augment=config.data.augment,
+            samples_per_scene=samples_per_scene,
+            seed=config.training.seed,
+            seeds_list=args.seeds_list,
+        )
+        for dataset_name in train_dataset_names
+    ]
+    train_dataset = train_datasets[0] if len(train_datasets) == 1 else ConcatDataset(train_datasets)
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.data.batch_size,

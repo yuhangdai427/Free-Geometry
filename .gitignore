@@ -37,6 +37,10 @@ temp*.png
 # Dataset
 data/
 checkpoints/
+# Local caches, downloaded checkpoints, and external experiment repos
+/.cache/
+/Free-Geo_ckpts/
+/Test3R/
 .claude
 workspace
 results
