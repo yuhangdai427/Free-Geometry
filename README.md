@@ -25,6 +25,7 @@ _Test-time self-evolution for feed-forward 3D reconstruction without 3D ground t
 
 ## 🔄 Updates
 - **2026.04.15:** The Free Geometry paper and code were released.
+- **2026.09.16:** Added the **GT-free test-time adaptation protocol** (per-scene LoRA, long-context teacher → short-context student distillation) with the new loss family — `maskdistill` + `rkd_huber` + `couple` (arm **RKDC1H**) and `maskdistill` + `rel` (arm **maskrel**) — verified champion results on 2 models × 4 datasets, and full protocol/verification docs under `docs/`. See the new [TTA Protocol](#-test-time-adaptation-protocol-gt-free) section.
 
 ## 📦 What This Repo Provides
 
@@ -76,6 +77,73 @@ Free Geometry builds a self-supervised task from a testing sequence by comparing
 </p>
 
 The paper reports consistent gains on four benchmark datasets, with an average improvement of **3.73%** in camera pose accuracy and **2.88%** in point-map prediction. The qualitative figures above highlight the intended effect of Free Geometry: cleaner depth structure, more stable geometry, and improved multiview consistency after adaptation.
+
+## 🧪 Test-Time Adaptation Protocol (GT-free)
+
+This is the protocol used for the current champion results. Per scene, a **frozen long-context teacher** (8–24 views) supervises a **short-context student** (4–8 views) carrying LoRA adapters (r=32, all blocks, camera token trainable on DA3; ≤100 steps, cosine LR, optional early-stop). Frame selection is GT-free: a SIFT-overlap statistic τ (median adjacent-frame match fraction) dispatches between *dense-equidistant* (τ>0.55) and *random-window* sampling; shared student frames always sit at teacher slots `[0,2,4,6]`.
+
+### Key losses
+
+All terms are computed on the **shared frames**; teacher tensors are detached. Notation: `f_s/f_t` = student/teacher patch tokens at the frozen depth head's four input layers (DA3 `[19,27,33,39]`, VGGT `[4,11,17,23]`), compared **after the head's shared LayerNorm**; `c_s/c_t` = camera centers decoded from predicted w2c poses (`c = −Rᵀt`); `d_s/d_t` = predicted depth.
+
+| Loss | Definition | Code |
+|---|---|---|
+| `maskdistill` | Student sees **50% block-masked** images, teacher sees clean images; `Huber(β=1) + 2·(1−cos)` on LN'd tokens, **only on masked patches**, weighted by teacher depth confidence, averaged over the 4 tap layers (MGD/iBOT-style) | `protocol_v1.py: loss_maskdistill` · `train_arms.py: loss_b5_maskdistill` |
+| `rkd_huber` | Relational KD on camera centers, **gauge-free**: mean-normalized pairwise center distances + 12 triangle angles, per-residual `Huber(δ=0.2)` | `protocol_v1.py: loss_rkd_shared_pose_huber_w2c` · `abs_pose_loss.py: loss_rkd_shared_pose_huber` |
+| `couple` | Cross-head **gauge coupling scalar**: `(log(RMS(c_s)/mean(d_s)) − log(RMS(c_t)/mean(d_t)))²` — keeps the pose scale and depth scale from decoupling | `protocol_v1.py: loss_couple_w2c` · `abs_pose_loss.py: loss_couple` |
+| `rel` | Relative pose per view-pair: rotation chordal + translation-direction `1−cos` (scale-free; exactly the functional the AUC@3 metric measures) | `protocol_v1.py: loss_pose_rel` · `train_arms.py: loss_pose_rel` |
+
+**Arms:** `RKDC1H = maskdistill + 1.5·rkd_huber + 1.0·couple` · `maskrel = maskdistill + 1.0·rel`.
+
+### Verified champion results (paired vs frozen baseline)
+
+Mean over scenes of the per-scene relative gain `(TTA − baseline)/baseline`. Eval on **100 views** (benchmark-100, seed 42) when the scene has ≥100 frames, else **all views**. Audit: [docs/RESULTS_VERIFICATION_2026-09-16.md](docs/RESULTS_VERIFICATION_2026-09-16.md) — every cell recomputed exactly from archived runs; footnotes below.
+
+| Model × Dataset | Champion recipe | dAUC@3 | dF1 |
+|---|---|---|---|
+| DA3 × 7scenes | `rkdc1h` + two_stage 0.7 + ratio_mix `8:4,16:4,24:8` + 20 pairs | **+7.62%** | **+5.50%** |
+| DA3 × eth3d | `rkdc1h`, pure 8:4 ‡ | +2.95% | −1.21% |
+| DA3 × hiroom | `rkdc1h`, 8:4 + early_stop | +3.33% | +0.62% |
+| DA3 × scannetpp | saturated ceiling (teacher≈student) | ±0.5% | ±0.4% |
+| VGGT × 7scenes | `maskrel` @100v | +0.62% | **+14.10%** |
+| VGGT × eth3d | `maskrel` @allv | **+32.24%** | **+25.46%** |
+| VGGT × hiroom | `maskrel` @allv † | **+18.54%** | **+18.52%** |
+| VGGT × scannetpp | `RKDC1H` @100v | **+5.50%** | +2.22% |
+
+† AUC averaged over 29 scenes (one baseline-AUC=0 scene excluded), F1 over 30. ‡ The reproducing run has no early-stop (es variants crashed); DA3-scannetpp baseline AUC 0.8467 is already at ceiling. Metrics: AUC@3 = all-pairs relative-pose AUC (max of rotation / translation-direction error, 1° bins, first-camera aligned); F1 = TSDF-fusion point cloud (recon_unposed, RANSAC-Umeyama aligned), 5 cm threshold.
+
+### Running it
+
+**DA3** — one entry point trains and evaluates (AUC + AbsRel + F1 in one inference). Exact champion commands (scene lists are frozen in `artifacts/diagnostics/final_protocol/<ds>/scene_manifest.json`, regenerable via `diagnostics/free_geometry/build_final_manifest.py`):
+
+```bash
+# 7scenes champion: two-stage curriculum (fixed-slot pairs first, endpoint-anchored later)
+python3 scripts/train_da3_protocol.py --dataset 7scenes \
+  --scenes chess fire heads office pumpkin redkitchen stairs \
+  --output_root workspace/da3_7scenes_2stage --steps 100 \
+  --arm rkdc1h --n_train 20 --ratio_mix "8:4,16:4,24:8" \
+  --combo --combo_se_frac 0.5 --two_stage 0.7
+
+# eth3d / hiroom champion: plain 8:4 (teacher_N=8, 4 shared student frames)
+python3 scripts/train_da3_protocol.py --dataset eth3d \
+  --scenes courtyard delivery_area electro facade kicker office pipes playground relief relief_2 terrains \
+  --output_root workspace/da3_protocol_eth3d_t8s4 \
+  --arm rkdc1h --teacher_N 8 --steps 100          # add --early_stop for the hiroom recipe
+```
+Requires: model weights at `model_weights/DA3-GIANT-1.1`, dataset roots as in `docs/BENCHMARK.md`. Outputs: `<output_root>/smoke_summary.json` (all metrics), `training_trace.csv`, per-scene LoRA ckpts.
+
+**VGGT** — three-step chain (train → view-count inference → metrics); example is the 7scenes champion:
+
+```bash
+DG=diagnostics/free_geometry; RR=artifacts/diagnostics/final_protocol/7scenes
+python3 $DG/train_arms.py --run_root $RR --arms C2M_maskrel --epochs 10 --seed 0 --no_eval32
+python3 $DG/eval_viewcounts.py --manifest $RR/scene_manifest.json --ckpt_root $RR/ckpts \
+  --run_root $RR --step 100 --arms C2M_maskrel --view_subsets 100v   # set SKIP_BASELINE=1 once A0 exists
+python3 $DG/run_eval.py --run_root $RR --datas 7scenes --experiments "C2M_maskrel@100v"
+```
+Swap `--arms C2M_RKDC1H` / `--view_subsets 100v|allv` for the scannetpp / small-scene recipes; add `--early_stop` for the v3.2 protocol. Reference launchers: `diagnostics/free_geometry/run_<ds>_<arm>.sh`.
+
+**Protocol docs:** [docs/TTA_PROTOCOL_v3_2026-09-15.md](docs/TTA_PROTOCOL_v3_2026-09-15.md) (VGGT) · [docs/TTA_PROTOCOL_DA3_v1_2026-09-15.md](docs/TTA_PROTOCOL_DA3_v1_2026-09-15.md) (DA3) · [docs/EVAL_AUDIT.md](docs/EVAL_AUDIT.md) (metric chain) · [docs/UNIFIED_PROTOCOL_RESEARCH_NOTES.md](docs/UNIFIED_PROTOCOL_RESEARCH_NOTES.md) (toward a unified, dataset/model-agnostic protocol).
 
 ## 📚 Usage
 
