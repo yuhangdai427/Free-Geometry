@@ -45,3 +45,20 @@ checkpoints/
 workspace
 results
 logs
+
+# Experiment outputs and base model weights (never track)
+/artifacts/
+/model_weights/
+
+# Reference PDFs / screenshots at repo root (docs assets stay tracked)
+/*.pdf
+/*.PDF
+/*.png
+
+# Diagnostics runtime byproducts
+diagnostics/**/__pycache__/
+
+# Local-only working notes (not for publish)
+/docs/OVERNIGHT_RUNBOOK_*.md
+/Free_Geometry_Minimal_Diagnostic_Plan.md
+.zcode/
