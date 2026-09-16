@@ -22,6 +22,7 @@ from depth_anything_3.bench.datasets.sevenscenes import SevenScenes
 from depth_anything_3.bench.datasets.scannetpp import ScanNetPP
 from depth_anything_3.bench.datasets.hiroom import HiRoomDataset
 from depth_anything_3.bench.datasets.dtu import DTU
+from depth_anything_3.bench.datasets.dtu64 import DTU64
 
 
 # ImageNet normalization (same as DA3)
@@ -36,6 +37,7 @@ DATASET_REGISTRY = {
     'scannetpp': ScanNetPP,
     'hiroom': HiRoomDataset,
     'dtu': DTU,
+    'dtu64': DTU64,
 }
 
 
@@ -67,6 +69,7 @@ class BenchmarkFreeGeometryDataset(Dataset):
         seed: int = 42,
         seeds_list: Optional[List[int]] = None,
         first_frame_ref: bool = False,
+        scenes: Optional[List[str]] = None,
     ):
         super().__init__()
 
@@ -90,7 +93,18 @@ class BenchmarkFreeGeometryDataset(Dataset):
         self.benchmark_dataset = DATASET_REGISTRY[dataset_name]()
 
         # Get all scenes (no train/val split - use all scenes)
-        self.scenes = list(self.benchmark_dataset.SCENES)
+        available_scenes = list(self.benchmark_dataset.SCENES)
+        if scenes is None:
+            self.scenes = available_scenes
+        else:
+            requested = list(scenes)
+            unknown = sorted(set(requested) - set(available_scenes))
+            if unknown:
+                raise ValueError(
+                    f"Unknown scenes for {dataset_name}: {unknown}. "
+                    f"Available: {available_scenes}"
+                )
+            self.scenes = requested
 
         if len(self.scenes) == 0:
             raise ValueError(f"No scenes found for {dataset_name}")

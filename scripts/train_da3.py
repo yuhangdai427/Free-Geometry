@@ -161,7 +161,7 @@ def train_epoch(
     args,
     writer: Optional[SummaryWriter] = None,
     cf_distance_criterion: Optional[nn.Module] = None,
-) -> int:
+) -> tuple[int, float]:
     student.train()
     teacher.eval()
 
@@ -270,7 +270,7 @@ def train_epoch(
                 f"checkpoint_step{global_step}.pt",
             )
 
-    return global_step
+    return global_step, total_loss / max(num_batches, 1)
 
 
 def main() -> None:
@@ -280,17 +280,23 @@ def main() -> None:
         "--dataset",
         type=str,
         default="scannetpp",
-        choices=["scannetpp", "eth3d", "7scenes", "hiroom", "dtu"],
+        choices=["scannetpp", "eth3d", "7scenes", "hiroom", "dtu", "dtu64"],
     )
     parser.add_argument(
         "--datasets",
         type=str,
         nargs="+",
         default=None,
-        choices=["scannetpp", "eth3d", "7scenes", "hiroom", "dtu"],
+        choices=["scannetpp", "eth3d", "7scenes", "hiroom", "dtu", "dtu64"],
         help="Train on multiple benchmark datasets with one shared adapter. Overrides --dataset.",
     )
     parser.add_argument("--samples_per_scene", type=int, default=4)
+    parser.add_argument(
+        "--scenes",
+        nargs="+",
+        default=None,
+        help="Optional benchmark scene subset; useful for a reproducible smoke run.",
+    )
     parser.add_argument("--seeds_list", type=int, nargs="+", default=None)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -299,6 +305,11 @@ def main() -> None:
     parser.add_argument("--model_name", type=str, default="depth-anything/DA3-GIANT-1.1")
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_alpha", type=float, default=16.0)
+    parser.add_argument(
+        "--freeze_camera_token",
+        action="store_true",
+        help="Keep the DA3 camera token frozen and update LoRA parameters only.",
+    )
     parser.add_argument("--finetune", action="store_true")
 
     parser.add_argument("--epochs", type=int, default=10)
@@ -362,6 +373,8 @@ def main() -> None:
     config.model.model_name = args.model_name
     config.model.lora_rank = args.lora_rank
     config.model.lora_alpha = args.lora_alpha
+    if args.freeze_camera_token:
+        config.model.train_camera_token = False
     config.training.epochs = args.epochs
     config.training.lr = args.lr
     if args.warmup_steps is not None:
@@ -402,6 +415,7 @@ def main() -> None:
             samples_per_scene=samples_per_scene,
             seed=config.training.seed,
             seeds_list=args.seeds_list,
+            scenes=args.scenes,
         )
         for dataset_name in train_dataset_names
     ]
@@ -521,7 +535,7 @@ def main() -> None:
         print(f"Epoch {epoch + 1}/{config.training.epochs}")
         print(f"{'=' * 60}")
 
-        global_step = train_epoch(
+        global_step, epoch_loss = train_epoch(
             teacher=teacher,
             student=student,
             train_loader=train_loader,
@@ -545,7 +559,7 @@ def main() -> None:
             scaler,
             epoch,
             global_step,
-            0.0,
+            epoch_loss,
             config.training.output_dir,
             f"epoch_{epoch}.pt",
         )

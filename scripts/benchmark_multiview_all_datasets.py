@@ -41,6 +41,27 @@ DEFAULT_VGGT_LORA_ROOT = "checkpoints/vggt_lora_final"
 DEFAULT_RESULTS_ROOT = "results"
 
 
+def load_view_index_file(path: str, expected_pool_size: int) -> Dict[Tuple[str, int], List[int]]:
+    """Load an auditable per-scene view file generated for an E6 evaluation seed."""
+    pools: Dict[Tuple[str, int], List[int]] = {}
+    with open(path, "r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            try:
+                key = (str(record["scene_id"]), int(record["sample_idx"]))
+                indices = [int(value) for value in record["frame_indices"]]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid view-index entry at {path}:{line_number}") from exc
+            if not indices or len(indices) > expected_pool_size or len(indices) != len(set(indices)) or indices[0] != 0:
+                raise ValueError(f"Expected unique pool of at most P{expected_pool_size} beginning at ref 0: {path}:{line_number}")
+            if key in pools:
+                raise ValueError(f"Duplicate view-index entry for {key} in {path}")
+            pools[key] = indices
+    return pools
+
+
 class LoRADepthAnything3:
     """Minimal wrapper to make a Free-Geometry DA3 LoRA model match the benchmark API."""
 
@@ -612,7 +633,13 @@ def run_vggt_inference(model, image_files, scene_data, selected_indices, work_di
     _export_vggt_visualizations(depth, pred_ext, pred_intr, image_files, vis_dir)
 
 
-def run_evaluation(model_family: str, work_dir: str, scenes_by_dataset: Dict[str, List[str]], experiments: Sequence[str]) -> None:
+def run_evaluation(
+    model_family: str,
+    work_dir: str,
+    scenes_by_dataset: Dict[str, List[str]],
+    experiments: Sequence[str],
+    num_fusion_workers: int,
+) -> None:
     if model_family == "da3":
         from depth_anything_3.bench.evaluator import Evaluator as EvalCls
     else:
@@ -648,6 +675,7 @@ def run_evaluation(model_family: str, work_dir: str, scenes_by_dataset: Dict[str
                 modes=EVAL_MODES,
                 max_frames=-1,
                 scenes=scenes_to_eval,
+                num_fusion_workers=num_fusion_workers,
             )
             metrics = evaluator.eval()
             evaluator.print_metrics(metrics)
@@ -787,6 +815,12 @@ def _parse_args():
     )
     parser.add_argument("--seed", type=int, default=43)
     parser.add_argument(
+        "--view_indices_file",
+        type=str,
+        default=None,
+        help="Optional JSONL with fixed per-scene evaluation indices. Requires one entry per scene at sample_idx=0.",
+    )
+    parser.add_argument(
         "--results_root",
         type=str,
         default=DEFAULT_RESULTS_ROOT,
@@ -805,6 +839,12 @@ def _parse_args():
     parser.add_argument("--lora_alpha", type=float, default=32.0)
     parser.add_argument("--lora_layers_start", type=int, default=0)
     parser.add_argument("--image_size", type=int, default=504, help="VGGT input image size")
+    parser.add_argument(
+        "--num_fusion_workers",
+        type=int,
+        default=4,
+        help="CPU workers for per-scene TSDF reconstruction fusion (default: 4)",
+    )
     parser.add_argument("--eval_only", action="store_true", help="Skip inference, only evaluate")
     parser.add_argument("--report_only", action="store_true", help="Only print the saved summary report")
     parser.add_argument(
@@ -877,6 +917,12 @@ def main():
     if args.lora_root is None and not args.no_lora and args.lora_path is None:
         args.lora_root = _default_lora_root(args.model_family)
 
+    fixed_view_indices = None
+    if args.view_indices_file:
+        if len(view_counts) != 1:
+            raise ValueError("--view_indices_file requires exactly one --view_counts value")
+        fixed_view_indices = load_view_index_file(args.view_indices_file, 32)
+
     if args.report_only:
         scenes_by_dataset = {}
         for dataset_name in args.datasets:
@@ -910,6 +956,15 @@ def main():
         datasets.append((dataset_name, dataset))
         scenes_by_dataset[dataset_name] = scenes
 
+    if fixed_view_indices is not None:
+        for dataset_name, scenes in list(scenes_by_dataset.items()):
+            eligible_scenes = [scene for scene in scenes if (scene, 0) in fixed_view_indices]
+            skipped_scenes = sorted(set(scenes) - set(eligible_scenes))
+            if skipped_scenes:
+                print(f"[WARN] {dataset_name}: skipping scenes absent from fixed P32 file: {skipped_scenes}")
+            scenes_by_dataset[dataset_name] = eligible_scenes
+        datasets = [(name, dataset) for name, dataset in datasets if scenes_by_dataset[name]]
+
     if not datasets:
         raise RuntimeError("No valid dataset/scene combination selected.")
 
@@ -924,7 +979,13 @@ def main():
     )
 
     if args.eval_only:
-        run_evaluation(args.model_family, args.work_dir, scenes_by_dataset, experiments)
+        run_evaluation(
+            args.model_family,
+            args.work_dir,
+            scenes_by_dataset,
+            experiments,
+            num_fusion_workers=args.num_fusion_workers,
+        )
         write_summary_report(args.work_dir, scenes_by_dataset, experiments)
         return
 
@@ -957,6 +1018,18 @@ def main():
                         scene=scene,
                         seed=args.seed,
                     )
+                    if fixed_view_indices is not None:
+                        try:
+                            selected_indices = fixed_view_indices[(scene, 0)]
+                        except KeyError as exc:
+                            raise KeyError(f"No fixed evaluation pool for scene={scene!r}, sample_idx=0") from exc
+                        if max(selected_indices) >= num_frames:
+                            raise ValueError(f"Fixed evaluation pool references unavailable frame in {scene}")
+                        if view_count < len(selected_indices):
+                            selected_indices = [
+                                selected_indices[index * len(selected_indices) // view_count]
+                                for index in range(view_count)
+                            ]
                     if not selected_indices:
                         print(f"  [{experiment}] Skip: no sampled indices available")
                         continue
@@ -1010,7 +1083,13 @@ def main():
         del model
         torch.cuda.empty_cache()
 
-    run_evaluation(args.model_family, args.work_dir, scenes_by_dataset, experiments)
+    run_evaluation(
+        args.model_family,
+        args.work_dir,
+        scenes_by_dataset,
+        experiments,
+        num_fusion_workers=args.num_fusion_workers,
+    )
     write_summary_report(args.work_dir, scenes_by_dataset, experiments)
 
 

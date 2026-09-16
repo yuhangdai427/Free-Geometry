@@ -334,10 +334,14 @@ class StudentModel(nn.Module):
 
         # Make camera token trainable if requested
         if train_camera_token:
-            backbone = self.da3.model.backbone.pretrained
-            if hasattr(backbone, 'camera_token'):
-                backbone.camera_token.requires_grad = True
+            _bb = self.da3.model.backbone.pretrained
+            _pre = getattr(_bb, "base_model", _bb)  # unwrap PeftModel -> LoraModel
+            _pre = getattr(_pre, "model", _pre)     # unwrap LoraModel -> DinoV2
+            if hasattr(_pre, 'camera_token'):
+                _pre.camera_token.requires_grad = True
                 print("Camera token is trainable")
+            else:
+                print("WARNING: camera_token not found on backbone (unfreeze FAILED)")
 
         # Print parameter count
         total, trainable = count_parameters(self.da3)

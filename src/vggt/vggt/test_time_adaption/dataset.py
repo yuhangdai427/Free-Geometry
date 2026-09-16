@@ -21,6 +21,7 @@ from depth_anything_3.bench.datasets.sevenscenes import SevenScenes
 from depth_anything_3.bench.datasets.scannetpp import ScanNetPP
 from depth_anything_3.bench.datasets.hiroom import HiRoomDataset
 from depth_anything_3.bench.datasets.dtu import DTU
+from .nested_view_sampling import load_jsonl, nested_subset
 
 
 # Dataset registry
@@ -69,7 +70,7 @@ class VGGTFreeGeometryDataset(Dataset):
         dataset_name: str,
         num_views: int = 8,
         image_size: int = 504,
-        student_indices: List[int] = None,
+        student_indices: Optional[List[int]] = None,
         augment: bool = True,
         samples_per_scene: int = 2,
         seed: int = 42,
@@ -83,6 +84,7 @@ class VGGTFreeGeometryDataset(Dataset):
         paired_gap: int = 3,
         fixed_subset_seed: Optional[int] = None,
         fixed_subset_max_frames: int = 100,
+        nested_indices_file: Optional[str] = None,
     ):
         super().__init__()
 
@@ -95,7 +97,11 @@ class VGGTFreeGeometryDataset(Dataset):
         self.dataset_name = dataset_name
         self.num_views = num_views
         self.image_size = image_size
-        self.student_indices = student_indices or [0, 2, 4, 6]
+        self.student_indices = (
+            list(student_indices) if student_indices is not None else list(range(0, num_views, 2))
+        )
+        if not self.student_indices or any(index < 0 or index >= num_views for index in self.student_indices):
+            raise ValueError(f"student_indices must be non-empty positions within [0, {num_views})")
         self.augment = augment
         self.seeds_list = seeds_list
         self.samples_per_scene = samples_per_scene
@@ -111,6 +117,8 @@ class VGGTFreeGeometryDataset(Dataset):
         self.fixed_subset_max_frames = fixed_subset_max_frames
         self.scene_subset_indices = {}  # Cache subset indices per scene
         self._fixed_subset_cache = {}  # Cache fixed subset indices per scene
+        self.nested_indices_file = nested_indices_file
+        self._nested_pools = load_jsonl(nested_indices_file) if nested_indices_file else None
         self.current_epoch = 0  # Mixed into sample seed for per-epoch diversity
 
         # Initialize benchmark dataset
@@ -118,6 +126,18 @@ class VGGTFreeGeometryDataset(Dataset):
 
         # Get all scenes (no train/val split - use all scenes)
         self.scenes = list(self.benchmark_dataset.SCENES)
+
+        if self._nested_pools is not None:
+            required_samples = set(range(self.samples_per_scene))
+            original_scenes = list(self.scenes)
+            self.scenes = [
+                scene
+                for scene in self.scenes
+                if all((scene, sample_idx) in self._nested_pools for sample_idx in required_samples)
+            ]
+            skipped = sorted(set(original_scenes) - set(self.scenes))
+            if skipped:
+                print(f"Skipping scenes without complete nested pools: {skipped}")
 
         if len(self.scenes) == 0:
             raise ValueError(f"No scenes found for {dataset_name}")
@@ -139,6 +159,8 @@ class VGGTFreeGeometryDataset(Dataset):
                 subset = self._get_fixed_subset_indices(scene, num_frames)
                 print(f"  [Fixed Subset] {scene}: {num_frames} -> {len(subset)} frames")
                 print(f"    indices: {subset}")
+        if self._nested_pools is not None:
+            print(f"Using nested E6 pools from: {nested_indices_file}")
 
         # Cache for scene data
         self._scene_cache: Dict[str, Dict] = {}
@@ -421,8 +443,16 @@ class VGGTFreeGeometryDataset(Dataset):
         random.seed(sample_seed)
         np.random.seed(sample_seed)
 
-        # Sample view indices (pass sample_idx for consecutive window selection)
-        view_indices = self._sample_view_indices(len(image_files), rng, scene=scene, sample_idx=sample_idx)
+        if self._nested_pools is not None:
+            pool = self._nested_pools.get((scene, sample_idx))
+            if pool is None:
+                raise KeyError(f"No nested P16 pool for scene={scene!r}, sample_idx={sample_idx}")
+            if max(pool) >= len(image_files):
+                raise ValueError(f"Nested pool for {scene!r} references unavailable frame")
+            view_indices = nested_subset(pool, self.num_views)
+        else:
+            # Sample view indices (pass sample_idx for consecutive window selection)
+            view_indices = self._sample_view_indices(len(image_files), rng, scene=scene, sample_idx=sample_idx)
 
         # Determine if we should flip (consistent across all views)
         do_flip = self.augment and random.random() < 0.5

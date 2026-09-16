@@ -198,6 +198,7 @@ class Evaluator:
                     export_format=export_format,
                     ref_view_strategy=self.ref_view_strategy,
                 )
+                self._wait_for_complete_export(export_dir)
                 self._save_gt_meta(export_dir, scene_data)
 
             if need_posed:
@@ -210,6 +211,7 @@ class Evaluator:
                     export_format=export_format,
                     ref_view_strategy=self.ref_view_strategy,
                 )
+                self._wait_for_complete_export(export_dir)
                 self._save_gt_meta(export_dir, scene_data)
 
             scene_time = time.time() - scene_start
@@ -403,6 +405,24 @@ class Evaluator:
 
     # -------------------- Helpers -------------------- #
 
+    @staticmethod
+    def _wait_for_complete_export(export_dir: str, timeout_seconds: float = 30.0) -> None:
+        """Wait until the asynchronous NPZ writer has finished its archive."""
+        import zipfile
+
+        result_path = os.path.join(export_dir, "exports", "mini_npz", "results.npz")
+        deadline = time.time() + timeout_seconds
+        while True:
+            try:
+                with zipfile.ZipFile(result_path) as archive:
+                    if archive.testzip() is None:
+                        return
+            except (FileNotFoundError, EOFError, OSError, zipfile.BadZipFile):
+                pass
+            if time.time() >= deadline:
+                raise TimeoutError(f"Timed out waiting for complete inference export: {result_path}")
+            time.sleep(0.1)
+
     def _save_gt_meta(self, export_dir: str, scene_data: Dict) -> None:
         """
         Save GT extrinsics/intrinsics/image_files for evaluation.
@@ -416,12 +436,15 @@ class Evaluator:
         """
         meta_path = os.path.join(export_dir, "exports", "gt_meta.npz")
         os.makedirs(os.path.dirname(meta_path), exist_ok=True)
-        np.savez_compressed(
-            meta_path,
-            extrinsics=scene_data.extrinsics,
-            intrinsics=scene_data.intrinsics,
-            image_files=np.array(scene_data.image_files, dtype=object),
-        )
+        payload = {
+            "extrinsics": scene_data.extrinsics,
+            "intrinsics": scene_data.intrinsics,
+            "image_files": np.array(scene_data.image_files, dtype=object),
+        }
+        # DTU fusion needs the per-view observation masks after frame sampling.
+        if getattr(scene_data, "aux", None) and scene_data.aux.get("mask_files") is not None:
+            payload["mask_files"] = np.array(scene_data.aux.mask_files, dtype=object)
+        np.savez_compressed(meta_path, **payload)
 
     def _load_gt_meta(self, export_dir: str) -> Dict:
         """
@@ -786,4 +809,3 @@ Examples:
             if not is_worker:
                 metrics = evaluator.eval()
                 evaluator.print_metrics(metrics)
-
