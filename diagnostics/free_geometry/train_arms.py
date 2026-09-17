@@ -2060,6 +2060,10 @@ def main():
                          "keep the single-context cache. 0=off (default)")
     ap.add_argument("--seed", type=int, default=0,
                     help="global RNG seed for LoRA init and per-scene train-order/mask seeds")
+    ap.add_argument("--loss_all_pos", action="store_true",
+                    help="ablation: keep the 50%% masked student input but compute the "
+                         "distill loss on ALL patch positions (default: MGD-style, "
+                         "masked positions only)")
     args = ap.parse_args()
     torch.manual_seed(args.seed)
     if args.ema_teacher and args.full_ft:
@@ -2305,6 +2309,11 @@ def main():
                             images4, patch_hw,
                             torch.Generator().manual_seed(
                                 stable_seed("maskasy", scene, epoch, pi, args.seed)))
+                    if args.loss_all_pos and pmask is not None:
+                        # ablation: keep the masked INPUT but supervise ALL patch
+                        # positions (standard KD-style; contrasts with the default
+                        # MGD-style masked-positions-only supervision)
+                        pmask = torch.ones_like(pmask)
                     if arm in ("FM_zero", "FM_mean"):
                         images8m = train_images8[pi].clone()
                         if arm == "FM_zero":

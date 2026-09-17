@@ -137,12 +137,17 @@ def assemble_teacher_list(shared: List[int], extras: List[int]) -> List[int]:
 
 
 def build_pair(N: int, teacher_N: int, dense: bool, sc: Optional[SiftCache], rng: random.Random,
-               n_shared: int = 4, selfevo: bool = False, selfevo_lmin: int = 2):
+               n_shared: int = 4, selfevo: bool = False, selfevo_lmin: int = 2,
+               sparse_overlap: bool = False):
     """One (teacher_frames, student_frames) pair following the tau dispatch.
     n_shared=4 -> 16:4 protocol (student slots [0,2,4,6]); n_shared=8 -> 16:8.
     selfevo=True (SelfEvo-faithful): student = teacher window's FIRST + LAST frame
     plus L-2 random middle frames, L ~ U{selfevo_lmin, min(6, teacher_N//2)} per pair
-    (endpoint-anchored, randomized asymmetry level)."""
+    (endpoint-anchored, randomized asymmetry level).
+    sparse_overlap=True: on the tau<=0.55 (random) branch, resample the window until
+    every teacher frame's mean SIFT match fraction vs the shared frames >= OVERLAP_LO
+    (soft fallback: best of 40 tries). Targets wide-baseline scenes where a purely
+    random window mixes mutually-invisible frames and degrades the teacher."""
     if dense:
         M = min(N, teacher_N * 3 // 2)
         step = N / M
@@ -164,16 +169,34 @@ def build_pair(N: int, teacher_N: int, dense: bool, sc: Optional[SiftCache], rng
             (in_range if OVERLAP_LO <= c <= OVERLAP_HI else out_range).append(f)
         extras = sorted((in_range + out_range)[: teacher_N - len(shared)])
     else:
-        t = sorted(rng.sample(range(N), teacher_N))
-        if selfevo:
-            l_max = max(selfevo_lmin, min(6, teacher_N // 2, len(t) - 2))
-            L = rng.randint(selfevo_lmin, l_max)
-            L = min(L, len(t))
-            mids = rng.sample(t[1:-1], k=max(0, L - 2))
-            shared = sorted([t[0]] + mids + [t[-1]])
+        def draw():
+            t = sorted(rng.sample(range(N), teacher_N))
+            if selfevo:
+                l_max = max(selfevo_lmin, min(6, teacher_N // 2, len(t) - 2))
+                L = rng.randint(selfevo_lmin, l_max)
+                L = min(L, len(t))
+                mids = rng.sample(t[1:-1], k=max(0, L - 2))
+                sh = sorted([t[0]] + mids + [t[-1]])
+            else:
+                stride = max(1, teacher_N // n_shared)
+                sh = t[::stride][:n_shared]
+            return t, sh
+        if not (sparse_overlap and sc is not None):
+            t, shared = draw()
         else:
-            stride = max(1, teacher_N // n_shared)
-            shared = t[::stride][:n_shared]
+            # covisibility-constrained resampling: every teacher frame must
+            # (on average) share SIFT content with the student's shared frames
+            best, best_score = None, -1.0
+            for _ in range(40):
+                t_c, sh_c = draw()
+                fr = [float(np.mean([sc.frac(f, s) for s in sh_c])) for f in t_c]
+                score = min(fr)
+                if score >= OVERLAP_LO:
+                    best = (t_c, sh_c)
+                    break
+                if score > best_score:
+                    best, best_score = (t_c, sh_c), score
+            t, shared = best
         extras = [f for f in t if f not in set(shared)]
     shared = sorted(shared)
     teacher = assemble_teacher_list(shared, extras)
@@ -192,6 +215,7 @@ def build_scene_protocol(
     selfevo: bool = False,
     combo: bool = False,
     combo_se_frac: float = 0.5,
+    sparse_overlap: bool = False,
 ) -> Dict:
     """Full GT-free per-scene protocol: tau, teacher_N, 10+2 pairs, eval frames.
     teacher_N override enables ratio variants: 16:4 (default), 16:8, 8:4, 8:2, 32:8.
@@ -200,7 +224,9 @@ def build_scene_protocol(
     selfevo=True: endpoint-anchored student with per-pair random L (SelfEvo-faithful).
     combo=True: each pair is seeded-either fixed-slot (camera-oriented) or
     endpoint-anchored with L>=4 (fusion-oriented), drawn with probability
-    combo_se_frac (0.5 = 1:1, 0.25 = 3:1 fixed:SE)."""
+    combo_se_frac (0.5 = 1:1, 0.25 = 3:1 fixed:SE).
+    sparse_overlap=True: covisibility-constrained teacher windows on the random
+    branch (see build_pair)."""
     image_files = list(image_files)
     N = len(image_files)
     if N < 8:
@@ -212,7 +238,7 @@ def build_scene_protocol(
         raise ValueError(f"{scene}: teacher_N={teacher_N} <= n_shared={n_shared}")
     tau = compute_tau(image_files)
     dense = tau > TAU_THRESHOLD
-    sc = SiftCache(image_files) if dense else None
+    sc = SiftCache(image_files) if (dense or sparse_overlap) else None
 
     def sample(tag: str, n: int, forb_t: set, forb_s: set):
         r = random.Random(stable_seed("final", tag, dataset, scene))
@@ -229,7 +255,8 @@ def build_scene_protocol(
             ns = min(ns, tn // 2)  # shared slots [0,2,...] must fit the teacher list
             se = selfevo or (combo and r.random() < combo_se_frac)
             teacher, shared = build_pair(N, tn, dense, sc, r, n_shared=ns,
-                                         selfevo=se, selfevo_lmin=(4 if combo else 2))
+                                         selfevo=se, selfevo_lmin=(4 if combo else 2),
+                                         sparse_overlap=sparse_overlap)
             key_t, key_s = tuple(sorted(teacher)), tuple(shared)
             if key_t in forb_t or key_s in forb_s:
                 continue
@@ -245,7 +272,8 @@ def build_scene_protocol(
             ns = min(ns, tn // 2)
             se = selfevo or (combo and r.random() < combo_se_frac)
             teacher, shared = build_pair(N, tn, dense, sc, r, n_shared=ns,
-                                         selfevo=se, selfevo_lmin=(4 if combo else 2))
+                                         selfevo=se, selfevo_lmin=(4 if combo else 2),
+                                         sparse_overlap=sparse_overlap)
             pairs.append({"teacher_frames": teacher, "student_frames": list(shared),
                           "teacher_N": tn, "n_shared": ns,
                           "kind": "se" if se else "fixed"})
@@ -273,7 +301,8 @@ def build_scene_protocol(
         "N": N,
         "teacher_N": teacher_N,
         "tau": tau,
-        "strategy": "dense_equidistant_sift" if dense else "random",
+        "strategy": ("dense_equidistant_sift" if dense
+                     else ("random_overlap" if sparse_overlap else "random")),
         "train_pairs": train_pairs,
         "probe_pairs": probe_pairs,
         "eval_frames": eval_frames,
@@ -753,6 +782,38 @@ def compute_c2m_loss(student, teacher_cache: Dict, images4_in: torch.Tensor, pat
 # ---------------------------------------------------------------------------
 # Per-scene training (protocol section 3)
 # ---------------------------------------------------------------------------
+def draw_patch_mask(S: int, patch_hw, ratio: float, gen, device=None):
+    """Same Bernoulli patch draw as mask_image_blocks, without touching pixels.
+    Returns [1,S,P] float (1=masked). Shared by all mask_mode arms so the
+    supervision/mask set Omega is IDENTICAL across the ablation."""
+    ph, pw = patch_hw
+    block = torch.rand(S, ph, pw, generator=gen, device=device) < ratio
+    return block.reshape(1, S, ph * pw).float()
+
+
+def install_token_mask(vit, pmask, where: str, mask_layer: int = 12):
+    """Zero-fill masked PATCH tokens at an internal backbone point (hooks).
+
+    where='shallow': right after patch projection, before any attention
+      (MAE/iBOT-style entry mask, zero fill).
+    where='feat':    at blocks[mask_layer] OUTPUT. DA3's cross-view (global)
+      attention starts at block 13, so mask_layer=12 is the structural analog
+      of "after the single-frame encoder, before the multi-view transformer".
+    Patch tokens sit at [..., 1:, :] (position 0 is the camera token).
+    Returns the hook handle (call .remove() after backward)."""
+    mask_rows = pmask[0].bool()  # [S, P] (batch is always 1 -> S rows == B*S)
+
+    def _hook(module, inp, out):
+        if where == "shallow":          # out: (BS, P, C) patch-only
+            out.masked_fill_(mask_rows.unsqueeze(-1), 0.0)
+        else:                            # out: (BS, 1+P, C) camera at index 0
+            out[:, 1:].masked_fill_(mask_rows.unsqueeze(-1), 0.0)
+        return out
+
+    target = vit.patch_embed if where == "shallow" else vit.blocks[mask_layer]
+    return target.register_forward_hook(_hook)
+
+
 def train_scene_c2m(
     teacher: DepthAnything3,
     student,
@@ -767,6 +828,9 @@ def train_scene_c2m(
     pose_weight: float = 1.0,
     arm: str = "c2m",
     mask_ratio: float = 0.5,
+    mask_mode: str = "image",  # image | none | token_shallow | token_feat
+    mask_layer: int = 12,
+    mask_loss_positions: bool = True,
     ctk_weight: float = 1.0,
     two_stage: float = 0.0,
     early_stop: bool = False,
@@ -852,17 +916,28 @@ def train_scene_c2m(
                 break
             cache = train_caches[pi]
             images4 = train_images[pi].unsqueeze(0).to(device)  # [1,4,3,H,W]
-            if mask_ratio > 0:
-                images4_in, pmask = mask_image_blocks(
-                    images4, mask_ratio, patch_hw,
-                    torch.Generator(device=images4.device).manual_seed(
-                        stable_seed("mask", scene, epoch, pi, seed)))
+            gen = torch.Generator(device=images4.device).manual_seed(
+                stable_seed("mask", scene, epoch, pi, seed))
+            if mask_mode == "image":
+                images4_in, pmask = mask_image_blocks(images4, mask_ratio, patch_hw, gen)
             else:
-                # nomask variant: clean-input distillation at ALL patch positions
-                # (tests whether the 50% input masking itself drives pose drift)
+                # mask-position ablation: SAME Omega via the same seed, but the
+                # input image stays clean; corruption happens inside the backbone
+                # (token modes) or not at all (none).
                 images4_in = images4
-                pmask = torch.ones(1, images4.shape[1], patch_hw[0] * patch_hw[1],
-                                   device=images4.device)
+                pmask = draw_patch_mask(images4.shape[1], patch_hw, mask_ratio,
+                                        gen, device=images4.device)
+            if not mask_loss_positions:
+                # ablation (--loss_all_pos): supervise ALL patch positions so the
+                # supervision set is identical across every mask_mode arm
+                pmask = torch.ones_like(pmask)
+            hook = None
+            if mask_mode in ("token_shallow", "token_feat"):
+                vit = _unwrap_pretrained(student.da3.model.backbone)
+                hook = install_token_mask(
+                    vit, pmask,
+                    "shallow" if mask_mode == "token_shallow" else "feat",
+                    mask_layer=mask_layer)
             torch.manual_seed(stable_seed("cf_rng", scene, epoch, pi, seed))
             if arm == "rkdc1hc":
                 loss, extra = compute_rkdc1hc_loss(student, cache, images4_in, pmask,
@@ -876,6 +951,8 @@ def train_scene_c2m(
                 raise FloatingPointError(
                     f"non-finite loss at scene={scene} step={step + 1}: {float(loss)}")
             loss.backward()
+            if hook is not None:
+                hook.remove()
             gn = torch.nn.utils.clip_grad_norm_(params, CLIP)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)

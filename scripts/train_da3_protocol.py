@@ -191,6 +191,12 @@ def main() -> None:
     ap.add_argument("--combo_se_frac", type=float, default=0.5,
                     help="fraction of endpoint-anchored pairs in combo mode "
                          "(0.5 = 1:1, 0.25 = 3:1 fixed:SE)")
+    ap.add_argument("--sparse_overlap", action="store_true",
+                    help="covisibility-constrained teacher windows on the tau<=0.55 "
+                         "random branch: resample until every teacher frame's mean "
+                         "SIFT match fraction vs the shared frames >= 0.1 (best of "
+                         "40 tries). Fixes wide-baseline windows that mix "
+                         "mutually-invisible frames (e.g. eth3d facade)")
     ap.add_argument("--ctk_weight", type=float, default=1.0,
                     help="weight of the camera-token KD term (rkdc1hc arm)")
     ap.add_argument("--two_stage", type=float, default=0.0,
@@ -200,6 +206,20 @@ def main() -> None:
     ap.add_argument("--mask_ratio", type=float, default=0.5,
                     help="input patch mask ratio for the distill loss; 0.0 = nomask "
                          "(clean-input distillation at all positions)")
+    ap.add_argument("--mask_mode", default="image",
+                    choices=["image", "none", "token_shallow", "token_feat"],
+                    help="mask-position ablation: image = fill ImageNet-mean on "
+                         "input pixels (current default); none = clean input; "
+                         "token_shallow = zero patch tokens right after patch "
+                         "projection; token_feat = zero patch tokens at "
+                         "--mask_layer output (default 12 = before DA3's "
+                         "cross-view attention starts at block 13)")
+    ap.add_argument("--mask_layer", type=int, default=12,
+                    help="block index for mask_mode=token_feat (output hook)")
+    ap.add_argument("--loss_all_pos", action="store_true",
+                    help="ablation: keep the masked student input but compute the "
+                         "distill loss on ALL patch positions (default: MGD-style, "
+                         "masked positions only)")
     ap.add_argument("--n_shared", type=int, default=4,
                     help="shared (student) frames per pair: 4 = 16:4 protocol, 8 = 16:8 "
                          "(unsaturates the student's local targets on strong backbones)")
@@ -248,7 +268,8 @@ def main() -> None:
                                        ratio_mix=ratio_mix,
                                        selfevo=args.selfevo,
                                        combo=args.combo,
-                                       combo_se_frac=args.combo_se_frac)
+                                       combo_se_frac=args.combo_se_frac,
+                                       sparse_overlap=args.sparse_overlap)
         print(f"[{scene}] N={proto['N']} tau={proto['tau']:.3f} "
               f"teacher_N={proto['teacher_N']} strategy={proto['strategy']} "
               f"n_shared={proto['n_shared']} eval_frames={len(proto['eval_frames'])}")
@@ -259,8 +280,10 @@ def main() -> None:
             device=device, steps=args.steps, epochs=args.epochs,
             lr=args.lr, seed=args.seed, pose_weight=pose_w,
             arm=args.arm, mask_ratio=args.mask_ratio, trace_rows=trace_rows,
+            mask_mode=args.mask_mode, mask_layer=args.mask_layer,
             ctk_weight=args.ctk_weight, two_stage=args.two_stage,
-            early_stop=args.early_stop)
+            early_stop=args.early_stop,
+            mask_loss_positions=not args.loss_all_pos)
 
         ckpt_dir = os.path.join(args.output_root, "ckpts", scene)
         os.makedirs(ckpt_dir, exist_ok=True)
