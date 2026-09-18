@@ -260,6 +260,9 @@ def main() -> None:
     ap.add_argument("--swanlab", action="store_true",
                     help="log every step (loss components, lr, grad_norm, pair_idx) "
                          "to swanlab cloud; one experiment per scene, named {scene}_{arm}")
+    ap.add_argument("--swanlab_suffix", default="",
+                    help="suffix for swanlab experiment names, e.g. _mv13 to mark "
+                         "the multi-view(13-39)-LoRA protocol runs")
     args = ap.parse_args()
 
     device = "cuda"
@@ -304,7 +307,7 @@ def main() -> None:
             import swanlab
             run = swanlab.init(
                 project="free-geometry-tta",
-                experiment_name=f"{scene}_{args.arm}",
+                experiment_name=f"{scene}_{args.arm}{args.swanlab_suffix}",
                 description=f"{args.dataset} | {args.arm} | "
                             f"loss_all_pos={args.loss_all_pos} | seed={args.seed}",
                 config={k: v for k, v in vars(args).items()
