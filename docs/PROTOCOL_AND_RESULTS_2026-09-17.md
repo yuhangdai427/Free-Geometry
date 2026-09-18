@@ -62,6 +62,12 @@ LoRA student（遮挡 4 帧）→ 特征 + 几何输出
 LoRA 统一设置：r=32, α=32, dropout=0, A~kaiming(√5), B=0（零-LoRA = 冻结 baseline）。
 优化器：AdamW wd=1e-5, clip=1.0, warmup 15% + cosine → 1e-8。
 
+> **2026-09-18 变更（DA3 LoRA 范围）**：DA3 backbone 是单个 40 块 DinoV2——0–12 层为纯单视角
+> local attention（"DINO 部分"），第 13 层注入共享 camera token，此后奇数层做跨视角 global
+> attention。按明确决定，**LoRA 范围从 0–39 改为仅 13–39**（multi-view 部分，27 块，
+> 可训练参数 31.5M → 21.2M），0–12 层永久冻结、不再有任何 LoRA。上表及本文所有 DA3 历史
+> 结果均为旧配置（0–39）产出；旧 all-40 checkpoint 与新配置不兼容（adapter 形状不同）。
+
 ## 六、Early stop 机制
 
 **定义**：tail-10 步 loss 均值相对 prev-10 改善 <2%，且 step ≥ max(30, warmup+10)。

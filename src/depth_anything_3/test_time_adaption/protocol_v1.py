@@ -516,8 +516,11 @@ def create_student(
     lora_alpha: float = LORA_ALPHA,
     lora_dropout: float = LORA_DROPOUT,
 ):
-    """StudentModel with protocol LoRA: r=32/a=32/dropout=0 on ALL 40 aggregator
-    blocks (attn qkv/proj + SwiGLU w12/w3), heads and camera token frozen."""
+    """StudentModel with protocol LoRA: r=32/a=32/dropout=0 on the multi-view
+    blocks 13..39 ONLY (attn qkv/proj + SwiGLU w12/w3); heads frozen, camera
+    token trainable. Layers 0..12 — the per-view "DINO" local-attention blocks
+    before alt_start (camera-token injection / first cross-view attention) —
+    are STRICTLY FROZEN: no LoRA there, by explicit decision (2026-09-18)."""
     from depth_anything_3.test_time_adaption.models import StudentModel
 
     student = StudentModel(
@@ -529,7 +532,7 @@ def create_student(
         lora_dropout=lora_dropout,
         train_camera_token=True,  # v2: camera token trainable (was frozen in v1);
                                   # cam_dec + heads stay frozen
-        lora_layers=list(range(DA3_NUM_LAYERS)),
+        lora_layers=list(range(13, 40)),  # multi-view scope ONLY (>= alt_start)
         ref_view_strategy="first",
         patch_swiglu_mlp_for_lora=True,
     )
