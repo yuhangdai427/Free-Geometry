@@ -787,8 +787,14 @@ def loss_pose_rel(pose_s: torch.Tensor, pose_t: torch.Tensor) -> torch.Tensor:
         for j in range(i + 1, S):
             Rr_s = R_s[:, i] @ R_s[:, j].transpose(-1, -2)
             Rr_t = R_t[:, i] @ R_t[:, j].transpose(-1, -2)
-            tr_s = t_s[:, i] - Rr_s @ t_s[:, j][..., None]
-            tr_t = t_t[:, i] - Rr_t @ t_t[:, j][..., None]
+            # SHAPE FIX 2026-09-18: t[:,i] is [B,3]; t[:,j][...,None] is [B,3,1].
+            # [B,3] - [B,3,1] broadcasts to [B,3,3] (a MATRIX) — wrong!
+            # Must keep both as column vectors [B,3,1]:
+            tr_s = t_s[:, i].unsqueeze(-1) - Rr_s @ t_s[:, j].unsqueeze(-1)
+            tr_t = t_t[:, i].unsqueeze(-1) - Rr_t @ t_t[:, j].unsqueeze(-1)
+            assert tr_s.shape == (t_s.shape[0], 3, 1), \
+                f"tr_s shape {tr_s.shape} != ({t_s.shape[0]}, 3, 1)"
+            assert tr_t.shape == tr_s.shape
             rot_loss = rot_loss + ((Rr_s - Rr_t) ** 2).sum(dim=(-2, -1)).mean()
             tn_s = torch.nn.functional.normalize(tr_s.squeeze(-1), dim=-1, eps=1e-8)
             tn_t = torch.nn.functional.normalize(tr_t.squeeze(-1), dim=-1, eps=1e-8)
