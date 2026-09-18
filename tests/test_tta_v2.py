@@ -211,12 +211,15 @@ def test_select_monotonic_improvement_picks_last():
     res = select(trace, cfg)
     assert res["selected_step"] == 4
     assert not res["fell_back_to_baseline"]
-    assert res["improvement"] == pytest.approx(0.2, rel=1e-9)
+    # with abs_floor_rel=0.2 the absolute envelope (0.2*typical) is wider than
+    # the relative one (0.05*|v0|) for these uniform-scale components, so the
+    # rel_change denominator widens to 4.0 and the score damps 4x (0.2 -> 0.05)
+    assert res["improvement"] == pytest.approx(0.05, rel=1e-9)
     assert res["disqualified"] == {}
 
 
 def test_select_falls_back_to_last_qualified_before_tau_violation():
-    cfg = ControllerConfig()
+    cfg = ControllerConfig(catastrophic_rel=None)  # legacy tau rule under test
     trace = [_mk_step(0, {n: 1.0 for n in ("feature", "rkd", "couple", "rot_deg")}),
              _mk_step(20, {n: 0.95 for n in ("feature", "rkd", "couple", "rot_deg")}),
              _mk_step(40, {"feature": 0.90, "rkd": 0.90, "couple": 0.90, "rot_deg": 2.0})]

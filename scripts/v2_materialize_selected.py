@@ -37,14 +37,17 @@ from free_geometry.tta_v2.controller import ControllerConfig, select  # noqa: E4
 
 
 def _read_trace_dir(trace_dir, default_arm):
-    """-> {(scene, arm): [evaluate()-shaped entries]} in step order."""
+    """-> {(scene, arm): [evaluate()-shaped entries]} in step order.
+
+    Per-record lines are grouped by their OWN arm field (never merged across
+    arms; previously the last line's arm silently won). Whole-line (DA3)
+    entries carry no arm and go to default_arm."""
     groups = {}
     for path in sorted(os.listdir(trace_dir)):
         if not path.endswith(".jsonl"):
             continue
         scene = path[:-len(".jsonl")]
-        per_step = {}
-        arm_hint = None
+        per_key = {}  # (arm, step) -> evaluate()-shaped entry
         with open(os.path.join(trace_dir, path)) as f:
             for line in f:
                 line = line.strip()
@@ -52,22 +55,22 @@ def _read_trace_dir(trace_dir, default_arm):
                     continue
                 r = json.loads(line)
                 if "records" in r:  # whole evaluate() line
-                    per_step[int(r["step"])] = {
+                    per_key[(default_arm, int(r["step"]))] = {
                         "step": int(r["step"]), "records": r["records"]}
                     continue
-                # per-record line
-                arm_hint = r.get("arm", default_arm)
+                arm = r.get("arm", default_arm)
                 step = int(r["step"])
-                per_step.setdefault(step, {"step": step, "records": []})
-                per_step[step]["records"].append({
+                e = per_key.setdefault((arm, step), {"step": step, "records": []})
+                e["records"].append({
                     "pair_id": r["pair_id"], "mask_id": int(r["mask_id"]),
                     "components": r["components"],
                     "total": r.get("total")})
-        if not per_step:
-            continue
-        arm = arm_hint if arm_hint is not None else default_arm
-        groups.setdefault((scene, arm), []).extend(
-            per_step[k] for k in sorted(per_step))
+        by_arm = {}
+        for (arm, step), e in per_key.items():
+            by_arm.setdefault(arm, {})[step] = e
+        for arm, steps in by_arm.items():
+            groups.setdefault((scene, arm), []).extend(
+                steps[k] for k in sorted(steps))
     return groups
 
 
@@ -144,6 +147,11 @@ def main():
         sel_step = int(sel["selected_step"])
         src_base = os.path.join(args.run_root, "ckpts", scene, arm, "v2",
                                 f"step{sel_step}_lora.pt")
+        if not os.path.exists(src_base) and not os.path.exists(
+                src_base.replace(".pt", "_peft")):
+            # DA3 layout has no arm layer: ckpts/<scene>/v2/stepN_lora.pt
+            src_base = os.path.join(args.run_root, "ckpts", scene, "v2",
+                                    f"step{sel_step}_lora.pt")
         dst_arm = args.out_arm or arm
         dst_base = os.path.join(out_root, scene, dst_arm,
                                 f"step{args.step}_lora.pt")

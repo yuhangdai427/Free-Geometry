@@ -9,7 +9,7 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=0
 PY=/root/miniconda3/envs/da3/bin/python
 MAN=workspace/protocol_v2/ab_manifests
-V2="--v2_ab_manifest $MAN --v2_probe --v2_ckpt --v2_rel_weight 1.0 --v2_grad_cap --v2_couple_fix --v2_rel_gate_deg 30 --v2_apply_selection --v2_baselines_json workspace/protocol_v2/baselines.json"
+V2="--v2_ab_manifest $MAN --v2_probe --v2_ckpt --v2_rel_weight 1.0 --v2_grad_cap --v2_couple_fix --v2_rel_gate_deg 0 --v2_apply_selection --v2_baselines_json workspace/protocol_v2/baselines.json"
 STOPF=workspace/protocol_v2/STOP
 
 mkdir -p logs
@@ -38,9 +38,19 @@ run_ds () {
   local ds=$1
   local out=workspace/protocol_v2/full_da3_$ds
   [ -f "$STOPF" ] && { echo "[v3-da3] STOP"; exit 1; }
-  echo "[v3-da3] $ds START $(date '+%F %T')"
+  # skip scenes whose final ckpt already exists (restart-safe)
+  local scenes=""
+  for sc in $(scenes_of "$ds" | tr '\n' ' '); do
+    if [ -f "$out/ckpts/$sc/v2/step100_lora.pt" ]; then
+      echo "[v3-da3] skip $sc (done)"
+    else
+      scenes="$scenes $sc"
+    fi
+  done
+  [ -z "${scenes# }" ] && { echo "[v3-da3] $ds already complete"; return 0; }
+  echo "[v3-da3] $ds START $(date '+%F %T') scenes:${scenes}"
   # shellcheck disable=SC2086
-  $PY scripts/train_da3_protocol.py --dataset "$ds" --scenes $(scenes_of "$ds" | tr '\n' ' ') \
+  $PY scripts/train_da3_protocol.py --dataset "$ds" --scenes $scenes \
       --output_root "$out" --steps 100 --arm rkdc1h --teacher_N 8 --n_train 10 \
       --mask_ratio 0.5 --loss_all_pos $V2 \
       --swanlab --swanlab_suffix _v2full \

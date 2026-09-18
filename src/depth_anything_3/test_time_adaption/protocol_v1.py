@@ -920,7 +920,11 @@ def resolve_ab_manifest(path_tmpl: str, dataset: str, scene: str) -> str:
     """--v2_ab_manifest accepts a directory (<dir>/<ds>/<scene>.json), a
     template with {scene}/{ds}/{dataset}, or a plain file path."""
     if os.path.isdir(path_tmpl):
-        return os.path.join(path_tmpl, dataset, f"{scene}.json")
+        p = os.path.join(path_tmpl, dataset, f"{scene}.json")
+        if not os.path.exists(p):
+            # builder sanitizes scene names: 20241230/828738/x -> 20241230__828738__x.json
+            p = os.path.join(path_tmpl, dataset, f"{scene.replace('/', '__')}.json")
+        return p
     if "{scene}" in path_tmpl or "{ds}" in path_tmpl or "{dataset}" in path_tmpl:
         return path_tmpl.format(scene=scene, ds=dataset, dataset=dataset)
     return path_tmpl
@@ -936,8 +940,7 @@ def load_ab_manifest(path: str, dataset: str, scene: str,
     teacher_frames (context A), teacher_frames_B (context B) and student_frames;
     probe_pairs stay single-context (no B)."""
     if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"AB manifest not found: {path} (--v2_ab_manifest given; refusing to "
+        raise FileNotFoundError(            f"AB manifest not found: {path} (--v2_ab_manifest given; refusing to "
             f"fall back to on-the-fly protocol sampling)")
     with open(path) as f:
         proto = json.load(f)
@@ -972,6 +975,21 @@ def load_ab_manifest(path: str, dataset: str, scene: str,
                 f"AB manifest {path}: train_pairs[{i}] teacher_frames_B has "
                 f"{len(p['teacher_frames_B'])} frames != teacher_frames "
                 f"{len(p['teacher_frames'])} (same teacher_N required)")
+        # A/B must share the SAME shared frames at the SAME slots, and the
+        # student frames must equal those slots — reliability compares A/B
+        # positionally; a violation would silently diff different frames.
+        slots = [int(s) for s in proto.get("student_slots", [0, 2, 4, 6])]
+        shared_a = [int(p["teacher_frames"][s]) for s in slots]
+        shared_b = [int(p["teacher_frames_B"][s]) for s in slots]
+        if shared_a != shared_b:
+            raise ValueError(
+                f"AB manifest {path}: train_pairs[{i}] shared slots {slots} differ "
+                f"between A and B ({shared_a} vs {shared_b}) — A/B contexts must "
+                f"differ ONLY in the extras")
+        if shared_a != [int(x) for x in p["student_frames"]]:
+            raise ValueError(
+                f"AB manifest {path}: train_pairs[{i}] student_frames "
+                f"{p['student_frames']} != teacher slots {slots} -> {shared_a}")
         for key in ("teacher_frames", "teacher_frames_B"):
             bad = [ix for ix in p[key] if not (0 <= int(ix) < n_frames)]
             if bad:

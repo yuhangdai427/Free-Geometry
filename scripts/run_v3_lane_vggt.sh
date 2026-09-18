@@ -9,7 +9,7 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=0
 PY=/root/miniconda3/envs/da3/bin/python
 DG=diagnostics/free_geometry
-V2="--v2_ab --v2_probe --v2_ckpt --v2_rel_weight 1.0 --v2_grad_cap --v2_couple_fix --v2_rel_gate_deg 30 --loss_all_pos --v2_baselines_json workspace/protocol_v2/baselines.json"
+V2="--v2_ab --v2_probe --v2_ckpt --v2_rel_weight 1.0 --v2_grad_cap --v2_couple_fix --v2_rel_gate_deg 0 --loss_all_pos --v2_baselines_json workspace/protocol_v2/baselines.json"
 STOPF=workspace/protocol_v2/STOP
 ARM=C2M_RKDC1H
 
@@ -32,6 +32,18 @@ run_ds () {
   [ -f "$STOPF" ] && exit 1
   mkdir -p "$RR"
   cp "workspace/protocol_v2/ab_scene_manifests/$ds/scene_manifest.json" "$RR/scene_manifest.json"
+  # drop scenes whose final ckpt already exists (restart-safe)
+  $PY - "$RR" <<'EOF'
+import json, os, sys
+rr = sys.argv[1]
+mp = os.path.join(rr, "scene_manifest.json")
+m = json.load(open(mp))
+before = len(m["scenes"])
+m["scenes"] = {k: v for k, v in m["scenes"].items()
+               if not os.path.isdir(os.path.join(rr, "ckpts", k, "C2M_RKDC1H", "v2", "step100_lora_peft"))}
+json.dump(m, open(mp, "w"), indent=1)
+print(f"[v3-vggt] manifest scenes: {before} -> {len(m['scenes'])}")
+EOF
   echo "[v3-vggt] $ds train START $(date '+%F %T')"
   # shellcheck disable=SC2086
   $PY $DG/train_arms.py --run_root "$RR" --arms $ARM --epochs 10 --seed 0 --no_eval32 \

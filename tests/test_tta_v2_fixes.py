@@ -16,6 +16,7 @@ Covers:
   6. should_stop best+patience: plateau -> True, new-best reset -> False,
      disqualified entries skipped.
 """
+import json
 import math
 import os
 import sys
@@ -359,3 +360,139 @@ def test_should_stop_skips_disqualified_entries():
              _mk_step(40, {"feature": 0.9, "rkd": 0.9, "couple": 0.9, "rot_deg": 5.0}),
              _mk_step(50, plateau)]
     assert should_stop(trace, cfg) is True  # step40 disqualified -> not counted
+
+
+# ---------------------------------------------------------------------------
+# 7. abs_floor_rel: per-component absolute noise floor (real-trace regression)
+# ---------------------------------------------------------------------------
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def _load_vggt_trace(path):
+    per_step = {}
+    with open(path) as f:
+        for line in f:
+            r = json.loads(line)
+            per_step.setdefault(int(r["step"]), {"step": int(r["step"]), "records": []})
+            per_step[int(r["step"])]["records"].append({
+                "pair_id": r["pair_id"], "mask_id": int(r["mask_id"]),
+                "components": r["components"], "total": r.get("total")})
+    return [per_step[k] for k in sorted(per_step)]
+
+
+def test_abs_floor_rel_electro_real_trace():
+    """workspace/protocol_v2/vggt_eth3d/probe_trace/electro.jsonl: the couple
+    record probe0/mask0 has step0=0.00083 while the component's typical scale
+    is ~0.054. Pre-fix (abs_floor_rel=0, legacy tau rule) the +0.001 noise
+    wiggle read as +108% rel_change and vetoed EVERY candidate -> whole-run
+    false fallback. With the abs_floor_rel noise floor the wiggle is noise;
+    under the redesigned selection rule (catastrophic safety net, default
+    0.5) no candidate is vetoed at all and the best-improvement step wins.
+    """
+    path = os.path.join(_REPO_ROOT, "workspace/protocol_v2/vggt_eth3d/probe_trace/electro.jsonl")
+    if not os.path.exists(path):
+        pytest.skip(f"real trace not available: {path}")
+    trace = _load_vggt_trace(path)
+
+    old = select(trace, ControllerConfig(abs_floor_rel=0.0, catastrophic_rel=None))
+    assert old["fell_back_to_baseline"] is True           # the reported pathology
+    assert old["selected_step"] == 0
+    assert 10 in old["disqualified"] and "couple" in old["disqualified"][10]
+
+    new = select(trace, ControllerConfig())
+    assert new["disqualified"] == {}                      # safety net: no vetoes
+    assert new["fell_back_to_baseline"] is False
+    assert new["selected_step"] == 100
+    assert new["improvement"] > 0
+
+
+def test_abs_floor_rel_mechanics_synthetic():
+    """couple records [0.05, 0.05, 8e-4, 8e-4] -> typical_k = 0.0254,
+    floor = 0.2*0.0254 = 0.00508 (abs), denominator = floor/tau = 0.1016.
+    A +0.001 wiggle passes; a +0.02 jump (2x floor, rel_change 0.197) passes
+    the 0.5 safety net but is caught by the legacy tau rule; a +0.2 jump
+    (rel_change ~2) is catastrophic."""
+    base = _mk_step(0, {"feature": 1.0, "rkd": 1.0, "couple": 0.05, "rot_deg": 1.0})
+    # probe1's couple baseline is near-zero while the component scale is 0.0254
+    for rec in base["records"]:
+        if rec["pair_id"] == "p1":
+            rec["components"]["couple"] = 8e-4
+    noise = _mk_step(5, {"feature": 1.0, "rkd": 1.0, "couple": 0.05, "rot_deg": 1.0})
+    for rec in noise["records"]:
+        if rec["pair_id"] == "p1":
+            rec["components"]["couple"] = 8e-4 + 0.001   # noise-level wiggle
+    old = select([base, noise], ControllerConfig(abs_floor_rel=0.0, catastrophic_rel=None))
+    assert 5 in old["disqualified"] and "couple" in old["disqualified"][5]
+    new = select([base, noise], ControllerConfig())
+    assert 5 not in new["disqualified"]
+    assert new["selected_step"] == 0                     # no improvement either
+
+    jump = _mk_step(7, {"feature": 1.0, "rkd": 1.0, "couple": 0.05, "rot_deg": 1.0})
+    for rec in jump["records"]:
+        if rec["pair_id"] == "p1":
+            rec["components"]["couple"] = 8e-4 + 0.02    # 2x floor: real but mild
+    res = select([base, jump], ControllerConfig())
+    assert 7 not in res["disqualified"]                  # below catastrophic 0.5
+    res_legacy = select([base, jump], ControllerConfig(catastrophic_rel=None))
+    assert 7 in res_legacy["disqualified"]               # legacy tau still vetoes
+
+    cata = _mk_step(9, {"feature": 1.0, "rkd": 1.0, "couple": 0.05, "rot_deg": 1.0})
+    for rec in cata["records"]:
+        if rec["pair_id"] == "p1":
+            rec["components"]["couple"] = 8e-4 + 0.2     # ~2x denominator: catastrophic
+    res = select([base, cata], ControllerConfig())
+    assert 9 in res["disqualified"] and "couple" in res["disqualified"][9]
+
+    # the floor is relative to the component's OWN scale and the WIDER
+    # envelope wins: a +4%-of-typical wiggle sits inside the absolute floor;
+    # a +24% jump is still far below the 0.5 safety net.
+    base2 = _mk_step(0, {"feature": 1.0, "rkd": 1.0, "couple": 0.05, "rot_deg": 1.0})
+    mild = _mk_step(11, {"feature": 1.0, "rkd": 1.0, "couple": 0.052, "rot_deg": 1.0})
+    res = select([base2, mild], ControllerConfig())
+    assert 11 not in res["disqualified"]
+    big = _mk_step(13, {"feature": 1.0, "rkd": 1.0, "couple": 0.062, "rot_deg": 1.0})
+    res = select([base2, big], ControllerConfig())
+    assert 13 not in res["disqualified"]
+
+
+def test_catastrophic_safety_net_semantics():
+    """The terrains motivation: a candidate with a mild (+0.25 rel_change)
+    degradation on ONE (record, component) but the best mean improvement must
+    WIN under the new rule, while the legacy rule vetoes it; a candidate with
+    a genuine catastrophic jump (+0.75 rel_change) is vetoed by the safety
+    net; fallback happens only when the best non-vetoed improvement <
+    min_delta."""
+    names = ("feature", "rkd", "couple", "rot_deg")
+    base = _mk_step(0, {n: 1.0 for n in names})
+    # candidate A: best mean improvement, one mild degradation (rc +0.25)
+    a = _mk_step(20, {n: 0.9 for n in names})
+    for rec in a["records"]:
+        if rec["pair_id"] == "p0" and rec["mask_id"] == 0:
+            rec["components"]["rot_deg"] = 2.0           # rc = 1.0/4.0 = +0.25
+    # candidate B: tiny improvement below min_delta
+    b = _mk_step(40, {n: 0.99 for n in names})
+    # candidate C: catastrophic component (rc +0.75)
+    c = _mk_step(60, {n: 0.9 for n in names})
+    for rec in c["records"]:
+        if rec["pair_id"] == "p0" and rec["mask_id"] == 0:
+            rec["components"]["rot_deg"] = 4.0           # rc = 3.0/4.0 = +0.75
+
+    new = select([base, a, b, c], ControllerConfig())
+    assert new["selected_step"] == 20                    # A wins despite the mild hit
+    assert 60 in new["disqualified"] and "rot_deg" in new["disqualified"][60]
+    assert 40 not in new["disqualified"]                 # B merely loses on rank
+
+    legacy = select([base, a, b, c], ControllerConfig(catastrophic_rel=None))
+    assert 20 in legacy["disqualified"]                  # tau rule vetoes A
+    assert legacy["selected_step"] == 0                  # B < min_delta -> fallback
+    assert legacy["fell_back_to_baseline"] is True
+
+    # fallback only when the best non-vetoed improvement is < min_delta:
+    # B alone -> fallback under the new rule too
+    both = select([base, b], ControllerConfig())
+    assert both["selected_step"] == 0 and both["fell_back_to_baseline"] is True
+    # ... and a clearly-improving candidate still wins
+    strong = _mk_step(80, {n: 0.9 for n in names})
+    res = select([base, strong], ControllerConfig())
+    assert res["selected_step"] == 80 and res["improvement"] > 0.005
+
