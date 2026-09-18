@@ -310,6 +310,13 @@ def main() -> None:
                          "mask on BOTH sides (losses.loss_couple_centers "
                          "semantics), skipping and logging on degenerate spread / "
                          "empty valid mask")
+    ap.add_argument("--v2_rel_tau_gate", type=float, default=0.55,
+                    help="dense-video rel gate: scenes with tau > this skip the "
+                         "v2 rel branch (0 = off)")
+    ap.add_argument("--v2_qfeat_off", action="store_true",
+                    help="protocol v2: do NOT apply q_feat to the feature loss "
+                         "(final config — geometry-side reliability kept; "
+                         "feature downweighting cost VGGT F1)")
     ap.add_argument("--v2_baselines_json", default="workspace/protocol_v2/baselines.json",
                     help="protocol v2: baselines.json for the scene-level "
                          "baseline-vs-TTA swanlab summary (da3.<dataset>.baseline.<scene>)")
@@ -420,6 +427,8 @@ def main() -> None:
                 probe=args.v2_probe, probe_every=args.v2_probe_every,
                 ckpt=args.v2_ckpt, rel_weight=args.v2_rel_weight,
                 grad_cap=args.v2_grad_cap, couple_fix=args.v2_couple_fix,
+                qfeat_off=args.v2_qfeat_off,
+                rel_tau_gate=args.v2_rel_tau_gate,
                 run_dir=args.output_root,
                 ckpt_dir=os.path.join(args.output_root, "ckpts"),
                 ab=args.v2_ab_manifest is not None,

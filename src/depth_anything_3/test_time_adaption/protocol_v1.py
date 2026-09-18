@@ -758,6 +758,8 @@ class V2Config:
     rel_weight: float = 0.0
     grad_cap: bool = False
     couple_fix: bool = False
+    qfeat_off: bool = False
+    rel_tau_gate: float = 0.55
     run_dir: str = "."
     ckpt_dir: str = ""
     ab: bool = False  # dual-teacher A/B contexts + frozen reliability weights
@@ -1413,6 +1415,20 @@ def train_scene_c2m(
         w_rot_base = v2.rel_weight if v2.rot_weight is None else v2.rot_weight
         w_tdir_base = v2.rel_weight if v2.tdir_weight is None else v2.tdir_weight
     rel_requested = (w_rot_base > 0.0) or (w_tdir_base > 0.0)
+    rel_requested_cfg = rel_requested  # CLI-level intent (gates must not trip this)
+    # dense-video rel gate (unified rule; evidence: 7scenes chess rel-on
+    # -9%/-21% vs rel-off +8.8%/+1.5%): scenes with tau > gate skip rel.
+    if rel_requested and v2 is not None and v2.rel_tau_gate > 0:
+        _tau = protocol.get("tau", float("nan"))
+        try:
+            _tau = float(_tau)
+        except (TypeError, ValueError):
+            _tau = float("nan")
+        if _tau == _tau and _tau > v2.rel_tau_gate:
+            log_fn(f"[{scene}] rel TAU-GATED off (tau={_tau:.3f} > "
+                   f"{v2.rel_tau_gate})")
+            w_rot_base = w_tdir_base = 0.0
+            rel_requested = False
     # scene-level rel gate: B=0 student, UNMASKED probe forwards. If even the
     # clean-input teacher-student rotation disagreement is huge, the rel target
     # is untrustworthy/unlearnable for this scene -> disable the rel branch.
@@ -1433,7 +1449,7 @@ def train_scene_c2m(
                    f"{rot_deg_unmasked_median:.1f} deg <= {v2.rel_gate_deg:.1f}")
     rel_active = (w_rot_base > 0.0) or (w_tdir_base > 0.0)
     use_v2_gc = bool(v2 and v2.grad_cap and rel_active)
-    if v2 is not None and v2.grad_cap and not rel_requested:
+    if v2 is not None and v2.grad_cap and not rel_requested_cfg:
         raise ValueError(
             "v2.grad_cap requires --v2_rel_weight > 0 or --v2_rot_weight / "
             "--v2_tdir_weight > 0")
@@ -1480,6 +1496,12 @@ def train_scene_c2m(
         log_fn(f"[{scene}] AB reliability: q_feat mean={q_summary['q_feat_mean']:.3f} "
                f"q10={q_summary['q_feat_q10']:.3f} | q_rot mean={q_summary['q_rot_mean']:.3f} "
                f"q10={q_summary['q_rot_q10']:.3f} | geo_w mean={q_summary['geo_w_mean']:.3f}")
+        if v2 is not None and getattr(v2, "qfeat_off", False):
+            # final config: keep geometry-side reliability (q_rot/q_tdir/geo_w)
+            # but do NOT downweight the feature loss (q_feat cost VGGT F1).
+            # neutralize AFTER the q_summary logging so stats stay complete.
+            for c in train_caches:
+                c["q_feat"] = None
 
     def _run_probe(step_n: int) -> None:
         res = probe_evaluator.evaluate(step_n, probe_forward_fn)
@@ -1604,7 +1626,8 @@ def train_scene_c2m(
             if use_ab:
                 # frozen reliability diagnostics for this pair (constant per pair)
                 extra.setdefault("geo_w", cache["geo_w"])
-                extra["q_feat_mean"] = float(cache["q_feat"].mean())
+                if cache.get("q_feat") is not None:
+                    extra["q_feat_mean"] = float(cache["q_feat"].mean())
                 extra["q_rot_mean"] = float(cache["q_rot"].mean())
             g_base_norm = g_R_norm = g_rot_norm = g_tdir_norm = c_R = None
             if use_v2_gc:

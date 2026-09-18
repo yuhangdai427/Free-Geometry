@@ -15,9 +15,15 @@ the running protocol; only the A/B split is new.
 
 Output: <out>/<ds>/<scene>.json, schema-compatible with the existing protocol
 JSONs (train pairs gain the optional teacher_frames_B / extras_A / extras_B /
-ab_overlap / n_candidates keys; probe pairs are unchanged v1 pairs). Top level
-gains protocol_version="v2ab", degraded, degrade_reasons, bad_files and AB
-statistics (ab_overlap_mean / ab_overlap_max / n_candidates_mean).
+ab_overlap / n_candidates keys; probe pairs are unchanged v1-style pairs at the
+scene's teacher_N). Top level gains protocol_version="v2ab", degraded,
+degrade_reasons, bad_files and AB statistics (ab_overlap_mean / ab_overlap_max
+/ n_candidates_mean). teacher_N convention: --teacher_n 8 (default; DA3 v2ab,
+8:4 everywhere) or auto16 (old VGGT manifest rule: 16:4 for N>=16, 8:4 below).
+A/B extras are disjoint-preferred; candidate shortage (pool smaller than
+shared + 2*extras) yields a recorded ab_overlap > 0 without degrading — the
+VGGT 16:4 convention explicitly accepts this (e.g. N=26 -> 2 overlapping
+frames); degradation tracks only bad files, N<12 pools and dedup exhaustion.
 
 Data-loader validation: every image file is checked for existence, non-zero
 size and a known image extension (header-level check; deliberately no full
@@ -42,13 +48,22 @@ import common as fg_common  # noqa: E402
 from depth_anything_3.test_time_adaption import protocol_v1 as P  # noqa: E402
 
 N_SHARED = 4
-N_EXTRAS = 4
+N_EXTRAS = 4  # extras per context when teacher_N = 8 (DA3 v2ab convention)
 TEACHER_N = N_SHARED + N_EXTRAS  # 8-frame teacher contexts (4 shared + 4 extras)
 OVERLAP_LO, OVERLAP_HI = P.OVERLAP_LO, P.OVERLAP_HI
 MIN_SCENE_N = 8   # below this the protocol drops the scene (protocol_v1 parity)
 DEGRADED_N = 12   # below this A/B extras cannot be fully disjoint -> degraded
 WINDOW = 40       # dense-branch candidate-window cap (bounds the SIFT ranking cost)
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".heic"}
+
+
+def teacher_n_for(N: int, mode: str = "8") -> int:
+    """Per-scene teacher_N convention. "8": fixed 8:4 everywhere (DA3 v2ab).
+    "auto16": the old VGGT manifest rule — 16:4 for N>=16, 8:4 below (matching
+    build_final_manifest's `teacher_N = 16 if N >= 16 else 8`)."""
+    if mode == "auto16":
+        return 16 if N >= 16 else 8
+    return 8
 
 
 # ---------------------------------------------------------------------------
@@ -125,34 +140,47 @@ def split_ab(scored: Sequence[Tuple[int, float]], n_extras: int = N_EXTRAS):
 
 
 def build_ab_train_pair(N: int, dense: bool, frac: Callable[[int, int], float], rng: random.Random,
-                        n_shared: int = N_SHARED, n_extras: int = N_EXTRAS,
+                        n_shared: int = N_SHARED, teacher_N: int = TEACHER_N,
                         overlap_lo: float = OVERLAP_LO, overlap_hi: float = OVERLAP_HI,
                         window: int = WINDOW) -> Dict:
     """One AB train task over a frame pool of size N (pool coordinates).
 
     Shared-group sampling keeps protocol_v1's tau dispatch: dense (tau>0.55)
-    equidistant window of <=`window` frames; random otherwise (12-frame random
-    window = 4 shared + 8 candidate slots, protocol_v1's random-branch style).
-    Extras A/B are always SIFT-ranked against the shared group (rank_candidates)
-    and disjoint-preferred (split_ab).
+    equidistant window (>= n_shared + 2*n_extras frames when the pool allows);
+    random otherwise (window of n_shared + 2*n_extras random frames). Extras
+    A/B (n_extras = teacher_N - n_shared per context) are always SIFT-ranked
+    against the shared group (rank_candidates) and disjoint-preferred
+    (split_ab); candidate shortage -> B reuses A's best, recorded in ab_overlap
+    (NOT degraded: acceptable, per the 16:4 VGGT convention).
 
     Returns {teacher_frames (A assembly), teacher_frames_B, student_frames,
     extras_A, extras_B, ab_overlap, n_candidates, overlap_mean_A/B, ...} with
     the shared frames at even slots [0,2,4,6] of BOTH teacher lists
-    (protocol_v1.assemble_teacher_list).
+    (protocol_v1.assemble_teacher_list; extras fill the remaining slots).
     """
+    n_extras = teacher_N - n_shared
     if N < n_shared + 1:
         raise ValueError(f"pool N={N} too small for n_shared={n_shared}")
     if dense:
-        M = min(N, window)
+        M = min(N, max(window, n_shared + 2 * n_extras))
         step = N / M
         off = rng.uniform(0, step)
         sup = sorted(set(int(off + i * step) for i in range(M)))[:M]
+        stride = max(1, len(sup) // n_shared)
+        shared = sorted(sup[::stride][:n_shared])
     else:
-        need = min(N, n_shared + 2 * n_extras)
-        sup = sorted(rng.sample(range(N), need))
-    stride = max(1, len(sup) // n_shared)
-    shared = sorted(sup[::stride][:n_shared])
+        need = n_shared + 2 * n_extras
+        if need < N:
+            sup = sorted(rng.sample(range(N), need))
+            stride = max(1, len(sup) // n_shared)
+            shared = sorted(sup[::stride][:n_shared])
+        else:
+            # pool smaller than one full A+B window: the window IS the whole
+            # pool, so a sorted stride pick would be deterministic ([0, s, 2s,
+            # ...] every task); draw the shared group at random instead so
+            # tasks stay distinct.
+            shared = sorted(rng.sample(range(N), n_shared))
+            sup = list(range(N))
     candidates = [f for f in sup if f not in set(shared)]
     scored = rank_candidates(candidates, shared, frac, overlap_lo, overlap_hi)
     A, B, sA, sB, ncand = split_ab(scored, n_extras)
@@ -180,11 +208,13 @@ class _FracAdapter:
 
 
 def sample_ab_tasks(N: int, dense: bool, frac: Callable[[int, int], float], dataset: str, scene: str,
-                    n_train: int = 10, n_probe: int = 2, window: int = WINDOW
+                    n_train: int = 10, n_probe: int = 2, window: int = WINDOW,
+                    teacher_N: int = TEACHER_N
                     ) -> Tuple[List[Dict], List[Dict], Dict]:
     """10 AB train tasks (shared-group dedup) + 2 single-context probe pairs
-    (protocol_v1.build_pair, key-disjoint from train). Pool coordinates; the
-    caller maps to global image_files indices. Returns (train, probe, meta)."""
+    (protocol_v1.build_pair at the scene's teacher_N, key-disjoint from train).
+    Pool coordinates; the caller maps to global image_files indices.
+    Returns (train, probe, meta)."""
     r = random.Random(P.stable_seed("ab_train", dataset, scene))
     forb_s: set = set()
     forb_union: set = set()
@@ -192,61 +222,78 @@ def sample_ab_tasks(N: int, dense: bool, frac: Callable[[int, int], float], data
     tries = 0
     while len(train) < n_train and tries < 10000:
         tries += 1
-        rec = build_ab_train_pair(N, dense, frac, r, window=window)
+        rec = build_ab_train_pair(N, dense, frac, r, window=window, teacher_N=teacher_N)
         key_s = tuple(rec["student_frames"])
         key_u = tuple(sorted(set(rec["teacher_frames"]) | set(rec["teacher_frames_B"])))
-        if key_s in forb_s or key_u in forb_union:
+        # union-key dedup is skipped when the union spans the whole pool: for
+        # small-N 16:4 scenes (e.g. N=26 -> union == 26 frames every time) a
+        # union collision is structural, not a duplicated task — the shared
+        # group is then the meaningful discriminator.
+        full_pool = len(key_u) >= N
+        if key_s in forb_s or (not full_pool and key_u in forb_union):
             continue
         forb_s.add(key_s)
         forb_union.add(key_u)
         train.append(rec)
     train_short = len(train) < n_train
     while len(train) < n_train:  # tiny-scene fallback: fill anyway (protocol_v1 parity)
-        train.append(build_ab_train_pair(N, dense, frac, r, window=window))
+        train.append(build_ab_train_pair(N, dense, frac, r, window=window, teacher_N=teacher_N))
 
     adapter = _FracAdapter(frac)
     rp = random.Random(P.stable_seed("ab_probe", dataset, scene))
+    # a single-context probe must not replicate ANY train context (A or B)
+    probe_collide = forb_union \
+        | {tuple(sorted(p["teacher_frames"])) for p in train} \
+        | {tuple(sorted(p["teacher_frames_B"])) for p in train}
     probe: List[Dict] = []
     tries = 0
     while len(probe) < n_probe and tries < 10000:
         tries += 1
-        teacher, shared = P.build_pair(N, TEACHER_N, dense, adapter, rp, n_shared=N_SHARED)
+        teacher, shared = P.build_pair(N, teacher_N, dense, adapter, rp, n_shared=N_SHARED)
         key_s = tuple(sorted(shared))
         key_t = tuple(sorted(teacher))
-        if key_s in forb_s or key_t in forb_union:
+        if key_s in forb_s or key_t in probe_collide:
             continue
         forb_s.add(key_s)
-        forb_union.add(key_t)
+        probe_collide.add(key_t)
         probe.append({"teacher_frames": [int(i) for i in teacher],
                       "student_frames": [int(i) for i in shared],
-                      "teacher_N": TEACHER_N, "n_shared": N_SHARED, "kind": "fixed"})
+                      "teacher_N": teacher_N, "n_shared": N_SHARED, "kind": "fixed"})
     probe_short = len(probe) < n_probe
     while len(probe) < n_probe:
-        teacher, shared = P.build_pair(N, TEACHER_N, dense, adapter, rp, n_shared=N_SHARED)
+        teacher, shared = P.build_pair(N, teacher_N, dense, adapter, rp, n_shared=N_SHARED)
         probe.append({"teacher_frames": [int(i) for i in teacher],
                       "student_frames": [int(i) for i in shared],
-                      "teacher_N": TEACHER_N, "n_shared": N_SHARED, "kind": "fixed"})
+                      "teacher_N": teacher_N, "n_shared": N_SHARED, "kind": "fixed"})
     return train, probe, {"train_dedup_short": train_short, "probe_dedup_short": probe_short}
 
 
 def build_ab_scene_protocol(image_files: Sequence[str], scene: str, dataset: str = "scannetpp",
-                            n_train: int = 10, n_probe: int = 2, window: int = WINDOW) -> Dict:
+                            n_train: int = 10, n_probe: int = 2, window: int = WINDOW,
+                            teacher_n_mode: str = "8") -> Dict:
     """Full per-scene v2ab manifest. `frac` comes from a protocol_v1 SiftCache
     over the VALID files; all sampling runs in valid-pool coordinates and is
     mapped back to global image_files indices at the end. Raises if fewer than
-    MIN_SCENE_N valid images (scene dropped, protocol_v1 parity)."""
+    MIN_SCENE_N valid images (scene dropped, protocol_v1 parity). teacher_N
+    follows teacher_n_for(Nv, teacher_n_mode): "8" fixed 8:4 (DA3), "auto16"
+    the old VGGT rule 16 if N>=16 else 8. Candidate shortage for fully-disjoint
+    A/B extras is RECORDED via ab_overlap but does NOT degrade the scene
+    (acceptable per the 16:4 VGGT convention); degradation only tracks bad
+    files, N<12 pools, and dedup-space exhaustion."""
     image_files = [os.path.join(ROOT, p) if not os.path.isabs(p) else p for p in image_files]
     N = len(image_files)
     valid_idx, bad_files = collect_valid_files(image_files)
     Nv = len(valid_idx)
     if Nv < MIN_SCENE_N:
         raise ValueError(f"{scene}: only {Nv} valid images (< {MIN_SCENE_N}), scene dropped")
+    teacher_N = teacher_n_for(Nv, teacher_n_mode)
     valid_files = [image_files[i] for i in valid_idx]
     tau = P.compute_tau(valid_files)
     dense = tau > P.TAU_THRESHOLD
     sc = P.SiftCache(valid_files)
     train, probe, samp_meta = sample_ab_tasks(Nv, dense, sc.frac, dataset, scene,
-                                              n_train=n_train, n_probe=n_probe, window=window)
+                                              n_train=n_train, n_probe=n_probe, window=window,
+                                              teacher_N=teacher_N)
     # pool coordinates -> global image_files indices
     for rec in train:
         for k in ("teacher_frames", "teacher_frames_B", "student_frames", "extras_A", "extras_B"):
@@ -269,6 +316,13 @@ def build_ab_scene_protocol(image_files: Sequence[str], scene: str, dataset: str
 
     ab = [rec["ab_overlap"] for rec in train]
     nc = [rec["n_candidates"] for rec in train]
+    n_extras = teacher_N - N_SHARED
+    full_identity = bool(ab) and max(ab) >= n_extras  # B fully reuses A: u == 0
+    degraded = degraded or full_identity
+    if full_identity:
+        reasons.append(f"A/B extras fully overlap (ab_overlap_max={max(ab)} >= "
+                       f"n_extras={n_extras}): contexts A and B are identical, "
+                       f"the cross-check carries no signal")
     if N >= 100:
         r = random.Random(42)
         idx = list(range(N))
@@ -277,7 +331,8 @@ def build_ab_scene_protocol(image_files: Sequence[str], scene: str, dataset: str
     else:
         eval_frames = list(range(N))
     return {"scene": scene, "dataset": dataset, "protocol_version": "v2ab",
-            "N": N, "N_valid": Nv, "teacher_N": TEACHER_N, "tau": tau,
+            "N": N, "N_valid": Nv, "teacher_N": teacher_N,
+            "teacher_n_mode": teacher_n_mode, "tau": tau,
             "strategy": "ab_dense_window_sift" if dense else "ab_random_window_sift",
             "degraded": degraded, "degrade_reasons": reasons, "bad_files": bad_files,
             "train_pairs": train, "probe_pairs": probe,
@@ -321,10 +376,13 @@ def main() -> None:
     ap.add_argument("--n_train", type=int, default=10)
     ap.add_argument("--n_probe", type=int, default=2)
     ap.add_argument("--window", type=int, default=WINDOW)
+    ap.add_argument("--teacher_n", choices=["8", "auto16"], default="8",
+                    help="per-scene teacher_N convention: '8' = fixed 8:4 (DA3 v2ab); "
+                         "'auto16' = old VGGT manifest rule, 16:4 for N>=16 else 8:4")
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
 
-    summary: Dict = {"out": args.out, "datasets": {}}
+    summary: Dict = {"out": args.out, "teacher_n": args.teacher_n, "datasets": {}}
     for ds in args.datasets:
         try:
             scenes = discover_scenes(ds)
@@ -347,7 +405,8 @@ def main() -> None:
                 data = fg_common.get_scene_data(scene)
                 proto = build_ab_scene_protocol(list(data.image_files), scene, ds,
                                                 n_train=args.n_train, n_probe=args.n_probe,
-                                                window=args.window)
+                                                window=args.window,
+                                                teacher_n_mode=args.teacher_n)
                 proto["gt_intrinsics"] = np.asarray(data.intrinsics).astype(float).tolist()
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "w") as f:
@@ -356,7 +415,8 @@ def main() -> None:
                 if proto["degraded"]:
                     ds_stat["degraded"] += 1
                 ds_stat["ab_overlap_means"].append(proto["ab_overlap_mean"])
-                print(f"[{tag}] N={proto['N']} Nv={proto['N_valid']} tau={proto['tau']:.3f} "
+                print(f"[{tag}] N={proto['N']} Nv={proto['N_valid']} tN={proto['teacher_N']} "
+                      f"tau={proto['tau']:.3f} "
                       f"dense={proto['strategy'].startswith('ab_dense')} "
                       f"ab_ov_mean={proto['ab_overlap_mean']:.2f} "
                       f"degraded={proto['degraded']} {proto['degrade_reasons']}", flush=True)

@@ -69,6 +69,7 @@ def check_scene_entry(scene: str, sc: Dict, require_ab: bool = True) -> Tuple[Li
     degraded = bool(sc.get("degraded", False))
     train, probe = sc["train_pairs"], sc["probe_pairs"]
     shared_keys, union_keys = set(), set()
+    N_total = sc.get("num_frames_total", 0)
     for pi, p in enumerate(train):
         t = p["teacher_frames"]
         if p["student_frames"] != [t[i] for i in STUDENT_SLOTS]:
@@ -79,7 +80,9 @@ def check_scene_entry(scene: str, sc: Dict, require_ab: bool = True) -> Tuple[Li
         dup = []
         if ks in shared_keys:
             dup.append("shared group duplicated")
-        if ku in union_keys:
+        # union-key dedup is structurally impossible when the union spans the
+        # whole pool (small-N 16:4 scenes): the shared group discriminates.
+        if len(set(ku)) < N_total and ku in union_keys:
             dup.append("A-union-B duplicated")
         if dup:
             (warnings if degraded else issues).append(f"{scene}: train{pi} {', '.join(dup)}")
@@ -96,7 +99,9 @@ def check_scene_entry(scene: str, sc: Dict, require_ab: bool = True) -> Tuple[Li
                     issues.append(f"{scene}: train{pi} B slots != shared")
                 if len(set(tb)) != len(tb):
                     issues.append(f"{scene}: train{pi} teacher B has duplicate frames")
-    probe_collide = union_keys | {tuple(sorted(x["teacher_frames"])) for x in train}
+    probe_collide = union_keys \
+        | {tuple(sorted(x["teacher_frames"])) for x in train} \
+        | {tuple(sorted(x["teacher_frames_B"])) for x in train}
     for pi, p in enumerate(probe):
         t = p["teacher_frames"]
         if p["student_frames"] != [t[i] for i in STUDENT_SLOTS]:
@@ -171,7 +176,8 @@ def merge_dataset(ds: str, ab_dir: str, ref_path: Optional[str], out_dir: str,
     note = (
         f"protocol v2 phase-C A/B context manifest (merged {np.datetime64('now')}): "
         f"train_pairs/probe_pairs from {ab_root}/{ds} (v2ab: 10 tasks, one shared "
-        f"group S(4) under two 8-frame teacher contexts A/B, shared at slots "
+        f"group S(4) under two teacher contexts A/B of equal length "
+        f"(len = first pair's teacher_frames), shared at slots "
         f"[0,2,4,6], extras SIFT-ranked disjoint-preferred; 2 single-context "
         f"probes; per-pair teacher_frames_B / ab_overlap / n_candidates kept). "
     )
