@@ -417,8 +417,10 @@ def loss_ctk(cam_s: Dict[int, torch.Tensor],
 
 
 def loss_pose_rel(ext_s_w2c: torch.Tensor, ext_t_w2c: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Relative-pose loss (identical form to VGGT loss_pose_rel): per view-pair
-    rotation chordal + translation-direction 1-cos, scale-free.
+    """Relative-pose loss, CORRECTED w2c construction (2026-09-18):
+    T_{i<-j} = E_i @ inv(E_j) (NOT inv(E_i) @ E_j).
+    R_rel = R_i @ R_j^T,  t_rel = t_i - R_i @ R_j^T @ t_j.
+    Per view-pair rotation chordal + translation-direction 1-cos, scale-free.
     ext_*: [S,4,4] or [1,S,4,4] w2c extrinsics (student grad, teacher detached)."""
     if ext_s_w2c.dim() == 4:
         ext_s_w2c = ext_s_w2c[0]
@@ -430,10 +432,11 @@ def loss_pose_rel(ext_s_w2c: torch.Tensor, ext_t_w2c: torch.Tensor) -> Tuple[tor
     rot_loss, tdir_loss, npairs = 0.0, 0.0, 0
     for i in range(S):
         for j in range(i + 1, S):
-            Rr_s = R_s[i].transpose(-1, -2) @ R_s[j]
-            Rr_t = R_t[i].transpose(-1, -2) @ R_t[j]
-            tr_s = R_s[i].transpose(-1, -2) @ (t_s[j] - t_s[i])[..., None]
-            tr_t = R_t[i].transpose(-1, -2) @ (t_t[j] - t_t[i])[..., None]
+            # Correct: T_{i<-j} = E_i @ inv(E_j)
+            Rr_s = R_s[i] @ R_s[j].transpose(-1, -2)
+            Rr_t = R_t[i] @ R_t[j].transpose(-1, -2)
+            tr_s = (t_s[i] - Rr_s @ t_s[j])[..., None] if t_s.dim() == 2 else t_s[i] - Rr_s @ t_s[j]
+            tr_t = (t_t[i] - Rr_t @ t_t[j])[..., None] if t_t.dim() == 2 else t_t[i] - Rr_t @ t_t[j]
             rot_loss = rot_loss + ((Rr_s - Rr_t) ** 2).sum(dim=(-2, -1)).mean()
             tn_s = F.normalize(tr_s.squeeze(-1), dim=-1, eps=1e-8)
             tn_t = F.normalize(tr_t.squeeze(-1), dim=-1, eps=1e-8)
@@ -712,9 +715,9 @@ def loss_couple_w2c(ext_s: torch.Tensor, depth_s: torch.Tensor,
 
 def compute_rkdc1h_loss(student, teacher_cache: Dict, images4_in: torch.Tensor,
                         patch_mask: torch.Tensor, rkd_weight: float = 1.5,
-                        couple_weight: float = 1.0):
-    """RKDC1H for DA3 = maskdistill + rkd_weight * rkd_huber + couple_weight * couple
-    (no rel term), the DA3 port of the VGGT scannetpp champion arm."""
+                        couple_weight: float = 1.0, rel_weight: float = 0.0):
+    """RKDC1H(+R) for DA3 = maskdistill + rkd_weight*rkd_huber + couple_weight*couple
+    + rel_weight*rel_corrected (rel_weight>0 enables the corrected rel term)."""
     tap_feats_s, ext_s, depth_s = student_forward_c2m(student, images4_in, with_depth=True)
     device = images4_in.device
     cache = {
@@ -729,8 +732,13 @@ def compute_rkdc1h_loss(student, teacher_cache: Dict, images4_in: torch.Tensor,
     cp_loss, cp_extra = loss_couple_w2c(ext_s, depth_s, ext_t,
                                         teacher_cache["depth4"].to(device),
                                         teacher_cache["conf4"].to(device))
-    return feat_loss + rkd_weight * rkd_loss + couple_weight * cp_loss, \
-        {**feat_extra, **rkd_extra, **cp_extra}
+    total = feat_loss + rkd_weight * rkd_loss + couple_weight * cp_loss
+    extra = {**feat_extra, **rkd_extra, **cp_extra}
+    if rel_weight > 0:
+        rel_loss, rel_extra = loss_pose_rel(ext_s, ext_t)
+        total = total + rel_weight * rel_loss
+        extra.update(rel_extra)
+    return total, extra
 
 
 def compute_rkdc1hc_loss(student, teacher_cache: Dict, images4_in: torch.Tensor,
@@ -832,6 +840,7 @@ def train_scene_c2m(
     mask_layer: int = 12,
     mask_loss_positions: bool = True,
     ctk_weight: float = 1.0,
+    rel_weight: float = 1.0,
     two_stage: float = 0.0,
     early_stop: bool = False,
     es_min_steps: int = 30,
@@ -875,7 +884,10 @@ def train_scene_c2m(
     params = student.get_trainable_params()
     optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=WD)
     n_steps = min(steps, n_train * epochs)
-    warm = int(n_train * epochs * WARMUP_RATIO)
+    # FIX 2026-09-17: schedule follows the ACTUAL step budget, not n_train*epochs.
+    # Otherwise 20-pair runs (n_train*epochs=200, steps=100) only reach 64% of
+    # the cosine at step 100, silently changing the LR curve with pair count.
+    warm = max(1, round(n_steps * WARMUP_RATIO))
     # plateau checks must not fire during/right after the LR warmup ramp
     # (a 20-pair run warms up for 30 steps; comparing windows that still sit
     # inside the ramp falsely reads as convergence -> premature stop)
@@ -883,7 +895,7 @@ def train_scene_c2m(
     scheduler = SequentialLR(
         optimizer,
         [LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warm),
-         CosineAnnealingLR(optimizer, T_max=n_train * epochs - warm, eta_min=1e-8)],
+         CosineAnnealingLR(optimizer, T_max=n_steps - warm, eta_min=1e-8)],
         [warm],
     )
 
@@ -927,21 +939,28 @@ def train_scene_c2m(
                 images4_in = images4
                 pmask = draw_patch_mask(images4.shape[1], patch_hw, mask_ratio,
                                         gen, device=images4.device)
+            # FIX 2026-09-17: separate the corruption mask (what gets hidden
+            # from the student) from the loss mask (which positions are
+            # supervised). Token hooks must always receive the 50% Omega,
+            # regardless of the supervision mode.
+            corruption_mask = pmask.clone()
             if not mask_loss_positions:
-                # ablation (--loss_all_pos): supervise ALL patch positions so the
-                # supervision set is identical across every mask_mode arm
+                # ablation (--loss_all_pos): supervise ALL patch positions
                 pmask = torch.ones_like(pmask)
             hook = None
             if mask_mode in ("token_shallow", "token_feat"):
                 vit = _unwrap_pretrained(student.da3.model.backbone)
                 hook = install_token_mask(
-                    vit, pmask,
+                    vit, corruption_mask,
                     "shallow" if mask_mode == "token_shallow" else "feat",
                     mask_layer=mask_layer)
             torch.manual_seed(stable_seed("cf_rng", scene, epoch, pi, seed))
             if arm == "rkdc1hc":
                 loss, extra = compute_rkdc1hc_loss(student, cache, images4_in, pmask,
                                                    ctk_weight=ctk_weight)
+            elif arm == "rkdc1hr":
+                loss, extra = compute_rkdc1h_loss(student, cache, images4_in, pmask,
+                                                  rel_weight=rel_weight)
             elif arm == "rkdc1h":
                 loss, extra = compute_rkdc1h_loss(student, cache, images4_in, pmask)
             else:

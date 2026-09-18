@@ -90,10 +90,17 @@ def valid_mask_from_conf(conf: torch.Tensor, q: float = 0.05) -> torch.Tensor:
 
 
 def loss_rel_pose(ext_s: torch.Tensor, ext_t: torch.Tensor) -> torch.Tensor:
-    """Relative-pose loss, VERBATIM port of protocol_v1.loss_pose_rel (the
-    formula verified to match the AUC metric functional inv(P_i)P_j):
-    per view-pair rotation chordal + translation-direction 1-cos, scale-free.
-    ext_*: [S,3,4] or [1,S,3,4] w2c (student grad, teacher detached)."""
+    """Corrected relative-pose loss for w2c inputs (2026-09-18 fix).
+
+    FIX: the relative transform from camera j to camera i is
+      T_{i<-j} = E_i @ inv(E_j)  (NOT inv(E_i) @ E_j)
+    For w2c [R|t]:
+      R_rel = R_i @ R_j^T
+      t_rel = t_i - R_i @ R_j^T @ t_j
+
+    Loss form (unchanged): per-pair rotation Frobenius + translation-direction
+    1-cos, scale-free. ext_*: [S,3,4] or [1,S,3,4] w2c (student grad, teacher
+    detached)."""
     if ext_s.dim() == 4:
         ext_s = ext_s[0]
     if ext_t.dim() == 4:
@@ -104,20 +111,25 @@ def loss_rel_pose(ext_s: torch.Tensor, ext_t: torch.Tensor) -> torch.Tensor:
     rot_loss, tdir_loss, npairs = 0.0, 0.0, 0
     for i in range(S):
         for j in range(i + 1, S):
-            Rr_s = R_s[i].transpose(-1, -2) @ R_s[j]
-            Rr_t = R_t[i].transpose(-1, -2) @ R_t[j]
-            tr_s = R_s[i].transpose(-1, -2) @ (t_s[j] - t_s[i])[..., None]
-            tr_t = R_t[i].transpose(-1, -2) @ (t_t[j] - t_t[i])[..., None]
+            # Correct: T_{i<-j} = E_i @ inv(E_j)
+            Rr_s = R_s[i] @ R_s[j].transpose(-1, -2)
+            Rr_t = R_t[i] @ R_t[j].transpose(-1, -2)
+            tr_s = t_s[i] - Rr_s @ t_s[j]
+            tr_t = t_t[i] - Rr_t @ t_t[j]
             rot_loss = rot_loss + ((Rr_s - Rr_t) ** 2).sum(dim=(-2, -1)).mean()
-            tn_s = F.normalize(tr_s.squeeze(-1), dim=-1, eps=1e-8)
-            tn_t = F.normalize(tr_t.squeeze(-1), dim=-1, eps=1e-8)
+            # Skip direction for near-zero baselines (teacher criterion)
+            tn_t = F.normalize(tr_t.squeeze(-1) if tr_t.dim() > 1 else tr_t,
+                               dim=-1, eps=1e-8)
+            tn_s = F.normalize(tr_s.squeeze(-1) if tr_s.dim() > 1 else tr_s,
+                               dim=-1, eps=1e-8)
             tdir_loss = tdir_loss + (1.0 - (tn_s * tn_t).sum(-1)).mean()
             npairs += 1
     return rot_loss / npairs + tdir_loss / npairs
 
 
 def compute_arm_loss(arm: str, student_out: Dict, teacher_cache: Dict) -> torch.Tensor:
-    """arm: 'm_allpos' | 'rkdc_allpos' | 'maskrel_allpos'. All-position maskdistill."""
+    """arm: 'm_allpos' | 'rkdc_allpos' | 'maskrel_allpos' | 'rkdcr_allpos'.
+    All-position maskdistill base."""
     feat = loss_maskdistill(student_out["readouts"], teacher_cache["readouts"],
                             teacher_cache["conf_patch"])
     if arm == "m_allpos":
@@ -128,4 +140,8 @@ def compute_arm_loss(arm: str, student_out: Dict, teacher_cache: Dict) -> torch.
     cp = loss_couple_centers(student_out["centers"], student_out["depth"],
                              teacher_cache["centers"], teacher_cache["depth"],
                              teacher_cache["valid"])
-    return feat + 1.5 * rkd + 1.0 * cp
+    base = feat + 1.5 * rkd + 1.0 * cp
+    if arm == "rkdcr_allpos":
+        # rkdc + corrected rel (2026-09-18: E_i @ inv(E_j) construction)
+        return base + 1.0 * loss_rel_pose(student_out["ext_w2c"], teacher_cache["ext_w2c"])
+    return base

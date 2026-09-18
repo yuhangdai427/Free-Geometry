@@ -768,9 +768,11 @@ def loss_b_patchform(depth_head, teacher_cache, feats24_s, patch_hw, space: str,
 
 
 def loss_pose_rel(pose_s: torch.Tensor, pose_t: torch.Tensor) -> torch.Tensor:
-    """Relative-pose loss aligned with the AUC metric definition:
-    per view-pair geodesic-friendly rotation chordal loss + translation
-    DIRECTION cosine loss (scale-free). pose_*: [1,S,9] pose encodings."""
+    """Relative-pose loss, CORRECTED w2c construction (2026-09-18):
+    T_{i<-j} = E_i @ inv(E_j), NOT inv(E_i) @ E_j.
+    R_rel = R_i @ R_j^T,  t_rel = t_i - R_i @ R_j^T @ t_j.
+    Loss form unchanged: rotation chordal + translation-direction 1-cos.
+    pose_*: [1,S,9] pose encodings."""
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
     H, W = 378, 504
@@ -783,10 +785,10 @@ def loss_pose_rel(pose_s: torch.Tensor, pose_t: torch.Tensor) -> torch.Tensor:
     rot_loss, tdir_loss, npairs = 0.0, 0.0, 0
     for i in range(S):
         for j in range(i + 1, S):
-            Rr_s = R_s[:, i].transpose(-1, -2) @ R_s[:, j]
-            Rr_t = R_t[:, i].transpose(-1, -2) @ R_t[:, j]
-            tr_s = R_s[:, i].transpose(-1, -2) @ (t_s[:, j] - t_s[:, i])[..., None]
-            tr_t = R_t[:, i].transpose(-1, -2) @ (t_t[:, j] - t_t[:, i])[..., None]
+            Rr_s = R_s[:, i] @ R_s[:, j].transpose(-1, -2)
+            Rr_t = R_t[:, i] @ R_t[:, j].transpose(-1, -2)
+            tr_s = t_s[:, i] - Rr_s @ t_s[:, j][..., None]
+            tr_t = t_t[:, i] - Rr_t @ t_t[:, j][..., None]
             rot_loss = rot_loss + ((Rr_s - Rr_t) ** 2).sum(dim=(-2, -1)).mean()
             tn_s = torch.nn.functional.normalize(tr_s.squeeze(-1), dim=-1, eps=1e-8)
             tn_t = torch.nn.functional.normalize(tr_t.squeeze(-1), dim=-1, eps=1e-8)
@@ -1692,6 +1694,16 @@ def compute_loss(arm, a1, base, teacher_cache, feats24_s, preds, patch_hw, step=
         cp, cp_extra = loss_couple(preds["pose_enc"], preds["depth"], pt,
                                    teacher_cache["depth4"], teacher_cache.get("conf4"))
         return feat + 1.5 * rkd + 1.0 * cp, {**extra, **rkd_extra, **cp_extra}
+    if arm == "C2M_RKDCR1H":
+        # rkdc1h + corrected rel pose (E_i @ inv(E_j) construction, 2026-09-18)
+        feat, extra = loss_b5_maskdistill(base.depth_head, teacher_cache, feats24_s, patch_hw, patch_mask)
+        pt = teacher_cache["pose_enc8"][:, STUDENT_INDICES].float()
+        rkd, rkd_extra = loss_rkd_shared_pose_huber(preds["pose_enc"], pt)
+        cp, cp_extra = loss_couple(preds["pose_enc"], preds["depth"], pt,
+                                   teacher_cache["depth4"], teacher_cache.get("conf4"))
+        rel, rel_extra = loss_pose_rel(preds["pose_enc"], pt)
+        return feat + 1.5 * rkd + 1.0 * cp + 1.0 * rel, \
+            {**extra, **rkd_extra, **cp_extra, **rel_extra}
     if arm == "C2M_RKDC1HC":
         feat, extra = loss_b5_maskdistill(base.depth_head, teacher_cache, feats24_s, patch_hw, patch_mask)
         pt = teacher_cache["pose_enc8"][:, STUDENT_INDICES].float()
@@ -2064,6 +2076,10 @@ def main():
                     help="ablation: keep the 50%% masked student input but compute the "
                          "distill loss on ALL patch positions (default: MGD-style, "
                          "masked positions only)")
+    ap.add_argument("--mask_mode", default="image", choices=["image", "token"],
+                    help="image = mask input pixels (default); token = clean input, "
+                         "zero 50%% of patch tokens at aggregator.patch_embed output "
+                         "(feature-level masking, after DINOv2, before aggregator blocks)")
     args = ap.parse_args()
     torch.manual_seed(args.seed)
     if args.ema_teacher and args.full_ft:
@@ -2284,10 +2300,10 @@ def main():
                     pmask = None
                     images4_in = images4
                     if arm in ("B5_maskdistill", "C2M_maskrel", "MD25", "MD75", "CONFD",
-                               "C2M_CamRel", "CONFD_REL", "B5_CTK", "C2M_CTK", "C2M_REL10", "C2M_REL2", "C2M_TRIP", "C2M_TRIF", "C2M_TRIF2", "C2M_TRIF3", "C2M_HARD", "C2M_SCL", "C2M_CYC", "C2M_CONFP", "C2M_GATE", "C2M_ABS", "C2M_ABS_REL", "C2M_ABSR", "C2M_ABSW1", "C2M_ABSR5", "C2M_RELAT", "C2M_RABS1", "C2M_RABS5", "C2M_RABS3", "C2M_XSH", "C2M_XSHA", "C2M_XAC", "C2M_XAC2", "C2M_XSH1", "C2M_XSHS", "C2M_XSH1S", "C2M_NREL", "C2M_RKD15", "C2M_RKDC", "C2M_RKDS", "C2M_XEXT", "C2M_RKDC1", "C2M_RKDC1R", "C2M_RKDC1A", "C2M_RKDC1H", "C2M_RKDC1HC", "C2M_maskrel_CTK", "C2M_RKDC2", "C2M_RKDC3", "C2M_RELC", "C2M_RKLH", "C2M_RELCH", "C2M_RKCX", "C2M_RKDCX", "C2M_RKDT16", "C2M_RKDCX3", "C2M_XAP", "C2M_RKDCL", "C2M_TGM"):
+                               "C2M_CamRel", "CONFD_REL", "B5_CTK", "C2M_CTK", "C2M_REL10", "C2M_REL2", "C2M_TRIP", "C2M_TRIF", "C2M_TRIF2", "C2M_TRIF3", "C2M_HARD", "C2M_SCL", "C2M_CYC", "C2M_CONFP", "C2M_GATE", "C2M_ABS", "C2M_ABS_REL", "C2M_ABSR", "C2M_ABSW1", "C2M_ABSR5", "C2M_RELAT", "C2M_RABS1", "C2M_RABS5", "C2M_RABS3", "C2M_XSH", "C2M_XSHA", "C2M_XAC", "C2M_XAC2", "C2M_XSH1", "C2M_XSHS", "C2M_XSH1S", "C2M_NREL", "C2M_RKD15", "C2M_RKDC", "C2M_RKDS", "C2M_XEXT", "C2M_RKDC1", "C2M_RKDC1R", "C2M_RKDC1A", "C2M_RKDC1H", "C2M_RKDCR1H", "C2M_RKDC1HC", "C2M_maskrel_CTK", "C2M_RKDC2", "C2M_RKDC3", "C2M_RELC", "C2M_RKLH", "C2M_RELCH", "C2M_RKCX", "C2M_RKDCX", "C2M_RKDT16", "C2M_RKDCX3", "C2M_XAP", "C2M_RKDCL", "C2M_TGM"):
                         ratio = {"B5_maskdistill": 0.5, "C2M_maskrel": 0.5, "CONFD": 0.5,
                                  "C2M_CamRel": 0.5, "CONFD_REL": 0.5, "B5_CTK": 0.5,
-                                 "C2M_CTK": 0.5, "C2M_REL10": 0.5, "C2M_REL2": 0.5, "C2M_TRIP": 0.5, "C2M_TRIF": 0.5, "C2M_TRIF2": 0.5, "C2M_TRIF3": 0.5, "C2M_HARD": 0.5, "C2M_SCL": 0.5, "C2M_CYC": 0.5, "C2M_CONFP": 0.5, "C2M_GATE": 0.5, "C2M_MC": 0.5, "C2M_ABS": 0.5, "C2M_ABS_REL": 0.5, "C2M_ABSR": 0.5, "C2M_ABSW1": 0.5, "C2M_ABSR5": 0.5, "C2M_RELAT": 0.5, "C2M_RABS1": 0.5, "C2M_RABS5": 0.5, "C2M_RABS3": 0.5, "C2M_XSH": 0.5, "C2M_XSHA": 0.5, "C2M_XAC": 0.5, "C2M_XAC2": 0.5, "C2M_XSH1": 0.5, "C2M_XSHS": 0.5, "C2M_XSH1S": 0.5, "C2M_NREL": 0.5, "C2M_RKD15": 0.5, "C2M_RKDC": 0.5, "C2M_RKDS": 0.5, "C2M_XEXT": 0.5, "C2M_RKDC1": 0.5, "C2M_RKDC1R": 0.5, "C2M_RKDC1A": 0.5, "C2M_RKDC1H": 0.5, "C2M_RKDC1HC": 0.5, "C2M_maskrel_CTK": 0.5, "C2M_RKDC2": 0.5, "C2M_RKDC3": 0.5, "C2M_RELC": 0.5, "C2M_RKLH": 0.5, "C2M_RELCH": 0.5, "C2M_RKCX": 0.5, "C2M_RKDCX": 0.5, "C2M_RKDT16": 0.5, "C2M_RKDCX3": 0.5, "C2M_XAP": 0.5, "C2M_RKDCL": 0.5, "C2M_TGM": 0.5,
+                                 "C2M_CTK": 0.5, "C2M_REL10": 0.5, "C2M_REL2": 0.5, "C2M_TRIP": 0.5, "C2M_TRIF": 0.5, "C2M_TRIF2": 0.5, "C2M_TRIF3": 0.5, "C2M_HARD": 0.5, "C2M_SCL": 0.5, "C2M_CYC": 0.5, "C2M_CONFP": 0.5, "C2M_GATE": 0.5, "C2M_MC": 0.5, "C2M_ABS": 0.5, "C2M_ABS_REL": 0.5, "C2M_ABSR": 0.5, "C2M_ABSW1": 0.5, "C2M_ABSR5": 0.5, "C2M_RELAT": 0.5, "C2M_RABS1": 0.5, "C2M_RABS5": 0.5, "C2M_RABS3": 0.5, "C2M_XSH": 0.5, "C2M_XSHA": 0.5, "C2M_XAC": 0.5, "C2M_XAC2": 0.5, "C2M_XSH1": 0.5, "C2M_XSHS": 0.5, "C2M_XSH1S": 0.5, "C2M_NREL": 0.5, "C2M_RKD15": 0.5, "C2M_RKDC": 0.5, "C2M_RKDS": 0.5, "C2M_XEXT": 0.5, "C2M_RKDC1": 0.5, "C2M_RKDC1R": 0.5, "C2M_RKDC1A": 0.5, "C2M_RKDC1H": 0.5, "C2M_RKDCR1H": 0.5, "C2M_RKDC1HC": 0.5, "C2M_maskrel_CTK": 0.5, "C2M_RKDC2": 0.5, "C2M_RKDC3": 0.5, "C2M_RELC": 0.5, "C2M_RKLH": 0.5, "C2M_RELCH": 0.5, "C2M_RKCX": 0.5, "C2M_RKDCX": 0.5, "C2M_RKDT16": 0.5, "C2M_RKDCX3": 0.5, "C2M_XAP": 0.5, "C2M_RKDCL": 0.5, "C2M_TGM": 0.5,
                                  "MD25": 0.25, "MD75": 0.75}[arm]
                         images4_in, pmask = mask_image_blocks(
                             images4, ratio, patch_hw,
@@ -2314,6 +2330,24 @@ def main():
                         # positions (standard KD-style; contrasts with the default
                         # MGD-style masked-positions-only supervision)
                         pmask = torch.ones_like(pmask)
+                    _feat_hook = None
+                    if args.mask_mode == "token" and pmask is not None:
+                        # Token-level masking: clean input (undo image masking),
+                        # install feature hook to zero patch tokens at
+                        # aggregator.patch_embed output (after DINOv2, before
+                        # aggregator blocks). Uses the 50% corruption mask.
+                        images4_in = images4  # clean input
+                        _corruption = None
+                        # Re-draw the corruption mask (same seed as image mode)
+                        gen2 = torch.Generator(device=images4.device).manual_seed(
+                            stable_seed("mask", scene, epoch, pi, args.seed))
+                        _ph, _pw = patch_hw
+                        _corruption = (torch.rand(images4.shape[1], _ph * _pw,
+                                        generator=gen2, device=images4.device) < 0.5).float()
+                        _corruption = _corruption.reshape(1, images4.shape[1], _ph * _pw)
+                        agg = student._get_aggregator()
+                        _feat_hook = agg.patch_embed.register_forward_hook(
+                            _feat_mask_hook(_corruption))
                     if arm in ("FM_zero", "FM_mean"):
                         images8m = train_images8[pi].clone()
                         if arm == "FM_zero":
@@ -2502,6 +2536,9 @@ def main():
                         with autocast(enabled=True):
                             feats24_s, psi, preds = M.student_preds(student, images4_in)
                             loss, extra = compute_loss(arm, a1, base, cache, feats24_s, preds, patch_hw, step=step, patch_mask=pmask)
+                    if _feat_hook is not None:
+                        _feat_hook.remove()
+                        _feat_hook = None
                     scaler.scale(loss).backward()
                     if args.sam_rho > 0:
                         # SAM: eps = rho*g/||g|| is invariant to the GradScaler factor,

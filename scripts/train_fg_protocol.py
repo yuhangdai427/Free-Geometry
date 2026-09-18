@@ -26,7 +26,12 @@ def main():
     ap.add_argument("--scenes", nargs="*", default=None,
                     help="scene tags (defaults to all protocol JSONs)")
     ap.add_argument("--arm", default="rkdc_allpos",
-                    choices=["a0", "m_allpos", "rkdc_allpos", "maskrel_allpos"])
+                    choices=["a0", "m_allpos", "rkdc_allpos", "maskrel_allpos",
+                             "rkdcr_allpos"])
+    ap.add_argument("--lora_variant", default="shared",
+                    choices=["shared", "two_stage"],
+                    help="LoRA variant for DVLT: shared (single LoRA across all "
+                         "K loops) or two_stage (early/late LoRA, split at step 6)")
     ap.add_argument("--steps", type=int, default=100)
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--lr", type=float, default=0.0, help="0 = model default")
@@ -45,7 +50,9 @@ def main():
     pdir = os.path.join(args.protocol_dir, args.dataset)
     tags = args.scenes or sorted(f[:-5] for f in os.listdir(pdir) if f.endswith(".json"))
     os.makedirs(args.output_root, exist_ok=True)
-    adapter = get_adapter(args.model)
+    adapter = get_adapter(args.model,
+                          **({"lora_variant": args.lora_variant}
+                             if args.model == "dvlt" else {}))
     summary = {"model": args.model, "dataset": args.dataset, "args": vars(args),
                "params": None, "scenes": {}}
     trace = []

@@ -69,7 +69,9 @@ def evaluate_scene(student, scene_data, eval_frames, max_frames: int = 0,
     image_files = [scene_data.image_files[i] for i in frames]
 
     student.eval()
-    pred = student.da3.inference(
+    # Accept both StudentModel (has .da3) and raw DepthAnything3 (a0 baseline)
+    _model = student.da3 if hasattr(student, 'da3') else student
+    pred = _model.inference(
         image=image_files,
         process_res=P.PROCESS_RES,
         process_res_method="upper_bound_resize",
@@ -87,10 +89,22 @@ def evaluate_scene(student, scene_data, eval_frames, max_frames: int = 0,
     )
 
     # Depth metrics with one least-squares scale per scene (GT-valid px only).
-    gt = np.stack([
-        load_gt_depth_raw(scene_data.aux.gt_depth_files[i], depth.shape[-2:]) for i in frames
-    ])
-    omega = np.isfinite(gt) & (gt > 0) & np.isfinite(depth) & (depth > 0)
+    # DTU/dtu64 have no gt_depth_files -> skip depth metrics (pose + recon only).
+    # NOTE: aux is an addict Dict — missing keys return empty Dict (not None),
+    # so hasattr() is always True; must check the VALUE is a real list of strs.
+    gt = None
+    try:
+        _gtf = scene_data.aux['gt_depth_files']
+        if _gtf and isinstance(_gtf, (list, tuple)) and isinstance(_gtf[0], str):
+            gt = np.stack([
+                load_gt_depth_raw(_gtf[i], depth.shape[-2:]) for i in frames
+            ])
+    except Exception:
+        gt = None
+    if gt is not None:
+        omega = np.isfinite(gt) & (gt > 0) & np.isfinite(depth) & (depth > 0)
+    else:
+        omega = np.zeros_like(depth, dtype=bool)
     n_valid = int(omega.sum())
     out = {
         "n_eval_frames": len(frames),
@@ -142,8 +156,11 @@ def evaluate_scene(student, scene_data, eval_frames, max_frames: int = 0,
         np.savez_compressed(meta_path, **payload)
         fuse_path = os.path.join(export_dir, "exports", "fuse", "pcd.ply")
         os.makedirs(os.path.dirname(fuse_path), exist_ok=True)
-        dataset_obj.fuse3d(scene, result_path, fuse_path, "recon_unposed")
-        recon = dataset_obj.eval3d(scene, fuse_path)
+        try:
+            dataset_obj.fuse3d(scene, result_path, fuse_path, "recon_unposed")
+            recon = dataset_obj.eval3d(scene, fuse_path)
+        except NotImplementedError:
+            recon = {}  # dtu64: pose-only, no reconstruction eval
         for k, v in dict(recon).items():
             out[f"recon_{k}"] = float(v)
     return out
@@ -157,6 +174,8 @@ def make_dataset(ds):
         "7scenes": ("depth_anything_3.bench.datasets.sevenscenes", "SevenScenes"),
         "hiroom": ("depth_anything_3.bench.datasets.hiroom", "HiRoomDataset"),
         "eth3d": ("depth_anything_3.bench.datasets.eth3d", "ETH3D"),
+        "dtu": ("depth_anything_3.bench.datasets.dtu", "DTU"),
+        "dtu64": ("depth_anything_3.bench.datasets.dtu64", "DTU64"),
     }
     mod = importlib.import_module(table[ds][0])
     return getattr(mod, table[ds][1])()
@@ -175,10 +194,11 @@ def main() -> None:
     ap.add_argument("--pose_weight", type=float, default=1.0,
                     help="1.0 = C2M (default); 0.0 = pure maskdistill (protocol fine "
                          "variant for tau<=0.55 datasets)")
-    ap.add_argument("--arm", default="c2m", choices=["c2m", "pw0", "rkdc1h", "rkdc1hc"],
+    ap.add_argument("--arm", default="c2m", choices=["c2m", "pw0", "rkdc1h", "rkdc1hc", "rkdc1hr"],
                     help="c2m = maskdistill+rel (maskrel); pw0 = pure maskdistill; "
                          "rkdc1h = maskdistill + 1.5*rkd_huber + 1.0*couple (no rel); "
-                         "rkdc1hc = rkdc1h + ctk_weight*camera-token KD")
+                         "rkdc1hc = rkdc1h + ctk_weight*camera-token KD; "
+                         "rkdc1hr = rkdc1h + rel_weight*corrected rel pose")
     ap.add_argument("--ratio_mix", default=None,
                     help="comma-separated teacher:student ratios mixed within ONE run, "
                          "e.g. '8:4,16:4,24:8' (SelfEvo-style mixed asymmetry per pair)")
@@ -197,6 +217,8 @@ def main() -> None:
                          "SIFT match fraction vs the shared frames >= 0.1 (best of "
                          "40 tries). Fixes wide-baseline windows that mix "
                          "mutually-invisible frames (e.g. eth3d facade)")
+    ap.add_argument("--rel_weight", type=float, default=1.0,
+                    help="weight of the corrected rel-pose term (rkdc1hr arm)")
     ap.add_argument("--ctk_weight", type=float, default=1.0,
                     help="weight of the camera-token KD term (rkdc1hc arm)")
     ap.add_argument("--two_stage", type=float, default=0.0,
@@ -281,7 +303,8 @@ def main() -> None:
             lr=args.lr, seed=args.seed, pose_weight=pose_w,
             arm=args.arm, mask_ratio=args.mask_ratio, trace_rows=trace_rows,
             mask_mode=args.mask_mode, mask_layer=args.mask_layer,
-            ctk_weight=args.ctk_weight, two_stage=args.two_stage,
+            ctk_weight=args.ctk_weight, rel_weight=args.rel_weight,
+            two_stage=args.two_stage,
             early_stop=args.early_stop,
             mask_loss_positions=not args.loss_all_pos)
 

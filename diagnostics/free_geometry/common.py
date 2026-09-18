@@ -38,7 +38,7 @@ PATCH_START_IDX = 5
 TAP_LAYERS = [4, 11, 17, 23]
 STUDENT_INDICES = [0, 2, 4, 6]
 MAX_DEPTH_M = 5.0
-IMAGE_SIZE = 504
+IMAGE_SIZE = 504  # DA3 benchmark default (36 patches × 14), unified across all models
 
 SEED_SCENE_SELECT = 43
 SEED_EVAL = 43_000
@@ -76,6 +76,12 @@ def get_scene_data(scene: str):
                          "dslr_images", os.path.basename(f))
             for f in d.image_files]
         return d
+    if _CURRENT_DATASET == "dtu":
+        from depth_anything_3.bench.datasets.dtu import DTU
+        return DTU().get_data(scene)
+    if _CURRENT_DATASET == "dtu64":
+        from depth_anything_3.bench.datasets.dtu64 import DTU64
+        return DTU64().get_data(scene)
     from depth_anything_3.bench.datasets.scannetpp import ScanNetPP
 
     ds = ScanNetPP()
