@@ -26,6 +26,7 @@ Outputs:
 import argparse
 import csv
 import importlib.util
+import json
 import math
 import os
 import sys
@@ -42,14 +43,18 @@ sys.path.insert(0, _HERE)
 import common
 from common import STUDENT_INDICES, TAP_LAYERS, get_scene_data, gt_ixt_raw, load_manifest, stable_seed
 import modeling as M
+import abs_pose_loss as _apl
 from abs_pose_loss import (loss_abs_pose_norm, loss_abs_pose_raw, loss_abs_t_fl,
                            loss_rkd_triplet_pose, loss_rkd_shared_pose,
                            loss_rkd_shared_pose_huber, loss_rkd_local_huber,
                            loss_rkd_mix_pose,
                            loss_xac_camtok, loss_xac2_camtok,
-                           loss_scale_gauge, loss_couple, loss_couple16,
+                           loss_scale_gauge, loss_couple16,
                            loss_rkd_ext_pose, loss_xap_pool,
                            loss_closure_align, loss_gram_pool)
+from free_geometry.tta_v2 import (ControllerConfig, ProbeEvaluator, append_jsonl,
+                                  edges_from_w2c, rot_edges_huber, select,
+                                  tdir_cos_loss)
 
 ARMS = ["A1_deployed", "A2_projected", "A3_outdepth", "A4_pose"]
 FEATURE_ARMS = ["B1_norm_patch", "B2_deployed_camtok", "B3_raw_patch", "B4_norm_camtok"]
@@ -63,6 +68,508 @@ WARMUP_RATIO = 0.15
 WD = 1e-5
 CLIP = 1.0
 EVAL_STEPS = (0, 30, 100)
+
+# Protocol v2: --v2_couple_fix swaps abs_pose_loss.loss_couple (asymmetric valid
+# masks: student side unmasked, teacher side conf-quantile-masked) for the
+# symmetric form where BOTH depth sides take the mean over the SAME
+# teacher-derived mask — identical semantics to losses.loss_couple_centers and
+# tta_v2.couple_robust. Dispatch happens through this module-level name so all
+# ~30 arm call sites pick the fix up without touching their code paths.
+_V2_COUPLE_FIX = False
+_loss_couple_orig = _apl.loss_couple
+
+# Protocol v2: --v2_allpos keeps the masked INPUT but computes the maskdistill
+# feature loss on ALL patch positions (w = teacher_patch_conf, no *patch_mask —
+# equivalent to loss_b5_conf weighting). Read by loss_b5_maskdistill, so every
+# arm routing its feature term through it (the whole C2M_* family and friends)
+# switches together. Distinct from --loss_all_pos (which replaces pmask with
+# ones in the training loop, so mask_ratio reports 1.0 and every other pmask
+# consumer is affected).
+_V2_ALLPOS = False
+
+
+def loss_couple_sharedmask(pose_enc_s, depth_s, pose_enc_t_shared, depth4_t,
+                           conf4_t=None, image_hw=_apl.IMAGE_HW):
+    """Symmetric-valid-mask variant of abs_pose_loss.loss_couple (the
+    --v2_couple_fix implementation). One mask, derived from the TEACHER depth
+    (isfinite & >0 & conf >= 5% quantile), is applied to both the student and
+    the teacher depth mean — the student no longer averages over its own
+    (unmasked) valid set."""
+    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+    with torch.autocast(device_type="cuda", enabled=False):
+        def centers(pose):
+            E, _ = pose_encoding_to_extri_intri(pose.float(), image_hw)
+            R, t = E[..., :3, :3], E[..., :3, 3]
+            return -(R.transpose(-1, -2) @ t.unsqueeze(-1)).squeeze(-1)[0]
+
+        d_t = depth4_t.squeeze(0).squeeze(-1).float() if depth4_t.dim() >= 4 \
+            else depth4_t.float()
+        m = torch.isfinite(d_t) & (d_t > 0)
+        if conf4_t is not None:
+            cf = conf4_t.squeeze(0).squeeze(-1).float() if conf4_t.dim() >= 4 \
+                else conf4_t.float()
+            q = torch.quantile(cf[m].flatten(), 0.05)
+            m = m & (cf >= q)
+
+        def stat(pose, depth):
+            c = centers(pose)
+            spr = (c - c.mean(0, keepdim=True)).norm(dim=-1).pow(2).mean().sqrt()
+            d = depth.squeeze(0).squeeze(-1).float() if depth.dim() >= 4 \
+                else depth.float()
+            md = d[m].mean().clamp_min(1e-6)
+            return torch.log(spr.clamp_min(1e-6)) - torch.log(md)
+
+        cs = stat(pose_enc_s, depth_s)
+        ct = stat(pose_enc_t_shared, depth4_t).detach()
+        loss = (cs - ct) ** 2
+    return loss.squeeze(), {"couple": float(loss)}
+
+
+def loss_couple(*args, **kwargs):
+    if _V2_COUPLE_FIX:
+        return loss_couple_sharedmask(*args, **kwargs)
+    return _loss_couple_orig(*args, **kwargs)
+
+
+# --------------------------------------------------------------------------
+# protocol v2 wiring (GT-free rel branch, grad cap, probe, ckpt)
+# --------------------------------------------------------------------------
+
+def v2_rel_pose_loss(pose_enc_s, teacher_cache, image_hw, weight):
+    """v2 robust relative-pose branch: rot_edges_huber + tdir_cos_loss on the
+    student shared views vs the DETACHED cached teacher shared views, both in
+    the corrected w2c convention (T_{i<-j} = E_i @ inv(E_j), same as
+    losses.loss_rel_pose). weight multiplies (rot + tdir). Student pose_enc may
+    carry extra views (SS8M: 8 at STUDENT_INDICES; XRKD: shared first 4)."""
+    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+    pe = pose_enc_s
+    if pe.shape[1] > 4:
+        pe = pe[:, STUDENT_INDICES] if pe.shape[1] == 2 * len(STUDENT_INDICES) \
+            else pe[:, :4]
+    with torch.autocast(device_type="cuda", enabled=False):
+        ext_s, _ = pose_encoding_to_extri_intri(pe.float(), image_hw,
+                                                pose_encoding_type="absT_quaR_FoV")
+        pt = teacher_cache["pose_enc8"][:, STUDENT_INDICES].float()
+        ext_t, _ = pose_encoding_to_extri_intri(pt, image_hw,
+                                                pose_encoding_type="absT_quaR_FoV")
+        e_s = edges_from_w2c(ext_s[0])
+        e_t = edges_from_w2c(ext_t[0])
+        rot = rot_edges_huber(e_s["R_rel"], e_t["R_rel"].detach())
+        tdir = tdir_cos_loss(e_s["t_rel"], e_t["t_rel"].detach(), e_t["baseline"])
+        loss = weight * (rot["loss"] + tdir["loss"])
+    return loss, {"v2_rel": float(loss), "v2_rel_rot": float(rot["loss"]),
+                  "v2_rel_tdir": float(tdir["loss"])}
+
+
+def v2_grad_cap_backward(loss_base, loss_rel, params, scaler, state):
+    """GradScaler-exact split backward with a per-param cap on the rel branch.
+
+    Implementation: TWO ordinary fused backwards instead of autograd.grad —
+    bit-exactness matters: autograd.grad on an autocast-built graph computes
+    weight grads behind the autocast boundary with different precision rules
+    (measured: conv-weight grad off by >30% on a toy autocast model), while
+    backward(retain_graph=True) + backward() is bitwise identical to a single
+    fused backward. Each branch is scaled by scaler.scale() exactly like the
+    normal path; g_base is snapshotted between the two backwards, g_R is
+    per-param-norm-capped (the cap factor is scale-invariant, applied in
+    scaled space), then merged back into p.grad so the existing
+    scaler.unscale_ -> clip_grad_norm_ -> scaler.step -> scaler.update chain
+    runs UNCHANGED (inf detection / step skipping behave as usual).
+
+    state: dict, mutated in place; keys "medians" (per-update median of
+    per-param unscaled ||g_R|| over the first 10 updates), "C_R" (float or
+    None until calibrated: C_R = 4 * median(medians), then constant).
+    Returns trace extras."""
+    for p in params:
+        p.grad = None
+    scaler.scale(loss_base).backward(retain_graph=True)
+    g_base = [p.grad.clone() if p.grad is not None else None for p in params]
+    for p in params:
+        p.grad = None
+    scaler.scale(loss_rel).backward()
+    with torch.no_grad():
+        s = scaler.get_scale()
+        g_base_norm = 0.0
+        for g in g_base:
+            if g is not None:
+                g_base_norm += float((g * g).sum()) / (s * s)
+        g_base_norm = g_base_norm ** 0.5
+        per = [float((p.grad * p.grad).sum()) ** 0.5 / s
+               for p in params if p.grad is not None]
+        g_R_norm = float(sum(v * v for v in per) ** 0.5) if per else 0.0
+        if len(state["medians"]) < 10:
+            if per:
+                state["medians"].append(float(np.median(per)))
+            if len(state["medians"]) == 10:
+                state["C_R"] = 4.0 * float(np.median(state["medians"]))
+        C_R = state["C_R"]
+        if C_R is not None:
+            for p in params:
+                if p.grad is None:
+                    continue
+                # per-param norm cap in unscaled space, applied to the scaled
+                # grad (factor is scale-invariant; no host sync per param)
+                f = torch.clamp(C_R * s / ((p.grad * p.grad).sum().sqrt() + 1e-12),
+                                max=1.0)
+                p.grad.mul_(f)
+        for p, gb in zip(params, g_base):
+            if gb is None and p.grad is None:
+                continue
+            total = p.grad if p.grad is not None else 0.0
+            if gb is not None:
+                total = total + gb
+            p.grad = total
+    return {"g_base_norm": g_base_norm, "g_R_norm": g_R_norm,
+            "C_R": float(C_R) if C_R is not None else -1.0}
+
+
+def build_v2_probe_contexts(scene, sc, probe_caches, probe_images4, base):
+    """One ProbeEvaluator context per manifest probe pair, built from the SAME
+    teacher caches the GT probe uses (GT-free quantities only: cached teacher
+    features/depth/conf/poses + teacher-conf valid mask). Returns
+    (contexts, overlaps) with overlaps[i] True when probe pair i collides with
+    a train pair on teacher_frames or student_frames keys."""
+    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+    train_t8 = {tuple(p["teacher_frames"]) for p in sc["train_pairs"]}
+    train_s4 = {tuple(p["student_frames"]) for p in sc["train_pairs"]}
+    contexts, overlaps = [], []
+    with torch.no_grad():
+        for pi, (pair, cache, im4) in enumerate(zip(
+                sc["probe_pairs"], probe_caches, probe_images4)):
+            ph, pw = cache["patch_hw"]
+            H, W = im4.shape[-2:]
+            with torch.autocast(device_type="cuda", enabled=False):
+                pt = cache["pose_enc8"][:, STUDENT_INDICES].float()
+                ext_t, _ = pose_encoding_to_extri_intri(
+                    pt, (H, W), pose_encoding_type="absT_quaR_FoV")
+                ext_t = ext_t[0].detach()                     # [4,3,4] w2c
+                R, t = ext_t[..., :3, :3], ext_t[..., :3, 3]
+                centers_t = (-R.transpose(-1, -2)
+                             @ t.unsqueeze(-1)).squeeze(-1).detach()
+                conf = cache["conf4"].float()
+                if conf.dim() == 5:
+                    conf = conf.squeeze(2)
+                conf = conf[0]                                # [4,H,W]
+                thr = torch.quantile(conf.flatten(), 0.05)
+                valid_t = (torch.isfinite(conf) & (conf >= thr)).detach()
+                depth_t = cache["depth4"].squeeze(0).squeeze(-1).float().detach()
+                feats_t = {l: M.to_norm(
+                    base.depth_head,
+                    M.to_patch(cache["feats"][l][:, STUDENT_INDICES].float()),
+                ).squeeze(0).detach() for l in TAP_LAYERS}    # {l: [4,P,C]}
+                feat_w = teacher_patch_conf(cache, (ph, pw))[0]
+            contexts.append({
+                "pair_id": f"probe{pi}", "scene": scene,
+                "patch_grid": (ph, pw), "mask_ratio": 0.5,
+                "images_meta": im4,
+                "teacher": {"features": feats_t, "feat_w": feat_w,
+                            "ext_w2c": ext_t, "centers": centers_t,
+                            "depth": depth_t, "valid": valid_t},
+            })
+            overlaps.append(tuple(pair["teacher_frames"]) in train_t8
+                            or tuple(pair["student_frames"]) in train_s4)
+    return contexts, overlaps
+
+
+def make_v2_probe_forward(student, base):
+    """forward_fn(images4, mask[S,ph,pw] bool) for ProbeEvaluator.evaluate.
+    Pixel fill matches the training-time masking convention exactly
+    (mask_image_blocks: multiply [0,1] images by (1 - block), i.e. ZERO fill).
+    The forward runs in fp32 with no autocast, matching evaluate_probes /
+    infer_eval32 (deployment) numerics. Runs under the caller's no_grad."""
+    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+    def fwd(images_meta, mask):
+        images4 = images_meta
+        ph, pw = mask.shape[-2], mask.shape[-1]
+        H, W = images4.shape[-2:]
+        m = mask.to(images4.device)
+        m = m.repeat_interleave(H // ph, dim=1).repeat_interleave(W // pw, dim=2)
+        masked = images4 * (~m)[:, None].float()
+        feats24, psi, preds = M.student_preds(student, masked)
+        feats_d = {l: M.to_norm(base.depth_head,
+                                M.to_patch(feats24[l].float()))[0]
+                   for l in TAP_LAYERS}
+        with torch.autocast(device_type="cuda", enabled=False):
+            ext, _ = pose_encoding_to_extri_intri(
+                preds["pose_enc"].float(), (H, W),
+                pose_encoding_type="absT_quaR_FoV")
+        ext = ext[0]                                          # [4,3,4] w2c
+        R, t = ext[..., :3, :3], ext[..., :3, 3]
+        centers = (-R.transpose(-1, -2) @ t.unsqueeze(-1)).squeeze(-1)
+        depth = preds["depth"].squeeze(0).squeeze(-1).float()
+        return {"features": feats_d, "ext_w2c": ext, "centers": centers,
+                "depth": depth}
+
+    return fwd
+
+
+def run_v2_probe(evaluator, fwd, scene, arm, step, run_root, overlaps,
+                 n_train_pairs, log_fn=None):
+    """Evaluate + append one JSONL line per (pair, mask) record to
+    <run_root>/probe_trace/<scene>.jsonl. log_fn(out) — when given — receives
+    the evaluate() result for swanlab reporting (x-axis = real step)."""
+    out = evaluator.evaluate(step, fwd)
+    path = os.path.join(run_root, "probe_trace", f"{scene}.jsonl")
+    for r in out["records"]:
+        pi = int(r["pair_id"].replace("probe", ""))
+        append_jsonl(path, {
+            "scene": scene, "arm": arm, "step": int(step),
+            "pair_id": r["pair_id"], "mask_id": int(r["mask_id"]),
+            "components": r["components"], "total": float(r["total"]),
+            "probe_train_overlap": bool(overlaps[pi]),
+            "n_train_pairs": int(n_train_pairs),
+        })
+    if log_fn is not None:
+        try:
+            log_fn(out)
+        except Exception as e:
+            print(f"[{scene}] v2 probe logging failed ({e}); continuing",
+                  flush=True)
+    return out
+
+
+def save_v2_ckpt(student, run_root, scene, arm, step):
+    """LoRA save for protocol v2 checkpoint selection. HARD assert on success:
+    save_lora_weights writes a _peft adapter dir (and the .pt only when the
+    camera token is trainable), so the _peft dir is the payload we verify."""
+    ckpt_dir = os.path.join(run_root, "ckpts", scene, arm, "v2")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    path = os.path.join(ckpt_dir, f"step{step}_lora.pt")
+    student.save_lora_weights(path)
+    peft_dir = path.replace(".pt", "_peft")
+    assert os.path.isdir(peft_dir) and len(os.listdir(peft_dir)) > 0, \
+        f"v2 ckpt save failed: {peft_dir} missing or empty"
+    return path
+
+
+# --------------------------------------------------------------------------
+# swanlab reporting (protocol v2 monitoring). All helpers are no-ops when
+# swanlab is disabled or unavailable, and EVERY call is exception-guarded:
+# logging must never kill a training run.
+# --------------------------------------------------------------------------
+
+def _finite(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) \
+        and v == v and abs(v) != float("inf")
+
+
+def _swan_safe_init(args, scene, arm):
+    """One swanlab experiment per (scene, arm), named {scene}_{arm}{suffix}.
+    Returns the Run or None (disabled / init failure — training continues)."""
+    if not getattr(args, "swanlab", False):
+        return None
+    try:
+        import swanlab
+        kw = dict(
+            project=args.swanlab_project,
+            name=f"{scene}_{arm}{args.swanlab_suffix}",
+            description=f"{common._CURRENT_DATASET} | {arm} | "
+                        f"run_root={args.run_root} | seed={args.seed}",
+            config={k: v for k, v in vars(args).items()
+                    if isinstance(v, (int, float, str, bool)) or v is None},
+        )
+        if getattr(args, "swanlab_mode", None):
+            kw["mode"] = args.swanlab_mode
+        if getattr(args, "swanlab_logdir", None):
+            kw["log_dir"] = args.swanlab_logdir
+        return swanlab.init(**kw)
+    except Exception as e:  # swanlab missing / offline / auth failure ...
+        print(f"[{scene}] swanlab init failed ({e}); continuing unlogged",
+              flush=True)
+        return None
+
+
+def _swan_log(run, metrics, step=None):
+    """Exception-guarded run.log; non-finite values are dropped."""
+    if run is None or not metrics:
+        return
+    try:
+        clean = {k: float(v) for k, v in metrics.items() if _finite(v)}
+        if clean:
+            run.log(clean, step=step)
+    except Exception as e:
+        print(f"[swanlab] log failed ({e}); continuing", flush=True)
+
+
+def _swan_finish(run):
+    if run is None:
+        return
+    try:
+        run.finish()
+    except Exception:
+        pass
+
+
+def _pair_metrics(pi, loss, extra) -> Dict[str, float]:
+    """Per-training-pair curves (x-axis = global step, so pair-to-pair spread
+    is visible against the shared time axis). Keys: pair/p{pi}/{total,feature,
+    rkd,couple,rel,v2_rel} — only the components present in this arm's extra."""
+    e = extra or {}
+    m = {f"pair/p{pi}/total": float(loss)}
+    if _finite(e.get("feat")):
+        m[f"pair/p{pi}/feature"] = float(e["feat"])
+    if _finite(e.get("rkd")):
+        m[f"pair/p{pi}/rkd"] = float(e["rkd"])
+    if _finite(e.get("couple")):
+        m[f"pair/p{pi}/couple"] = float(e["couple"])
+    if _finite(e.get("rel_rot")) and _finite(e.get("rel_tdir")):
+        m[f"pair/p{pi}/rel"] = float(e["rel_rot"]) + float(e["rel_tdir"])
+    if _finite(e.get("v2_rel")):
+        m[f"pair/p{pi}/v2_rel"] = float(e["v2_rel"])
+    return m
+
+
+def _probe_metrics(out) -> Dict[str, float]:
+    """Swanlab dict for one ProbeEvaluator.evaluate() result: per
+    (pair, mask) components + probe/mean/* over records. x-axis = out['step']."""
+    m: Dict[str, float] = {}
+    comps: Dict[str, List[float]] = {}
+    totals: List[float] = []
+    for r in out["records"]:
+        j = int(str(r["pair_id"]).replace("probe", ""))
+        k = int(r["mask_id"])
+        for c, v in r["components"].items():
+            if _finite(v):
+                m[f"probe/pair{j}/mask{k}/{c}"] = float(v)
+                comps.setdefault(c, []).append(float(v))
+        if _finite(r["total"]):
+            m[f"probe/pair{j}/mask{k}/total"] = float(r["total"])
+            totals.append(float(r["total"]))
+    for c, vals in comps.items():
+        m[f"probe/mean/{c}"] = sum(vals) / len(vals)
+    if totals:
+        m["probe/mean/total"] = sum(totals) / len(totals)
+    return m
+
+
+def _swan_selector_summary(run_root, scene, arm, run):
+    """Offline checkpoint-selection replay: read this (scene, arm)'s records
+    from probe_trace/<scene>.jsonl and run tta_v2.controller.select on them,
+    then log the summary. No-op when the trace/step-0 baseline is absent or
+    anything fails."""
+    if run is None:
+        return
+    path = os.path.join(run_root, "probe_trace", f"{scene}.jsonl")
+    if not os.path.exists(path):
+        return
+    try:
+        recs = []
+        with open(path) as f:
+            for line in f:
+                r = json.loads(line)
+                if r.get("arm") == arm and r.get("scene") == scene:
+                    recs.append(r)
+        trace = []
+        for step in sorted({int(r["step"]) for r in recs}):
+            trace.append({"step": step, "records": [
+                {"pair_id": r["pair_id"], "mask_id": r["mask_id"],
+                 "components": r["components"], "total": r["total"]}
+                for r in recs if int(r["step"]) == step]})
+        if not trace or int(trace[0]["step"]) != 0:
+            return
+        out = select(trace, ControllerConfig())
+        _swan_log(run, {
+            "selector/selected_step": float(out["selected_step"]),
+            "selector/fell_back_to_baseline": float(out["fell_back_to_baseline"]),
+            "selector/improvement": float(out["improvement"]),
+        }, step=int(trace[-1]["step"]))
+        print(f"[{scene}] {arm} selector replay: selected_step="
+              f"{out['selected_step']} fell_back={out['fell_back_to_baseline']} "
+              f"improvement={out['improvement']:.4f}", flush=True)
+    except Exception as e:
+        print(f"[{scene}] selector replay failed ({e}); continuing", flush=True)
+
+
+def _metrics_of(entry):
+    """Extract (auc03, f1) from a baselines-json scene entry, tolerating
+    key spelling variants."""
+    if not isinstance(entry, dict):
+        return None, None
+    auc = entry.get("auc03", entry.get("auc3"))
+    f1 = entry.get("f1", entry.get("recon_fscore"))
+    return auc, f1
+
+
+def _swan_scene_eval(args, scene, arm, run):
+    """Scene-level baseline-vs-TTA eval comparison.
+
+    baselines.json schema (nested): {model: {arm: {scene: {auc03, f1, ...}}}}
+    with "_" -prefixed meta keys allowed at the scene level. Reads model=vggt,
+    arms "baseline" (reference) and the current arm (TTA side). Logs
+    eval/{baseline_auc03,baseline_f1,auc03,f1,d_auc03_rel,d_f1_rel}; when the
+    current-arm entry is unavailable, drops <run_root>/scene_eval_pending.json
+    so an external eval script can backfill (run_eval.py runs outside this
+    process — per-scene recon AUC/F1 is NOT computable in-train_arms)."""
+    base_e = arm_e = None
+    try:
+        with open(args.v2_baselines_json) as f:
+            d = json.load(f)
+        vggt = d.get("vggt", {})
+
+        def _scene_entry(arm_name):
+            a = vggt.get(arm_name, {})
+            scenes = {k: v for k, v in a.items()
+                      if isinstance(v, dict) and not k.startswith("_")}
+            return scenes.get(scene)
+
+        base_e = _scene_entry("baseline")
+        arm_e = _scene_entry(arm)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[{scene}] baselines json unreadable ({e}); pending eval",
+              flush=True)
+    b_auc, b_f1 = _metrics_of(base_e)
+    t_auc, t_f1 = _metrics_of(arm_e)
+    m = {}
+    if _finite(b_auc):
+        m["eval/baseline_auc03"] = float(b_auc)
+    if _finite(b_f1):
+        m["eval/baseline_f1"] = float(b_f1)
+    if _finite(t_auc):
+        m["eval/auc03"] = float(t_auc)
+    if _finite(t_f1):
+        m["eval/f1"] = float(t_f1)
+    if _finite(b_auc) and _finite(t_auc) and b_auc:
+        m["eval/d_auc03_rel"] = (float(t_auc) - float(b_auc)) / abs(float(b_auc))
+    if _finite(b_f1) and _finite(t_f1) and b_f1:
+        m["eval/d_f1_rel"] = (float(t_f1) - float(b_f1)) / abs(float(b_f1))
+    if m:
+        _swan_log(run, m)
+        print(f"[{scene}] {arm} eval: {m}", flush=True)
+    else:
+        _append_pending_eval(args, scene, arm)
+
+
+def _append_pending_eval(args, scene, arm):
+    """Record an unfinished scene-level eval comparison for the external
+    backfill script (run_eval.py aggregates recon metrics outside this
+    process)."""
+    try:
+        path = os.path.join(args.run_root, "scene_eval_pending.json")
+        items = []
+        if os.path.exists(path):
+            with open(path) as f:
+                items = json.load(f)
+        items = [i for i in items
+                 if not (i.get("scene") == scene and i.get("arm") == arm)]
+        items.append({
+            "scene": scene, "arm": arm,
+            "run_root": os.path.abspath(args.run_root),
+            "ckpt_dir": os.path.abspath(
+                os.path.join(args.run_root, "ckpts", scene, arm)),
+            "dataset": common._CURRENT_DATASET,
+            "ts": time.time(),
+        })
+        with open(path, "w") as f:
+            json.dump(items, f, indent=1)
+    except Exception as e:
+        print(f"[{scene}] pending-eval record failed ({e}); continuing",
+              flush=True)
 
 
 def import_deployed_losses():
@@ -655,15 +1162,28 @@ def loss_b5_maskdistill(depth_head, teacher_cache, feats24_s, patch_hw, patch_ma
     """Masked distillation (iBOT/MGD mechanism): student sees block-masked
     images; the conf-gated B5 loss is computed ONLY on masked positions, so
     the LoRA-adapted attention must reconstruct the teacher's features there
-    from cross-view context instead of copying local evidence."""
-    w = teacher_patch_conf(teacher_cache, patch_hw) * patch_mask
+    from cross-view context instead of copying local evidence.
+
+    --v2_allpos: masked input unchanged, but the loss runs on ALL patch
+    positions (w = teacher_patch_conf, no *patch_mask) and extra carries
+    "allpos": 1.0. A None patch_mask already means all positions and is
+    unaffected by the switch."""
+    w_all = teacher_patch_conf(teacher_cache, patch_hw)
+    mask_ratio = float(patch_mask.mean()) if patch_mask is not None else -1.0
+    w = w_all if (_V2_ALLPOS or patch_mask is None) else w_all * patch_mask
     w = w / w.mean().clamp_min(1e-8)
     total = 0.0
     for layer in TAP_LAYERS:
         hs = M.to_norm(depth_head, M.to_patch(feats24_s[layer].float()))
         ht = M.to_norm(depth_head, M.to_patch(teacher_cache["feats"][layer][:, STUDENT_INDICES].float()))
         total = total + _huber_cos(hs, ht, w)
-    return total / len(TAP_LAYERS), {"mask_ratio": float(patch_mask.mean())}
+    # "feat" feeds the swanlab per-pair feature curves; "mask_ratio" always
+    # reports the INPUT mask (still ~0.5 under --v2_allpos)
+    extra = {"mask_ratio": mask_ratio,
+             "feat": float(total / len(TAP_LAYERS))}
+    if _V2_ALLPOS:
+        extra["allpos"] = 1.0
+    return total / len(TAP_LAYERS), extra
 
 
 def teacher_patch_conf(teacher_cache, patch_hw) -> torch.Tensor:
@@ -741,7 +1261,9 @@ def loss_b5_conf(depth_head, teacher_cache, feats24_s, patch_hw,
         wl = layer_w.get(layer, 1.0)
         total = total + wl * _huber_cos(hs, ht, w)
         wsum += wl
-    return total / wsum, {"conf_w_max": float(w.max()), "conf_w_min": float(w.min())}
+    # "feat" feeds the swanlab per-pair feature curves
+    return total / wsum, {"conf_w_max": float(w.max()), "conf_w_min": float(w.min()),
+                          "feat": float(total / wsum)}
 
 
 def loss_b_patchform(depth_head, teacher_cache, feats24_s, patch_hw, space: str,
@@ -2086,6 +2608,70 @@ def main():
                     help="image = mask input pixels (default); token = clean input, "
                          "zero 50%% of patch tokens at aggregator.patch_embed output "
                          "(feature-level masking, after DINOv2, before aggregator blocks)")
+    ap.add_argument("--v2_probe", action="store_true",
+                    help="protocol v2: GT-free probe on the manifest probe pairs "
+                         "(fixed per-pair masks, robust components vs the frozen "
+                         "teacher cache), evaluated at step 0 and every "
+                         "--v2_probe_every updates; appended to "
+                         "<run_root>/probe_trace/<scene>.jsonl. Coexists with the "
+                         "existing GT probe (evaluate_probes), which is untouched.")
+    ap.add_argument("--v2_probe_every", type=int, default=10,
+                    help="v2 probe cadence in optimizer updates (default 10)")
+    ap.add_argument("--v2_ckpt", action="store_true",
+                    help="protocol v2: save LoRA at step 0 and every probe point to "
+                         "ckpts/<scene>/<arm>/v2/step{N}_lora.pt (hard assert on "
+                         "save success). LoRA path only (skipped with --full_ft).")
+    ap.add_argument("--v2_rel_weight", type=float, default=0.0,
+                    help=">0: append v2_rel_weight * (rot_edges_huber.loss + "
+                         "tdir_cos_loss.loss) to the arm loss, teacher detached, "
+                         "on the student shared-4 w2c extrinsics (tta_v2 robust "
+                         "form; the arm's own rel term, if any, is unchanged)")
+    ap.add_argument("--v2_grad_cap", action="store_true",
+                    help="requires --v2_rel_weight>0: split backward into two "
+                         "fused backwards (base vs v2-rel branch; bit-exact vs "
+                         "the normal path), per-param cap on the rel branch — "
+                         "first 10 updates measure the median per-param "
+                         "||g_R||, afterwards C_R = 4*median is fixed; capped "
+                         "rel grads are merged back into p.grad (scaled space, "
+                         "GradScaler-compatible) before the existing "
+                         "unscale/clip/scaler.step. Records g_base_norm/"
+                         "g_R_norm/C_R in the trace extra column.")
+    ap.add_argument("--v2_couple_fix", action="store_true",
+                    help="use the symmetric valid-mask couple loss (teacher conf "
+                         "mask applied to BOTH depth sides, aligned with "
+                         "losses.loss_couple_centers) instead of the asymmetric "
+                         "abs_pose_loss.loss_couple")
+    ap.add_argument("--v2_allpos", action="store_true",
+                    help="protocol v2: keep the masked student INPUT but compute "
+                         "the maskdistill feature loss on ALL patch positions "
+                         "(w = teacher_patch_conf, no *patch_mask) for every arm "
+                         "routing through loss_b5_maskdistill; extra records "
+                         "allpos=1.0 while mask_ratio still reports the input "
+                         "mask. Distinct from --loss_all_pos (loop-level pmask "
+                         "replacement, mask_ratio becomes 1.0)")
+    ap.add_argument("--swanlab", action="store_true",
+                    help="log to swanlab (project free-geometry-tta), one "
+                         "experiment per (scene, arm) named {scene}_{arm}{suffix}. "
+                         "All logging is exception-guarded: swanlab unavailable "
+                         "or offline never affects training.")
+    ap.add_argument("--swanlab_suffix", default="",
+                    help="experiment-name suffix, e.g. _smoketest (house style: "
+                         "protocol tags like _mv13)")
+    ap.add_argument("--swanlab_project", default="free-geometry-tta",
+                    help="swanlab project name (default free-geometry-tta)")
+    ap.add_argument("--swanlab_mode", default=None,
+                    help="swanlab init mode override: local | offline | "
+                         "disabled (default None = swanlab default)")
+    ap.add_argument("--swanlab_logdir", default=None,
+                    help="swanlab log_dir override (where local/offline runs "
+                         "store their data)")
+    ap.add_argument("--v2_baselines_json",
+                    default="workspace/protocol_v2/baselines.json",
+                    help="scene-level eval comparison source: nested "
+                         "{model:{arm:{scene:{auc03,f1,...}}}}; reads vggt / "
+                         "baseline / <scene> (and the current arm). Missing "
+                         "entries -> <run_root>/scene_eval_pending.json for "
+                         "external backfill (run_eval.py runs out-of-process).")
     args = ap.parse_args()
     torch.manual_seed(args.seed)
     if args.ema_teacher and args.full_ft:
@@ -2093,6 +2679,16 @@ def main():
     if args.ema_teacher and args.teacher_consensus:
         raise ValueError("--ema_teacher and --teacher_consensus are mutually exclusive "
                          "(EMA refresh rebuilds single-context caches)")
+    global _V2_COUPLE_FIX, _V2_ALLPOS
+    _V2_COUPLE_FIX = bool(args.v2_couple_fix)
+    _V2_ALLPOS = bool(args.v2_allpos)
+    if args.v2_grad_cap and args.v2_rel_weight <= 0:
+        raise ValueError("--v2_grad_cap requires --v2_rel_weight > 0")
+    if args.v2_grad_cap and args.sam_rho > 0:
+        raise ValueError("--v2_grad_cap and --sam_rho are mutually exclusive "
+                         "(both replace the single backward())")
+    if args.v2_probe_every < 1:
+        raise ValueError("--v2_probe_every must be >= 1")
 
     manifest = load_manifest(os.path.join(args.run_root, "scene_manifest.json"))
     common.set_dataset(manifest.get("dataset", "scannetpp"))
@@ -2204,6 +2800,14 @@ def main():
         train_caches, probe_caches = caches[:n_train], caches[n_train:]
         train_images = pair_images[:n_train]
         train_images8 = pair_images8[:n_train]
+        # ---- protocol v2: GT-free probe contexts from the SAME caches ----
+        v2_contexts, v2_overlaps = [], []
+        if args.v2_probe or args.v2_ckpt:
+            v2_contexts, v2_overlaps = build_v2_probe_contexts(
+                scene, sc, probe_caches, pair_images[n_train:], base)
+            if any(v2_overlaps):
+                print(f"[{scene}] WARNING: probe/train pair key overlap "
+                      f"(probe_train_overlap={v2_overlaps})", flush=True)
         if any("pose_disagree_deg" in c for c in probe_caches):
             dg = float(np.median([c["pose_disagree_deg"] for c in probe_caches
                                   if "pose_disagree_deg" in c]))
@@ -2254,6 +2858,12 @@ def main():
                 LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warm),
                 CosineAnnealingLR(optimizer, T_max=n_steps - warm, eta_min=1e-8)], [warm])
             scaler = GradScaler(enabled=True)
+            if args.v2_grad_cap:
+                # GradScaler lazily creates its scale factor on the first
+                # scale() call; the split-backward path (v2_grad_cap_backward)
+                # never calls scaler.scale(), so init it up front — afterwards
+                # scaler.get_scale() is valid in every update.
+                scaler.scale(torch.zeros((), device=device))
             torch.cuda.reset_peak_memory_stats()
             step_times = []
             ema_params = None
@@ -2261,6 +2871,35 @@ def main():
                 ema_params = [p.detach().clone() for p in params]
                 print(f"[{scene}] {arm} ema teacher on: K={args.ema_teacher} "
                       f"decay={args.ema_decay} n_params={len(ema_params)}", flush=True)
+
+            # ---- swanlab experiment for this (scene, arm); None when disabled
+            #      or init failed — every use below is exception-guarded.
+            swan_run = _swan_safe_init(args, scene, arm)
+
+            def _v2_probe_log(out, _run=swan_run):
+                _swan_log(_run, _probe_metrics(out), step=int(out["step"]))
+
+            # ---- protocol v2 (flag-gated): GT-free probe evaluator for this
+            #      arm (fixed per-pair masks, drawn from stable seeds) + step-0
+            #      probe / ckpt of the freshly-reset student.
+            v2_evaluator = None
+            v2_fwd = None
+            v2_grad_state = {"medians": [], "C_R": None}
+            if args.v2_probe:
+                v2_evaluator = ProbeEvaluator(v2_contexts, model=student)
+                v2_fwd = make_v2_probe_forward(student, base)
+            if args.v2_probe or args.v2_ckpt:
+                student.eval()
+                if args.v2_probe:
+                    out0 = run_v2_probe(v2_evaluator, v2_fwd, scene, arm, 0,
+                                        args.run_root, v2_overlaps, n_train,
+                                        log_fn=_v2_probe_log)
+                    tot = float(np.mean([r["total"] for r in out0["records"]]))
+                    print(f"[{scene}] {arm} v2 probe step=0 records={len(out0['records'])} "
+                          f"mean_total={tot:.4f}", flush=True)
+                if args.v2_ckpt and not args.full_ft:
+                    p0 = save_v2_ckpt(student, args.run_root, scene, arm, 0)
+                    print(f"[{scene}] {arm} v2 ckpt step=0 -> {p0}", flush=True)
 
             for step_mark in EVAL_STEPS:
                 pass
@@ -2291,6 +2930,7 @@ def main():
                     t_step0 = time.perf_counter()
                     cache = train_caches[pi]
                     images4 = train_images[pi]
+                    preds = None  # set by every arm branch below (v2 rel consumes it)
                     if ema_params is not None and step % args.ema_teacher == 0:
                         t_ref = time.perf_counter()
                         images8_r, _ = M.load_pair_images(
@@ -2379,6 +3019,7 @@ def main():
                             xco, xco_extra = loss_xco_consistency(base.depth_head, featsA, featsB)
                             loss = loss + xco
                             extra = {**extra, **xco_extra}
+                        preds = predsA  # v2 rel branch consumes preds["pose_enc"]
                     elif arm == "SS8M":
                         images8m, pmask8 = mask_image_blocks(
                             train_images8[pi], 0.5, patch_hw,
@@ -2403,6 +3044,7 @@ def main():
                                     patch_hw, step=step, patch_mask=pm_k)
                                 loss = loss + l_k / 2.0
                                 extra = e_k
+                            preds = p_k  # v2 rel branch consumes preds["pose_enc"]
                     elif arm == "MDF":
                         _, pmask = mask_image_blocks(
                             images4, 0.5, patch_hw,
@@ -2545,7 +3187,30 @@ def main():
                     if _feat_hook is not None:
                         _feat_hook.remove()
                         _feat_hook = None
-                    scaler.scale(loss).backward()
+                    # ---- protocol v2 (flag-gated): robust rel branch + grad cap.
+                    #      With both flags off this block reduces to the original
+                    #      single scaler.scale(loss).backward() (regression-locked).
+                    loss_base = loss
+                    loss_rel = None
+                    if args.v2_rel_weight > 0:
+                        assert preds is not None and "pose_enc" in preds, \
+                            f"--v2_rel_weight requires an arm branch that produces preds (arm={arm})"
+                        loss_rel, rel_extra = v2_rel_pose_loss(
+                            preds["pose_enc"], cache, images4.shape[-2:],
+                            args.v2_rel_weight)
+                        loss = loss_base + loss_rel
+                        extra = {**extra, **rel_extra}
+                    if args.v2_grad_cap:
+                        # split backward: two fused backwards (bit-exact vs the
+                        # single fused path; autograd.grad is NOT — it computes
+                        # weight grads behind the autocast boundary differently),
+                        # rel branch per-param-norm-capped, merged into p.grad
+                        # in scaled space so unscale_/clip/scaler.step are exact.
+                        cap_extra = v2_grad_cap_backward(
+                            loss_base, loss_rel, params, scaler, v2_grad_state)
+                        extra = {**extra, **cap_extra}
+                    else:
+                        scaler.scale(loss).backward()
                     if args.sam_rho > 0:
                         # SAM: eps = rho*g/||g|| is invariant to the GradScaler factor,
                         # so it can be computed from scaled grads directly.
@@ -2583,6 +3248,30 @@ def main():
                         loss=float(loss), lr=scheduler.get_last_lr()[0],
                         grad_norm=float(gn), extra=str(extra),
                         step_time_s=f"{step_dt:.4f}", peak_mem_mib=f"{peak_mib:.1f}"))
+                    # ---- swanlab: aggregate curve + per-pair curves (x = step)
+                    _swan_log(swan_run, {
+                        "loss": float(loss),
+                        "lr": scheduler.get_last_lr()[0],
+                        "grad_norm": float(gn),
+                        ** _pair_metrics(pi, loss, extra),
+                    }, step=step)
+                    # ---- protocol v2 (flag-gated): probe + ckpt at probe points.
+                    #      Runs BEFORE the max_steps break so smoke mode
+                    #      (max_steps=3, probe_every=1) still exercises it.
+                    if (args.v2_probe or args.v2_ckpt) \
+                            and step % args.v2_probe_every == 0:
+                        if args.v2_probe:
+                            outp = run_v2_probe(v2_evaluator, v2_fwd, scene, arm,
+                                                step, args.run_root, v2_overlaps,
+                                                n_train, log_fn=_v2_probe_log)
+                            tot = float(np.mean([r["total"] for r in outp["records"]]))
+                            print(f"[{scene}] {arm} v2 probe step={step} "
+                                  f"records={len(outp['records'])} mean_total={tot:.4f}",
+                                  flush=True)
+                        if args.v2_ckpt and not args.full_ft:
+                            pc = save_v2_ckpt(student, args.run_root, scene, arm, step)
+                            print(f"[{scene}] {arm} v2 ckpt step={step} -> {pc}",
+                                  flush=True)
                     if args.max_steps and step >= args.max_steps:
                         break
                     losses.append(float(loss))
@@ -2630,6 +3319,13 @@ def main():
             mean_dt = float(np.mean(step_times)) if step_times else float("nan")
             print(f"[{scene}] {arm} summary: steps={step} "
                   f"mean_step_time_s={mean_dt:.3f} peak_mem_mib={peak_mib:.1f}", flush=True)
+            # ---- swanlab: selector replay (checkpoint-selection audit) + scene
+            #      eval comparison (or pending-eval record for external backfill).
+            #      Gate on swan_run: swanlab off/unavailable -> zero side effects.
+            _swan_selector_summary(args.run_root, scene, arm, swan_run)
+            if swan_run is not None:
+                _swan_scene_eval(args, scene, arm, swan_run)
+            _swan_finish(swan_run)
             print(f"[{scene}] {arm} done ({time.time()-t0:.0f}s cumulative)", flush=True)
 
         del caches, pair_images

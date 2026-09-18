@@ -181,6 +181,28 @@ def make_dataset(ds):
     return getattr(mod, table[ds][1])()
 
 
+def load_scene_baseline(path: str, dataset: str, scene: str):
+    """baselines.json layout: {model: {dataset: {arm: {scene: {metric: value},
+    "_source": [...], "_n_scenes": ...}}}} — scene keys are interleaved with
+    "_" -prefixed meta keys; we read da3.<dataset>.baseline.<scene> and filter.
+    Returns the metric dict, or None (with a printed warning) when missing."""
+    if not os.path.exists(path):
+        print(f"[warn] baselines.json not found: {path}; skipping baseline comparison")
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        node = data.get("da3", {}).get(dataset, {}).get("baseline", {})
+        entry = node.get(scene)
+        if not isinstance(entry, dict):
+            print(f"[warn] no baseline for {dataset}/{scene} in {path}; skipping")
+            return None
+        return {k: v for k, v in entry.items() if not k.startswith("_")}
+    except Exception as e:
+        print(f"[warn] failed to read baseline for {dataset}/{scene} ({e}); skipping")
+        return None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="DA3 per-scene TTA (protocol v1, C2M)")
     ap.add_argument("--scenes", nargs="+", required=True)
@@ -263,7 +285,39 @@ def main() -> None:
     ap.add_argument("--swanlab_suffix", default="",
                     help="suffix for swanlab experiment names, e.g. _mv13 to mark "
                          "the multi-view(13-39)-LoRA protocol runs")
+    ap.add_argument("--v2_probe", action="store_true",
+                    help="protocol v2: GT-free probe on the protocol's probe pairs "
+                         "(kept teacher caches, 2 fixed masks per pair, robust "
+                         "losses vs frozen teacher) every --v2_probe_every updates "
+                         "plus step 0; appended to <output_root>/probe_trace/<scene>.jsonl")
+    ap.add_argument("--v2_probe_every", type=int, default=10,
+                    help="probe evaluation cadence in optimizer updates (default 10)")
+    ap.add_argument("--v2_ckpt", action="store_true",
+                    help="protocol v2: save LoRA at step 0 and every probe-cadence "
+                         "step to <output_root>/ckpts/<scene>/v2/step{N}_lora.pt; "
+                         "hard-fails if the artifact is missing on disk")
+    ap.add_argument("--v2_rel_weight", type=float, default=0.0,
+                    help="protocol v2: append rel_weight * (rot_edges_huber.loss + "
+                         "tdir_cos_loss.loss) to the arm loss, teacher side "
+                         "detached (replaces the old loss_pose_rel path, which "
+                         "stays available via --arm rkdc1hr)")
+    ap.add_argument("--v2_grad_cap", action="store_true",
+                    help="protocol v2: separate backward of base vs v2-rel "
+                         "gradients; ||g_R|| capped at 4*median(||g_R|| over the "
+                         "first 10 updates) (requires --v2_rel_weight > 0)")
+    ap.add_argument("--v2_couple_fix", action="store_true",
+                    help="protocol v2: couple term uses the teacher-derived valid "
+                         "mask on BOTH sides (losses.loss_couple_centers "
+                         "semantics), skipping and logging on degenerate spread / "
+                         "empty valid mask")
+    ap.add_argument("--v2_baselines_json", default="workspace/protocol_v2/baselines.json",
+                    help="protocol v2: baselines.json for the scene-level "
+                         "baseline-vs-TTA swanlab summary (da3.<dataset>.baseline.<scene>)")
     args = ap.parse_args()
+    if args.v2_grad_cap and args.v2_rel_weight <= 0:
+        ap.error("--v2_grad_cap requires --v2_rel_weight > 0")
+    if args.v2_probe_every <= 0:
+        ap.error("--v2_probe_every must be > 0")
 
     device = "cuda"
     fg_common.set_dataset(args.dataset)
@@ -304,17 +358,31 @@ def main() -> None:
 
         run = None
         if args.swanlab:
-            import swanlab
-            run = swanlab.init(
-                project="free-geometry-tta",
-                experiment_name=f"{scene}_{args.arm}{args.swanlab_suffix}",
-                description=f"{args.dataset} | {args.arm} | "
-                            f"loss_all_pos={args.loss_all_pos} | seed={args.seed}",
-                config={k: v for k, v in vars(args).items()
-                        if isinstance(v, (int, float, str, bool)) or v is None},
-            )
+            try:
+                import swanlab
+                run = swanlab.init(
+                    project="free-geometry-tta",
+                    experiment_name=f"{scene}_{args.arm}{args.swanlab_suffix}",
+                    description=f"{args.dataset} | {args.arm} | "
+                                f"loss_all_pos={args.loss_all_pos} | seed={args.seed}",
+                    config={k: v for k, v in vars(args).items()
+                            if isinstance(v, (int, float, str, bool)) or v is None},
+                )
+            except Exception as e:  # logging must never kill training
+                print(f"[{scene}] WARNING: swanlab unavailable ({e}); continuing without it")
+                run = None
 
         pair_visits = {}
+
+        v2 = None
+        if (args.v2_probe or args.v2_ckpt or args.v2_rel_weight > 0
+                or args.v2_grad_cap or args.v2_couple_fix):
+            v2 = P.V2Config(
+                probe=args.v2_probe, probe_every=args.v2_probe_every,
+                ckpt=args.v2_ckpt, rel_weight=args.v2_rel_weight,
+                grad_cap=args.v2_grad_cap, couple_fix=args.v2_couple_fix,
+                run_dir=args.output_root,
+                ckpt_dir=os.path.join(args.output_root, "ckpts"))
 
         def _on_step(row, _run=run):
             if _run is None:
@@ -322,7 +390,9 @@ def main() -> None:
             m = {}
             for k in ("loss", "lr", "grad_norm", "pair_idx", "epoch",
                       "maskdistill", "rkd_sh_d", "rkd_sh_a", "couple",
-                      "rel_rot", "rel_tdir", "ctk", "peak_mem_mib"):
+                      "rel_rot", "rel_tdir", "ctk", "peak_mem_mib",
+                      "v2_rel_rot", "v2_rel_tdir",
+                      "g_base_norm", "g_R_norm", "v2_C_R"):
                 v = row.get(k)
                 if isinstance(v, (int, float)) and v == v:
                     m[k] = v
@@ -337,7 +407,47 @@ def main() -> None:
                 v = row.get(k)
                 if isinstance(v, (int, float)) and v == v:
                     pm[f"pair{pi}/{k}"] = v
+            try:
+                # normalized per-pair components (v2 reporting): pair/pN/{total,
+                # feature, rkd, couple, rel} — rel only when the arm has a rel term
+                normed = {"total": row.get("loss"), "feature": row.get("maskdistill")}
+                if row.get("rkd_sh_d") is not None or row.get("rkd_sh_a") is not None:
+                    normed["rkd"] = (row.get("rkd_sh_d") or 0.0) + (row.get("rkd_sh_a") or 0.0)
+                if row.get("couple") is not None:
+                    normed["couple"] = row.get("couple")
+                if row.get("rel_rot") is not None:  # old loss_pose_rel path
+                    normed["rel"] = row.get("rel_rot") + row.get("rel_tdir")
+                elif row.get("v2_rel_rot") is not None:  # v2 robust rel branch
+                    normed["rel"] = row.get("v2_rel_rot") + row.get("v2_rel_tdir")
+                for name, v in normed.items():
+                    if isinstance(v, (int, float)) and v == v:
+                        pm[f"pair/p{pi}/{name}"] = v
+            except Exception as e:
+                print(f"[warn] per-pair swanlab logging failed: {e}")
             _run.log(pm, step=pair_visits[pi])
+
+        def _on_probe(rec, _run=run):
+            """probe curves at the REAL step: per (pair, mask) components + means"""
+            if _run is None:
+                return
+            try:
+                comps = ("feature", "rot_deg", "rkd", "couple")
+                m = {}
+                for r in rec["records"]:
+                    j = str(r["pair_id"]).replace("probe", "")
+                    k = int(r["mask_id"])
+                    for c in comps:
+                        v = r["components"].get(c)
+                        if isinstance(v, (int, float)) and v == v:
+                            m[f"probe/pair{j}/mask{k}/{c}"] = v
+                    m[f"probe/pair{j}/mask{k}/total"] = r["total"]
+                n = len(rec["records"])
+                for c in comps:
+                    m[f"probe/mean/{c}"] = sum(r["components"][c] for r in rec["records"]) / n
+                m["probe/mean/total"] = sum(r["total"] for r in rec["records"]) / n
+                _run.log(m, step=int(rec["step"]))
+            except Exception as e:
+                print(f"[warn] probe swanlab logging failed: {e}")
 
         pose_w = 0.0 if args.arm == "pw0" else args.pose_weight
         stats = P.train_scene_c2m(
@@ -350,7 +460,25 @@ def main() -> None:
             two_stage=args.two_stage,
             early_stop=args.early_stop,
             mask_loss_positions=not args.loss_all_pos,
-            on_step=_on_step)
+            on_step=_on_step, on_probe=_on_probe if args.swanlab else None, v2=v2)
+
+        if run is not None and v2 is not None and v2.probe:
+            # offline selector replay on the probe trace this run just wrote —
+            # shows which checkpoint the controller would pick (read-only)
+            try:
+                from free_geometry.tta_v2.controller import ControllerConfig, select
+                trace_file = os.path.join(args.output_root, "probe_trace", f"{scene}.jsonl")
+                with open(trace_file) as f:
+                    trace = [json.loads(line) for line in f if line.strip()]
+                sel = select(trace, ControllerConfig())
+                run.log({"selector/selected_step": sel["selected_step"],
+                         "selector/fell_back_to_baseline": sel["fell_back_to_baseline"],
+                         "selector/improvement": sel["improvement"]})
+                print(f"[{scene}] selector replay: selected_step={sel['selected_step']} "
+                      f"fell_back={sel['fell_back_to_baseline']} "
+                      f"improvement={sel['improvement']:.4f}")
+            except Exception as e:
+                print(f"[{scene}] WARNING: selector replay failed: {e}")
 
         ckpt_dir = os.path.join(args.output_root, "ckpts", scene)
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -384,6 +512,34 @@ def main() -> None:
                   f"cd={ev.get('recon_overall', float('nan')):.4f} "
                   f"abs_rel={ev.get('abs_rel', float('nan')):.4f} "
                   f"({ev['n_eval_frames']} frames, peak {ev['eval_peak_mem_mib']:.0f}MiB)")
+            if run is not None:
+                # scene-level baseline-vs-TTA summary (signed relative deltas)
+                try:
+                    base = load_scene_baseline(args.v2_baselines_json,
+                                               args.dataset, scene)
+                    if base is not None:
+                        m = {}
+                        b_auc = base.get("auc03")
+                        if b_auc and ev.get("auc03") is not None:
+                            m["eval/auc03"] = ev["auc03"]
+                            m["eval/d_auc03_rel"] = (ev["auc03"] - b_auc) / b_auc
+                        b_f = base.get("fscore")
+                        if b_f and ev.get("recon_fscore") is not None:
+                            m["eval/f1"] = ev["recon_fscore"]
+                            m["eval/d_f1_rel"] = (ev["recon_fscore"] - b_f) / b_f
+                        else:
+                            b_o = base.get("overall")  # dtu/dtu64: chamfer distance
+                            if b_o and ev.get("recon_overall") is not None:
+                                m["eval/chamfer_overall"] = ev["recon_overall"]
+                                m["eval/d_chamfer_overall_rel"] = (
+                                    ev["recon_overall"] - b_o) / b_o
+                        if m:
+                            run.log(m)
+                            print(f"[{scene}] baseline delta vs {args.dataset}/baseline: "
+                                  + " ".join(f"{k}={v:+.4f}" for k, v in m.items()
+                                             if k.startswith("eval/d_")))
+                except Exception as e:
+                    print(f"[{scene}] WARNING: baseline comparison failed: {e}")
 
         if run is not None:
             if not args.skip_eval and "eval" in summary["scenes"][scene]:
@@ -397,7 +553,9 @@ def main() -> None:
     if trace_rows:
         keys = ["scene", "step", "epoch", "pair_idx", "loss", "lr", "grad_norm",
                 "peak_mem_mib", "maskdistill", "rel", "rel_rot", "rel_tdir",
-                "rkd_sh_d", "rkd_sh_a", "couple", "ctk", "mask_ratio"]
+                "rkd_sh_d", "rkd_sh_a", "couple", "ctk", "mask_ratio",
+                "v2_rel_rot", "v2_rel_tdir", "couple_skipped",
+                "g_base_norm", "g_R_norm", "v2_C_R"]
         with open(trace_path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
             w.writeheader()

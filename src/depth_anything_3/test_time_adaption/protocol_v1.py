@@ -32,6 +32,7 @@ import hashlib
 import math
 import os
 import random
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -716,11 +717,177 @@ def loss_couple_w2c(ext_s: torch.Tensor, depth_s: torch.Tensor,
     return loss.squeeze(), {"couple": float(loss)}
 
 
+# ---------------------------------------------------------------------------
+# Protocol v2 additions (all default-off; v2=None reproduces v1 exactly)
+# ---------------------------------------------------------------------------
+@dataclass
+class V2Config:
+    """Protocol-v2 knobs, wired in from scripts/train_da3_protocol.py.
+
+    probe:        GT-free probe evaluation on the protocol's probe_pairs
+                  (their teacher caches are kept instead of discarded).
+    probe_every:  evaluate every N optimizer updates (plus the step-0 baseline).
+    ckpt:         save LoRA at step 0 and at every probe-cadence step to
+                  <ckpt_dir>/<scene>/v2/step{N}_lora.pt (hard-fails if missing).
+    rel_weight:   >0 appends rel_weight * (rot_edges_huber + tdir_cos_loss) to
+                  the arm loss (teacher detached; replaces the old loss_pose_rel
+                  path, which remains available via the rkdc1hr arm).
+    grad_cap:     separate backward of base vs v2-rel gradients; ||g_R|| capped
+                  at 4*median(||g_R|| over the first 10 updates) (requires
+                  rel_weight > 0).
+    couple_fix:   couple term uses the shared teacher-derived valid mask on
+                  BOTH sides (losses.loss_couple_centers semantics), skipping
+                  and logging on degenerate spread / empty valid mask.
+    run_dir:      probe trace root -> <run_dir>/probe_trace/<scene>.jsonl.
+    ckpt_dir:     v2 checkpoint root -> <ckpt_dir>/<scene>/v2/step{N}_lora.pt.
+    """
+
+    probe: bool = False
+    probe_every: int = 10
+    ckpt: bool = False
+    rel_weight: float = 0.0
+    grad_cap: bool = False
+    couple_fix: bool = False
+    run_dir: str = "."
+    ckpt_dir: str = ""
+
+
+def _centers_from_ext(ext: torch.Tensor) -> torch.Tensor:
+    """Camera centers [S,3] from w2c ext [S,3,4] | [1,S,3,4] | [1,S,4,4]."""
+    if ext.dim() == 4:
+        ext = ext[0]
+    R, t = ext[..., :3, :3].float(), ext[..., :3, 3].float()
+    return -(R.transpose(-1, -2) @ t.unsqueeze(-1)).squeeze(-1)
+
+
+def _v2_rel_branch(ext_s: torch.Tensor, ext_t: torch.Tensor):
+    """v2 robust relative-pose branch on the shared frames' w2c view-graph
+    edges (teacher side detached): rot_edges_huber.loss + tdir_cos_loss.loss.
+    Nothing here detaches the student side. Returns (branch, extra dict)."""
+    from free_geometry.tta_v2 import edges_from_w2c, rot_edges_huber, tdir_cos_loss
+
+    e_t = edges_from_w2c(ext_t)
+    e_s = edges_from_w2c(ext_s)
+    rot = rot_edges_huber(e_s["R_rel"], e_t["R_rel"].detach())
+    tdir = tdir_cos_loss(e_s["t_rel"], e_t["t_rel"].detach(), e_t["baseline"])
+    branch = rot["loss"] + tdir["loss"]
+    extra = {"v2_rel_rot": float(rot["loss"]), "v2_rel_tdir": float(tdir["loss"]),
+             "v2_rel_tdir_n_kept": int(tdir["n_kept"]),
+             "v2_rel_tdir_n_skipped": int(tdir["n_skipped"])}
+    return branch, extra
+
+
+def _couple_fixed(ext_s: torch.Tensor, depth_s: torch.Tensor,
+                  ext_t: torch.Tensor, depth_t: torch.Tensor,
+                  conf_t: torch.Tensor):
+    """Couple term with the losses.loss_couple_centers semantics (2026-09-17
+    fix): BOTH sides take mean depth over the SAME teacher-derived valid-pixel
+    mask (conf 5% quantile). Degenerate camera spread / empty valid mask ->
+    zero loss + skip reason in extra (logged by the caller)."""
+    from free_geometry.losses import valid_mask_from_conf
+    from free_geometry.tta_v2 import couple_robust
+
+    with torch.autocast(device_type="cuda", enabled=False):
+        valid_t = valid_mask_from_conf(conf_t[0].float())  # conf [1,S,H,W] -> [S,H,W]
+        cs, ct = _centers_from_ext(ext_s), _centers_from_ext(ext_t).detach()
+        ds, dt = depth_s.float(), depth_t.float()
+        if ds.dim() == 4:
+            ds = ds[0]
+        if dt.dim() == 4:
+            dt = dt[0]
+        cp = couple_robust(cs, ct, ds, dt, valid_t, huber_delta=None)
+    if cp["skipped"]:
+        zero = (cs - ct).sum() * 0.0
+        return zero, {"couple": 0.0, "couple_skipped": cp["reason"]}
+    return cp["loss"], {"couple": float(cp["loss"])}
+
+
+def _save_v2_ckpt(student, ckpt_dir: str, scene: str, step: int) -> str:
+    """Save LoRA (+ trainable camera token) to <ckpt_dir>/<scene>/v2/step{N}_lora.pt
+    and HARD-FAIL if the artifact is not on disk afterwards — a silently missing
+    ckpt once let eval fall back to base and polluted 12 scenes."""
+    d = os.path.join(ckpt_dir, scene, "v2")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"step{step}_lora.pt")
+    student.save_lora_weights(path)
+    assert os.path.isdir(path.replace(".pt", "_peft")), f"v2 ckpt save failed: {path}"
+    assert os.path.exists(path), f"v2 ckpt save failed: {path}"
+    return path
+
+
+def _build_probe_evaluator(student, scene: str, protocol: Dict,
+                           probe_caches: List[Dict], probe_images: List[torch.Tensor],
+                           device: str):
+    """ProbeEvaluator contexts from the protocol's probe pairs. The teacher side
+    of each context comes from the pair's (previously discarded) teacher cache:
+    post-head.norm tapped features, conf patch weights, w2c ext / centers /
+    depth / teacher-derived valid mask — all on `device` (the core does no
+    device moves). images_meta stays a CPU [4,3,H,W] handle for forward_fn."""
+    from free_geometry.losses import valid_mask_from_conf
+    from free_geometry.tta_v2 import ProbeEvaluator
+
+    head_norm = student.da3.model.head.norm
+    contexts = []
+    with torch.no_grad():
+        for pi, (cache, imgs4) in enumerate(zip(probe_caches, probe_images)):
+            conf = cache["conf4"].to(device)  # [1,4,H,W] fp32
+            feats_t = {l: head_norm(cache["feats"][l].to(device).float()).detach()
+                       for l in TAP_LAYERS}
+            ext_t = cache["ext4"].to(device).float()  # [4,3,4] w2c
+            contexts.append({
+                "pair_id": f"probe{pi}",
+                "scene": scene,
+                "patch_grid": cache["patch_hw"],
+                "teacher": {
+                    "features": feats_t,
+                    "feat_w": teacher_patch_conf(conf, cache["patch_hw"]),
+                    "ext_w2c": ext_t,
+                    "centers": _centers_from_ext(ext_t),
+                    "depth": cache["depth4"][0].to(device).float(),
+                    "valid": valid_mask_from_conf(conf[0]),
+                },
+                "images_meta": imgs4,  # CPU [4,3,H,W]; moved to device in forward_fn
+            })
+    return ProbeEvaluator(contexts, model=student)
+
+
+def _probe_forward_factory(student, device: str):
+    """forward_fn(images_meta, mask [S,ph,pw] bool) for ProbeEvaluator: zero-fill
+    the masked 14x14 blocks of the 4 shared frames in normalized space (same
+    convention as mask_image_blocks), run the student under bf16 autocast, and
+    map outputs onto the ProbeEvaluator contract (post-head.norm feature dict,
+    w2c ext, centers, depth). Grad-free: evaluate() wraps this in no_grad."""
+
+    def forward_fn(images_meta, mask):
+        images4 = images_meta.to(device).unsqueeze(0)  # [1,4,3,H,W]
+        H, W = images4.shape[-2], images4.shape[-1]
+        ph, pw = int(mask.shape[1]), int(mask.shape[2])
+        m = mask.to(device).repeat_interleave(H // ph, dim=1).repeat_interleave(W // pw, dim=2)
+        images4_in = images4 * (~m).unsqueeze(1).float()  # [S,1,H,W] broadcast over C
+        tap, ext_w2c, depth_s = student_forward_c2m(student, images4_in, with_depth=True)
+        head_norm = student.da3.model.head.norm
+        features = {l: head_norm(tap[l].float()) for l in TAP_LAYERS}
+        return {"features": features,
+                "ext_w2c": ext_w2c,
+                "centers": _centers_from_ext(ext_w2c),
+                "depth": depth_s[0].float()}
+
+    return forward_fn
+
+
 def compute_rkdc1h_loss(student, teacher_cache: Dict, images4_in: torch.Tensor,
                         patch_mask: torch.Tensor, rkd_weight: float = 1.5,
-                        couple_weight: float = 1.0, rel_weight: float = 0.0):
+                        couple_weight: float = 1.0, rel_weight: float = 0.0,
+                        v2_rel_weight: float = 0.0, v2_couple_fix: bool = False,
+                        v2_split: bool = False):
     """RKDC1H(+R) for DA3 = maskdistill + rkd_weight*rkd_huber + couple_weight*couple
-    + rel_weight*rel_corrected (rel_weight>0 enables the corrected rel term)."""
+    + rel_weight*rel_corrected (rel_weight>0 enables the corrected rel term).
+
+    v2 (all default-off): v2_couple_fix swaps the couple term for the
+    shared-valid-mask semantics of losses.loss_couple_centers; v2_rel_weight>0
+    appends v2_rel_weight * (rot_edges_huber.loss + tdir_cos_loss.loss) with the
+    teacher side detached; v2_split=True returns (base_total, extra, rel_branch)
+    with the branch NOT added to total, for --v2_grad_cap separate backward."""
     tap_feats_s, ext_s, depth_s = student_forward_c2m(student, images4_in, with_depth=True)
     device = images4_in.device
     cache = {
@@ -732,23 +899,39 @@ def compute_rkdc1h_loss(student, teacher_cache: Dict, images4_in: torch.Tensor,
     feat_loss, feat_extra = loss_maskdistill(head_norm, cache, tap_feats_s, patch_mask)
     ext_t = teacher_cache["ext4"].to(device)
     rkd_loss, rkd_extra = loss_rkd_shared_pose_huber_w2c(ext_s, ext_t)
-    cp_loss, cp_extra = loss_couple_w2c(ext_s, depth_s, ext_t,
-                                        teacher_cache["depth4"].to(device),
-                                        teacher_cache["conf4"].to(device))
+    if v2_couple_fix:
+        cp_loss, cp_extra = _couple_fixed(ext_s, depth_s, ext_t,
+                                          teacher_cache["depth4"].to(device),
+                                          teacher_cache["conf4"].to(device))
+    else:
+        cp_loss, cp_extra = loss_couple_w2c(ext_s, depth_s, ext_t,
+                                            teacher_cache["depth4"].to(device),
+                                            teacher_cache["conf4"].to(device))
     total = feat_loss + rkd_weight * rkd_loss + couple_weight * cp_loss
     extra = {**feat_extra, **rkd_extra, **cp_extra}
+    rel_branch = None
+    if v2_rel_weight > 0:
+        rel_branch, rel_extra = _v2_rel_branch(ext_s, ext_t)
+        extra.update(rel_extra)
+        if not v2_split:
+            total = total + v2_rel_weight * rel_branch
     if rel_weight > 0:
         rel_loss, rel_extra = loss_pose_rel(ext_s, ext_t)
         total = total + rel_weight * rel_loss
         extra.update(rel_extra)
+    if v2_split:
+        return total, extra, rel_branch
     return total, extra
 
 
 def compute_rkdc1hc_loss(student, teacher_cache: Dict, images4_in: torch.Tensor,
                          patch_mask: torch.Tensor, rkd_weight: float = 1.5,
-                         couple_weight: float = 1.0, ctk_weight: float = 1.0):
+                         couple_weight: float = 1.0, ctk_weight: float = 1.0,
+                         v2_rel_weight: float = 0.0, v2_couple_fix: bool = False,
+                         v2_split: bool = False):
     """RKDC1HC = RKDC1H + ctk_weight * camera-token KD (direct pose-pathway
-    supervision on the shared views' position-0 tokens, all 4 tap layers)."""
+    supervision on the shared views' position-0 tokens, all 4 tap layers).
+    v2 kwargs: same semantics as compute_rkdc1h_loss."""
     tap_feats_s, ext_s, depth_s, tap_cam_s = student_forward_c2m(
         student, images4_in, with_depth=True, with_cam=True)
     device = images4_in.device
@@ -761,22 +944,39 @@ def compute_rkdc1hc_loss(student, teacher_cache: Dict, images4_in: torch.Tensor,
     feat_loss, feat_extra = loss_maskdistill(head_norm, cache, tap_feats_s, patch_mask)
     ext_t = teacher_cache["ext4"].to(device)
     rkd_loss, rkd_extra = loss_rkd_shared_pose_huber_w2c(ext_s, ext_t)
-    cp_loss, cp_extra = loss_couple_w2c(ext_s, depth_s, ext_t,
-                                        teacher_cache["depth4"].to(device),
-                                        teacher_cache["conf4"].to(device))
+    if v2_couple_fix:
+        cp_loss, cp_extra = _couple_fixed(ext_s, depth_s, ext_t,
+                                          teacher_cache["depth4"].to(device),
+                                          teacher_cache["conf4"].to(device))
+    else:
+        cp_loss, cp_extra = loss_couple_w2c(ext_s, depth_s, ext_t,
+                                            teacher_cache["depth4"].to(device),
+                                            teacher_cache["conf4"].to(device))
     cam_t = {l: t.to(device) for l, t in teacher_cache["cam"].items()}
     ctk_loss, ctk_extra = loss_ctk(tap_cam_s, cam_t)
     total = feat_loss + rkd_weight * rkd_loss + couple_weight * cp_loss \
         + ctk_weight * ctk_loss
-    return total, {**feat_extra, **rkd_extra, **cp_extra, **ctk_extra}
+    extra = {**feat_extra, **rkd_extra, **cp_extra, **ctk_extra}
+    rel_branch = None
+    if v2_rel_weight > 0:
+        rel_branch, rel_extra = _v2_rel_branch(ext_s, ext_t)
+        extra.update(rel_extra)
+        if not v2_split:
+            total = total + v2_rel_weight * rel_branch
+    if v2_split:
+        return total, extra, rel_branch
+    return total, extra
 
 
 def compute_c2m_loss(student, teacher_cache: Dict, images4_in: torch.Tensor, patch_mask: torch.Tensor,
-                     pose_weight: float = 1.0):
+                     pose_weight: float = 1.0, v2_rel_weight: float = 0.0,
+                     v2_split: bool = False):
     """C2M = maskdistill + pose_weight * rel-pose, the VGGT C2M_maskrel arm.
     pose_weight=0 recovers the protocol's pure-maskdistill fine variant
     (recommended for tau <= 0.55 datasets). Teacher cache tensors live on CPU
-    and are moved to the GPU here per step."""
+    and are moved to the GPU here per step. v2_rel_weight>0 appends the robust
+    relative-pose branch (see compute_rkdc1h_loss); v2_split returns
+    (base_total, extra, rel_branch) for --v2_grad_cap."""
     tap_feats_s, ext_s, _ = student_forward_c2m(student, images4_in)
     device = images4_in.device
     cache = {
@@ -786,8 +986,19 @@ def compute_c2m_loss(student, teacher_cache: Dict, images4_in: torch.Tensor, pat
     }
     head_norm = student.da3.model.head.norm
     feat_loss, feat_extra = loss_maskdistill(head_norm, cache, tap_feats_s, patch_mask)
-    rel_loss, rel_extra = loss_pose_rel(ext_s, teacher_cache["ext4"].to(device))
-    return feat_loss + pose_weight * rel_loss, {**feat_extra, **rel_extra, "rel": float(rel_loss)}
+    ext_t = teacher_cache["ext4"].to(device)
+    rel_loss, rel_extra = loss_pose_rel(ext_s, ext_t)
+    total = feat_loss + pose_weight * rel_loss
+    extra = {**feat_extra, **rel_extra, "rel": float(rel_loss)}
+    rel_branch = None
+    if v2_rel_weight > 0:
+        rel_branch, v2_extra = _v2_rel_branch(ext_s, ext_t)
+        extra.update(v2_extra)
+        if not v2_split:
+            total = total + v2_rel_weight * rel_branch
+    if v2_split:
+        return total, extra, rel_branch
+    return total, extra
 
 
 # ---------------------------------------------------------------------------
@@ -851,6 +1062,8 @@ def train_scene_c2m(
     log_fn=print,
     trace_rows: Optional[list] = None,
     on_step=None,  # per-step callback(row: dict) for external loggers (swanlab)
+    on_probe=None,  # per-probe-eval callback(record: dict), same record as the JSONL line
+    v2: Optional[V2Config] = None,  # protocol-v2 knobs; None = pure v1 behavior
 ) -> Dict:
     """Run the fixed-100-step C2M adaptation for one scene. Returns stats.
 
@@ -858,6 +1071,11 @@ def train_scene_c2m(
     teacher is on `device` only while its features are cached, then goes back
     to CPU; the student moves to `device` for the training loop. Teacher caches
     and pair images live on CPU and are streamed per step.
+
+    v2 (V2Config, all default-off): keeps the probe pairs' teacher caches for
+    the GT-free probe, periodic LoRA checkpoints, the robust relative-pose
+    branch, its gradient cap, and the fixed couple term. With v2=None (or every
+    field default) the loss values are bit-identical to v1.
     """
     from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
@@ -880,6 +1098,8 @@ def train_scene_c2m(
     patch_hw = caches[0]["patch_hw"]
     n_train = len(protocol["train_pairs"])
     train_caches, train_images = caches[:n_train], pair_images4[:n_train]
+    # v2: the probe pairs' caches used to be built and dropped; keep them.
+    probe_caches, probe_images = caches[n_train:], pair_images4[n_train:]
 
     # ---- fresh LoRA (student == baseline at step 0) ----
     student.to(device)
@@ -908,6 +1128,46 @@ def train_scene_c2m(
     step = 0
     losses = []
     stop = False
+
+    # ---- protocol v2 state (all inert when v2 is None / defaults) ----
+    use_v2_gc = bool(v2 and v2.grad_cap and v2.rel_weight > 0)
+    if v2 is not None and v2.grad_cap and v2.rel_weight <= 0:
+        raise ValueError("v2.grad_cap requires v2.rel_weight > 0")
+    v2_rel_w = v2.rel_weight if v2 is not None else 0.0
+    v2_cf = bool(v2 and v2.couple_fix)
+    v2_gR_hist: List[float] = []
+    v2_C_R = None  # set after the first 10 updates: 4 * median(||g_R||)
+    probe_evaluator = None
+    probe_forward_fn = None
+    probe_overlap = False
+    if v2 is not None and v2.probe:
+        probe_evaluator = _build_probe_evaluator(
+            student, scene, protocol, probe_caches, probe_images, device)
+        probe_forward_fn = _probe_forward_factory(student, device)
+        # tiny scenes: the probe-pair fallback branch dedups against NOTHING,
+        # so a probe pair can be identical to a train pair — warn, don't hide it
+        _train_keys = {(tuple(sorted(p["teacher_frames"])), tuple(p["student_frames"]))
+                       for p in protocol["train_pairs"]}
+        probe_overlap = any(
+            (tuple(sorted(p["teacher_frames"])), tuple(p["student_frames"])) in _train_keys
+            for p in protocol["probe_pairs"])
+        if probe_overlap:
+            log_fn(f"[{scene}] WARNING: a probe pair is identical to a train pair "
+                   f"(probe_train_overlap=true); the probe is not held out here")
+
+    def _run_probe(step_n: int) -> None:
+        res = probe_evaluator.evaluate(step_n, probe_forward_fn)
+        rec = {"scene": scene, **res}
+        if probe_overlap:
+            rec["probe_train_overlap"] = True
+        from free_geometry.tta_v2 import append_jsonl
+        append_jsonl(os.path.join(v2.run_dir, "probe_trace", f"{scene}.jsonl"), rec)
+        if on_probe is not None:
+            try:
+                on_probe(rec)
+            except Exception as e:  # a logger must never kill training
+                log_fn(f"[{scene}] WARNING: on_probe callback failed: {e}")
+
     stage_cut = round(steps * two_stage) if two_stage > 0 else None
     kinds = [p.get("kind", "fixed") for p in protocol["train_pairs"]]
     if stage_cut is not None:
@@ -916,6 +1176,12 @@ def train_scene_c2m(
                f"(fixed={kinds.count('fixed')}, se={kinds.count('se')}); "
                f"early_stop disabled (phase structure bounds training)")
     epoch = 0
+    # step-0 baseline (student == frozen base right after the LoRA reset)
+    if v2 is not None:
+        if v2.ckpt:
+            _save_v2_ckpt(student, v2.ckpt_dir, scene, 0)
+        if v2.probe:
+            _run_probe(0)
     while not stop:
         if stage_cut is not None:
             se_phase = step >= stage_cut
@@ -959,29 +1225,84 @@ def train_scene_c2m(
                     "shallow" if mask_mode == "token_shallow" else "feat",
                     mask_layer=mask_layer)
             torch.manual_seed(stable_seed("cf_rng", scene, epoch, pi, seed))
+            base_loss, rel_branch = None, None
             if arm == "rkdc1hc":
-                loss, extra = compute_rkdc1hc_loss(student, cache, images4_in, pmask,
-                                                   ctk_weight=ctk_weight)
+                if use_v2_gc:
+                    base_loss, extra, rel_branch = compute_rkdc1hc_loss(
+                        student, cache, images4_in, pmask, ctk_weight=ctk_weight,
+                        v2_rel_weight=v2_rel_w, v2_couple_fix=v2_cf, v2_split=True)
+                    loss = base_loss + v2.rel_weight * rel_branch
+                else:
+                    loss, extra = compute_rkdc1hc_loss(
+                        student, cache, images4_in, pmask, ctk_weight=ctk_weight,
+                        v2_rel_weight=v2_rel_w, v2_couple_fix=v2_cf)
             elif arm == "rkdc1hr":
                 loss, extra = compute_rkdc1h_loss(student, cache, images4_in, pmask,
-                                                  rel_weight=rel_weight)
+                                                  rel_weight=rel_weight,
+                                                  v2_couple_fix=v2_cf)
             elif arm == "rkdc1h":
-                loss, extra = compute_rkdc1h_loss(student, cache, images4_in, pmask)
+                if use_v2_gc:
+                    base_loss, extra, rel_branch = compute_rkdc1h_loss(
+                        student, cache, images4_in, pmask,
+                        v2_rel_weight=v2_rel_w, v2_couple_fix=v2_cf, v2_split=True)
+                    loss = base_loss + v2.rel_weight * rel_branch
+                else:
+                    loss, extra = compute_rkdc1h_loss(
+                        student, cache, images4_in, pmask,
+                        v2_rel_weight=v2_rel_w, v2_couple_fix=v2_cf)
             else:
-                loss, extra = compute_c2m_loss(student, cache, images4_in, pmask,
-                                               pose_weight=pose_weight)
+                if use_v2_gc:
+                    base_loss, extra, rel_branch = compute_c2m_loss(
+                        student, cache, images4_in, pmask, pose_weight=pose_weight,
+                        v2_rel_weight=v2_rel_w, v2_split=True)
+                    loss = base_loss + v2.rel_weight * rel_branch
+                else:
+                    loss, extra = compute_c2m_loss(
+                        student, cache, images4_in, pmask, pose_weight=pose_weight,
+                        v2_rel_weight=v2_rel_w)
             if not torch.isfinite(loss):
                 raise FloatingPointError(
                     f"non-finite loss at scene={scene} step={step + 1}: {float(loss)}")
-            loss.backward()
-            if hook is not None:
-                hook.remove()
-            gn = torch.nn.utils.clip_grad_norm_(params, CLIP)
+            g_base_norm = g_R_norm = c_R = None
+            if use_v2_gc:
+                g_base = torch.autograd.grad(base_loss, params, allow_unused=True,
+                                             retain_graph=True)
+                g_rel = torch.autograd.grad(rel_branch, params, allow_unused=True)
+                g_base = [torch.zeros_like(p) if g is None else g
+                          for p, g in zip(params, g_base)]
+                g_rel = [torch.zeros_like(p) if g is None else g
+                         for p, g in zip(params, g_rel)]
+                g_base_norm = float(torch.norm(torch.stack([g.norm() for g in g_base])))
+                g_R_norm = float(torch.norm(torch.stack([g.norm() for g in g_rel])))
+                if len(v2_gR_hist) < 10:
+                    v2_gR_hist.append(g_R_norm)  # record only, no cap yet
+                    scale_R, c_R = 1.0, float("nan")
+                else:
+                    if v2_C_R is None:
+                        v2_C_R = 4.0 * float(np.median(v2_gR_hist))
+                    scale_R = min(1.0, v2_C_R / max(g_R_norm, 1e-12))
+                    c_R = v2_C_R
+                with torch.no_grad():
+                    for p, gb, gr in zip(params, g_base, g_rel):
+                        p.grad = gb + v2.rel_weight * scale_R * gr
+                if hook is not None:
+                    hook.remove()
+                gn = torch.nn.utils.clip_grad_norm_(params, CLIP)
+            else:
+                loss.backward()
+                if hook is not None:
+                    hook.remove()
+                gn = torch.nn.utils.clip_grad_norm_(params, CLIP)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             step += 1
             losses.append(float(loss))
+            if v2 is not None and step % v2.probe_every == 0 and (v2.probe or v2.ckpt):
+                if v2.probe:
+                    _run_probe(step)
+                if v2.ckpt:
+                    _save_v2_ckpt(student, v2.ckpt_dir, scene, step)
             row = {
                 "scene": scene, "step": step, "epoch": epoch, "pair_idx": pi,
                 "loss": float(loss), "lr": scheduler.get_last_lr()[0],
@@ -989,6 +1310,10 @@ def train_scene_c2m(
                 "peak_mem_mib": torch.cuda.max_memory_allocated() / 2**20,
                 **extra,
             }
+            if g_base_norm is not None:
+                row["g_base_norm"] = g_base_norm
+                row["g_R_norm"] = g_R_norm
+                row["v2_C_R"] = c_R
             if trace_rows is not None:
                 trace_rows.append(row)
             if on_step is not None:
@@ -1032,6 +1357,6 @@ def train_scene_c2m(
     log_fn(
         f"[{scene}] done: steps={step} loss {stats['loss_first10']:.4f} -> "
         f"{stats['loss_last10']:.4f} peak_mem={peak_mib:.0f}MiB")
-    del caches, pair_images4, train_images
+    del caches, pair_images4, train_images, probe_caches, probe_images
     torch.cuda.empty_cache()
     return stats
