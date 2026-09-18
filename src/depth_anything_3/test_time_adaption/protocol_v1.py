@@ -29,6 +29,7 @@ DA3-giant-1.1 interface facts this port relies on (audited 2026-09-13):
 """
 
 import hashlib
+import json
 import math
 import os
 import random
@@ -369,15 +370,24 @@ def loss_maskdistill(
     teacher_cache: Dict,
     tap_feats_s: Dict[int, torch.Tensor],
     patch_mask: torch.Tensor,
+    q_feat: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """C2M maskdistill for DA3: post-LN (DualDPT shared norm) Huber+2cos on the
     4 tapped layers, teacher-conf weighted, masked positions only.
 
     teacher_cache["feats"][layer]: [1,4,P,3072] raw concat tokens of the shared
     views (bf16 cache, upcast here); tap_feats_s[layer]: [1,4,P,3072] student.
-    """
-    w = teacher_patch_conf(teacher_cache["conf4"], teacher_cache["patch_hw"]) * patch_mask
-    w = w / w.mean().clamp_min(1e-8)
+
+    q_feat (optional, AB reliability): frozen per-patch weights [4,P] in [0,1].
+    When given, w = conf_mean1 * q_feat * patch_mask with NO renormalization —
+    renormalizing would cancel exactly the downweighting q encodes. The legacy
+    path (q_feat=None) renormalizes after masking, unchanged."""
+    w = teacher_patch_conf(teacher_cache["conf4"], teacher_cache["patch_hw"])
+    if q_feat is not None:
+        w = w * q_feat.to(w.device).float()
+    else:
+        w = w / w.mean().clamp_min(1e-8)
+    w = w * patch_mask
     total = 0.0
     for layer in TAP_LAYERS:
         hs = head_norm(tap_feats_s[layer].float())
@@ -750,6 +760,13 @@ class V2Config:
     couple_fix: bool = False
     run_dir: str = "."
     ckpt_dir: str = ""
+    ab: bool = False  # dual-teacher A/B contexts + frozen reliability weights
+                      # (--v2_ab_manifest; train pairs must carry teacher_frames_B)
+    rel_gate_deg: float = 0.0  # scene-level rel gate: disable the v2 rel branch
+                               # when the B=0 unmasked probe rot median exceeds
+                               # this (0 = gate off; CLI default 30)
+    rot_weight: Optional[float] = None   # R/T split; None -> fall back to rel_weight
+    tdir_weight: Optional[float] = None  # R/T split; None -> fall back to rel_weight
 
 
 def _centers_from_ext(ext: torch.Tensor) -> torch.Tensor:
@@ -760,21 +777,42 @@ def _centers_from_ext(ext: torch.Tensor) -> torch.Tensor:
     return -(R.transpose(-1, -2) @ t.unsqueeze(-1)).squeeze(-1)
 
 
-def _v2_rel_branch(ext_s: torch.Tensor, ext_t: torch.Tensor):
+def _v2_rel_branch(ext_s: torch.Tensor, ext_t: torch.Tensor,
+                   q_rot: Optional[torch.Tensor] = None,
+                   q_tdir: Optional[torch.Tensor] = None):
     """v2 robust relative-pose branch on the shared frames' w2c view-graph
     edges (teacher side detached): rot_edges_huber.loss + tdir_cos_loss.loss.
-    Nothing here detaches the student side. Returns (branch, extra dict)."""
+    Nothing here detaches the student side.
+
+    q_rot / q_tdir: optional frozen AB-reliability edge weights [E] in [0,1]
+    (NaN where the teacher baseline is ~0). NaN tdir edges are DROPPED from the
+    tdir mean (their directions are undefined); rot edges are always defined.
+
+    Returns (rot_loss, tdir_loss, extra) — the two branches SEPARATE, so the
+    caller can weight R and T independently (--v2_rot_weight/--v2_tdir_weight).
+    """
     from free_geometry.tta_v2 import edges_from_w2c, rot_edges_huber, tdir_cos_loss
 
     e_t = edges_from_w2c(ext_t)
     e_s = edges_from_w2c(ext_s)
-    rot = rot_edges_huber(e_s["R_rel"], e_t["R_rel"].detach())
-    tdir = tdir_cos_loss(e_s["t_rel"], e_t["t_rel"].detach(), e_t["baseline"])
-    branch = rot["loss"] + tdir["loss"]
+    dev = e_s["R_rel"].device
+    edge_w_r = None if q_rot is None else q_rot.to(dev).float()
+    rot = rot_edges_huber(e_s["R_rel"], e_t["R_rel"].detach(), edge_w=edge_w_r)
+    if q_tdir is not None:
+        qT = q_tdir.to(dev).float()
+        keep = torch.isfinite(qT)  # near-zero-baseline edges: undefined tdir
+        tdir = tdir_cos_loss(e_s["t_rel"][keep], e_t["t_rel"].detach()[keep],
+                             e_t["baseline"][keep], edge_w=qT[keep])
+        n_nan = int((~keep).sum())
+    else:
+        tdir = tdir_cos_loss(e_s["t_rel"], e_t["t_rel"].detach(), e_t["baseline"])
+        n_nan = 0
     extra = {"v2_rel_rot": float(rot["loss"]), "v2_rel_tdir": float(tdir["loss"]),
              "v2_rel_tdir_n_kept": int(tdir["n_kept"]),
              "v2_rel_tdir_n_skipped": int(tdir["n_skipped"])}
-    return branch, extra
+    if n_nan:
+        extra["v2_rel_tdir_n_nan"] = n_nan
+    return rot["loss"], tdir["loss"], extra
 
 
 def _couple_fixed(ext_s: torch.Tensor, depth_s: torch.Tensor,
@@ -875,28 +913,177 @@ def _probe_forward_factory(student, device: str):
     return forward_fn
 
 
+# ---------------------------------------------------------------------------
+# AB dual-teacher manifests + frozen reliability weights (layer 1+2)
+# ---------------------------------------------------------------------------
+def resolve_ab_manifest(path_tmpl: str, dataset: str, scene: str) -> str:
+    """--v2_ab_manifest accepts a directory (<dir>/<ds>/<scene>.json), a
+    template with {scene}/{ds}/{dataset}, or a plain file path."""
+    if os.path.isdir(path_tmpl):
+        return os.path.join(path_tmpl, dataset, f"{scene}.json")
+    if "{scene}" in path_tmpl or "{ds}" in path_tmpl or "{dataset}" in path_tmpl:
+        return path_tmpl.format(scene=scene, ds=dataset, dataset=dataset)
+    return path_tmpl
+
+
+def load_ab_manifest(path: str, dataset: str, scene: str,
+                     image_files: Sequence[str]) -> Dict:
+    """Load + validate a per-scene AB manifest. Raises with an explicit message
+    on any problem — NEVER silently falls back to on-the-fly sampling.
+
+    Schema: compatible with the protocol JSON (N / teacher_N / n_shared /
+    student_slots / eval_frames / image_files / ...). train_pairs items carry
+    teacher_frames (context A), teacher_frames_B (context B) and student_frames;
+    probe_pairs stay single-context (no B)."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"AB manifest not found: {path} (--v2_ab_manifest given; refusing to "
+            f"fall back to on-the-fly protocol sampling)")
+    with open(path) as f:
+        proto = json.load(f)
+    for key in ("N", "eval_frames", "train_pairs", "probe_pairs"):
+        if key not in proto:
+            raise ValueError(f"AB manifest {path}: missing required key '{key}'")
+    if not isinstance(proto["train_pairs"], list) or not proto["train_pairs"]:
+        raise ValueError(f"AB manifest {path}: train_pairs must be a non-empty list")
+    if not isinstance(proto["probe_pairs"], list):
+        raise ValueError(f"AB manifest {path}: probe_pairs must be a list")
+    files = list(image_files)
+    if "image_files" in proto:
+        # rel-vs-abs path styles differ across invocation contexts; normalize
+        norm = lambda ps: [os.path.abspath(str(p)) for p in ps]
+        if norm(proto["image_files"]) != norm(files):
+            raise ValueError(
+                f"AB manifest {path}: image_files do not match the dataset's scene "
+                f"image list (manifest {len(proto['image_files'])} vs scene {len(files)})")
+    else:
+        proto["image_files"] = files
+    if int(proto["N"]) != len(files):
+        raise ValueError(f"AB manifest {path}: N={proto['N']} != {len(files)} images")
+    n_frames = len(files)
+    for i, p in enumerate(proto["train_pairs"]):
+        for key in ("teacher_frames", "teacher_frames_B", "student_frames"):
+            if key not in p:
+                raise ValueError(
+                    f"AB manifest {path}: train_pairs[{i}] missing '{key}' "
+                    f"(dual-context A/B protocol requires teacher_frames_B)")
+        if len(p["teacher_frames_B"]) != len(p["teacher_frames"]):
+            raise ValueError(
+                f"AB manifest {path}: train_pairs[{i}] teacher_frames_B has "
+                f"{len(p['teacher_frames_B'])} frames != teacher_frames "
+                f"{len(p['teacher_frames'])} (same teacher_N required)")
+        for key in ("teacher_frames", "teacher_frames_B"):
+            bad = [ix for ix in p[key] if not (0 <= int(ix) < n_frames)]
+            if bad:
+                raise ValueError(f"AB manifest {path}: train_pairs[{i}].{key} has "
+                                 f"out-of-range indices {bad[:4]}...")
+    for i, p in enumerate(proto["probe_pairs"]):
+        for key in ("teacher_frames", "student_frames"):
+            if key not in p:
+                raise ValueError(f"AB manifest {path}: probe_pairs[{i}] missing '{key}'")
+    proto.setdefault("dataset", dataset)
+    proto.setdefault("scene", scene)
+    proto.setdefault("strategy", "ab_manifest")
+    proto.setdefault("tau", float("nan"))
+    return proto
+
+
+@torch.no_grad()
+def compute_pair_reliability(cache_a: Dict, cache_b: Dict, head_norm,
+                             device: str) -> Dict:
+    """Frozen per-pair reliability weights from the two teacher contexts
+    (A=teacher_frames, B=teacher_frames_B). Computed ONCE at cache time;
+    student residuals are NEVER used.
+
+    Feature level: uF[i,p] = 1 - cos(zA, zB) on the shared 4 views in the
+    post-head.norm readout space (same taps / same norm as the distill loss),
+    averaged over TAP_LAYERS -> uF [4,P].
+    Edge level (6 shared edges, gauge-free via tta_v2.edges_from_w2c):
+      uR_ij = angle(R_rel_A, R_rel_B) in degrees;
+      uT_ij = 1 - cos(tdir_A, tdir_B), NaN where the teacher baseline is ~0
+      (direction undefined) — dropped from the scene median.
+    Scene medians tau_F/tau_R/tau_T and q = 1/(1+(u/tau)^2) are applied by the
+    caller (they need ALL pairs). Returns u-tensors (CPU fp32) + per-pair
+    geo_w = mean(qR) filled by the caller."""
+    from free_geometry.tta_v2 import edges_from_w2c
+
+    feats_a = {l: cache_a["feats"][l].to(device).float() for l in TAP_LAYERS}
+    feats_b = {l: cache_b["feats"][l].to(device).float() for l in TAP_LAYERS}
+    u_feat = 0.0
+    for l in TAP_LAYERS:
+        zA = head_norm(feats_a[l])
+        zB = head_norm(feats_b[l])
+        u_feat = u_feat + (1.0 - F.cosine_similarity(zA, zB, dim=-1))  # [1,4,P]
+    u_feat = (u_feat / len(TAP_LAYERS))[0].detach().cpu()  # [4,P]
+
+    ext_a = cache_a["ext4"].to(device).float()  # [4,3,4]
+    ext_b = cache_b["ext4"].to(device).float()
+    ea, eb = edges_from_w2c(ext_a), edges_from_w2c(ext_b)
+    z = ((ea["R_rel"] - eb["R_rel"]) ** 2).sum(dim=(-2, -1))
+    d = (z / 8.0).clamp(max=4.0).sqrt()  # |sin(phi/2)|, capped before asin
+    u_rot = torch.rad2deg(2.0 * torch.asin(d.clamp(0.0, 1.0))).detach().cpu()  # [E]
+    tn_a = F.normalize(ea["t_rel"], dim=-1, eps=1e-8)
+    tn_b = F.normalize(eb["t_rel"], dim=-1, eps=1e-8)
+    u_tdir = (1.0 - (tn_a * tn_b).sum(dim=-1)).detach().cpu()  # [E]
+    near0 = ea["baseline"] < 1e-3 * ea["baseline"].mean()  # same convention as
+    u_tdir = torch.where(near0.cpu(), torch.full_like(u_tdir, float("nan")), u_tdir)
+    return {"u_feat": u_feat, "u_rot": u_rot, "u_tdir": u_tdir}
+
+
+def finalize_reliability_(caches: List[Dict]) -> None:
+    """Scene-level reliability: tau = median of u over ALL given pair caches,
+    q = 1/(1+(u/tau)^2); stores q_feat/q_rot/q_tdir (CPU fp32) and geo_w
+    (scalar float = mean(q_rot)) into each cache, in place."""
+    u_feats = torch.cat([c["u_feat"].reshape(-1) for c in caches])
+    u_rots = torch.cat([c["u_rot"].reshape(-1) for c in caches])
+    u_tdirs = torch.cat([c["u_tdir"].reshape(-1) for c in caches])
+    # floors: identical A/B contexts (or a scene where >50% of values are
+    # exactly 0) would otherwise give tau=0 -> q=NaN. Same convention as
+    # train_arms._q_from_u (max(tau, 1e-12)).
+    tau_f = u_feats.median().clamp_min(1e-12)
+    tau_r = u_rots.median().clamp_min(1e-12)
+    finite_t = u_tdirs[torch.isfinite(u_tdirs)]
+    tau_t = (finite_t.median() if finite_t.numel()
+             else torch.tensor(1.0)).clamp_min(1e-12)
+    for c in caches:
+        qf = 1.0 / (1.0 + (c["u_feat"] / tau_f) ** 2)
+        qr = 1.0 / (1.0 + (c["u_rot"] / tau_r) ** 2)
+        qt = 1.0 / (1.0 + (c["u_tdir"] / tau_t) ** 2)  # NaN stays NaN
+        c["q_feat"] = qf.float().cpu()
+        c["q_rot"] = qr.float().cpu()
+        c["q_tdir"] = qt.float().cpu()
+        c["geo_w"] = float(qr.mean())
+
+
 def compute_rkdc1h_loss(student, teacher_cache: Dict, images4_in: torch.Tensor,
                         patch_mask: torch.Tensor, rkd_weight: float = 1.5,
                         couple_weight: float = 1.0, rel_weight: float = 0.0,
-                        v2_rel_weight: float = 0.0, v2_couple_fix: bool = False,
+                        v2_rot_w: Optional[float] = None,
+                        v2_tdir_w: Optional[float] = None,
+                        v2_couple_fix: bool = False,
                         v2_split: bool = False):
     """RKDC1H(+R) for DA3 = maskdistill + rkd_weight*rkd_huber + couple_weight*couple
     + rel_weight*rel_corrected (rel_weight>0 enables the corrected rel term).
 
     v2 (all default-off): v2_couple_fix swaps the couple term for the
-    shared-valid-mask semantics of losses.loss_couple_centers; v2_rel_weight>0
-    appends v2_rel_weight * (rot_edges_huber.loss + tdir_cos_loss.loss) with the
-    teacher side detached; v2_split=True returns (base_total, extra, rel_branch)
-    with the branch NOT added to total, for --v2_grad_cap separate backward."""
+    shared-valid-mask semantics of losses.loss_couple_centers; v2_rot_w /
+    v2_tdir_w (>0) add the robust relative-pose branches rot_edges_huber /
+    tdir_cos_loss with the teacher side detached, weighted independently
+    (the caller applies the scene gate + ramp to these scalars); v2_split=True
+    returns (base_total, extra, {"rot","tdir"}) with the branches UNWEIGHTED
+    and NOT added, for --v2_grad_cap separate backward."""
     tap_feats_s, ext_s, depth_s = student_forward_c2m(student, images4_in, with_depth=True)
     device = images4_in.device
     cache = {
         "feats": {l: t.to(device) for l, t in teacher_cache["feats"].items()},
         "conf4": teacher_cache["conf4"].to(device),
         "patch_hw": teacher_cache["patch_hw"],
+        "q_feat": (None if teacher_cache.get("q_feat") is None
+                   else teacher_cache["q_feat"].to(device)),
     }
     head_norm = student.da3.model.head.norm
-    feat_loss, feat_extra = loss_maskdistill(head_norm, cache, tap_feats_s, patch_mask)
+    feat_loss, feat_extra = loss_maskdistill(head_norm, cache, tap_feats_s, patch_mask,
+                                             q_feat=cache["q_feat"])
     ext_t = teacher_cache["ext4"].to(device)
     rkd_loss, rkd_extra = loss_rkd_shared_pose_huber_w2c(ext_s, ext_t)
     if v2_couple_fix:
@@ -907,27 +1094,41 @@ def compute_rkdc1h_loss(student, teacher_cache: Dict, images4_in: torch.Tensor,
         cp_loss, cp_extra = loss_couple_w2c(ext_s, depth_s, ext_t,
                                             teacher_cache["depth4"].to(device),
                                             teacher_cache["conf4"].to(device))
-    total = feat_loss + rkd_weight * rkd_loss + couple_weight * cp_loss
     extra = {**feat_extra, **rkd_extra, **cp_extra}
-    rel_branch = None
-    if v2_rel_weight > 0:
-        rel_branch, rel_extra = _v2_rel_branch(ext_s, ext_t)
+    # AB reliability (--v2_ab_manifest): frozen per-pair scalar downweights the
+    # geometry terms. q_* live in the teacher cache; None when the flag is off.
+    geo_w = teacher_cache.get("geo_w")
+    if geo_w is not None:
+        rkd_loss = rkd_loss * geo_w
+        cp_loss = cp_loss * geo_w
+        extra["geo_w"] = float(geo_w)
+    total = feat_loss + rkd_weight * rkd_loss + couple_weight * cp_loss
+    w_rot, w_tdir = (v2_rot_w or 0.0), (v2_tdir_w or 0.0)
+    rel = None
+    if w_rot > 0.0 or w_tdir > 0.0 or v2_split:
+        rot_l, tdir_l, rel_extra = _v2_rel_branch(
+            ext_s, ext_t, q_rot=teacher_cache.get("q_rot"),
+            q_tdir=teacher_cache.get("q_tdir"))
         extra.update(rel_extra)
         if not v2_split:
-            total = total + v2_rel_weight * rel_branch
+            total = total + w_rot * rot_l + w_tdir * tdir_l
+        else:
+            rel = {"rot": rot_l, "tdir": tdir_l}
     if rel_weight > 0:
         rel_loss, rel_extra = loss_pose_rel(ext_s, ext_t)
         total = total + rel_weight * rel_loss
         extra.update(rel_extra)
     if v2_split:
-        return total, extra, rel_branch
+        return total, extra, rel
     return total, extra
 
 
 def compute_rkdc1hc_loss(student, teacher_cache: Dict, images4_in: torch.Tensor,
                          patch_mask: torch.Tensor, rkd_weight: float = 1.5,
                          couple_weight: float = 1.0, ctk_weight: float = 1.0,
-                         v2_rel_weight: float = 0.0, v2_couple_fix: bool = False,
+                         v2_rot_w: Optional[float] = None,
+                         v2_tdir_w: Optional[float] = None,
+                         v2_couple_fix: bool = False,
                          v2_split: bool = False):
     """RKDC1HC = RKDC1H + ctk_weight * camera-token KD (direct pose-pathway
     supervision on the shared views' position-0 tokens, all 4 tap layers).
@@ -939,9 +1140,12 @@ def compute_rkdc1hc_loss(student, teacher_cache: Dict, images4_in: torch.Tensor,
         "feats": {l: t.to(device) for l, t in teacher_cache["feats"].items()},
         "conf4": teacher_cache["conf4"].to(device),
         "patch_hw": teacher_cache["patch_hw"],
+        "q_feat": (None if teacher_cache.get("q_feat") is None
+                   else teacher_cache["q_feat"].to(device)),
     }
     head_norm = student.da3.model.head.norm
-    feat_loss, feat_extra = loss_maskdistill(head_norm, cache, tap_feats_s, patch_mask)
+    feat_loss, feat_extra = loss_maskdistill(head_norm, cache, tap_feats_s, patch_mask,
+                                             q_feat=cache["q_feat"])
     ext_t = teacher_cache["ext4"].to(device)
     rkd_loss, rkd_extra = loss_rkd_shared_pose_huber_w2c(ext_s, ext_t)
     if v2_couple_fix:
@@ -954,29 +1158,39 @@ def compute_rkdc1hc_loss(student, teacher_cache: Dict, images4_in: torch.Tensor,
                                             teacher_cache["conf4"].to(device))
     cam_t = {l: t.to(device) for l, t in teacher_cache["cam"].items()}
     ctk_loss, ctk_extra = loss_ctk(tap_cam_s, cam_t)
+    extra = {**feat_extra, **rkd_extra, **cp_extra, **ctk_extra}
+    geo_w = teacher_cache.get("geo_w")  # frozen AB reliability scalar (None = off)
+    if geo_w is not None:
+        rkd_loss = rkd_loss * geo_w
+        cp_loss = cp_loss * geo_w
+        extra["geo_w"] = float(geo_w)
     total = feat_loss + rkd_weight * rkd_loss + couple_weight * cp_loss \
         + ctk_weight * ctk_loss
-    extra = {**feat_extra, **rkd_extra, **cp_extra, **ctk_extra}
-    rel_branch = None
-    if v2_rel_weight > 0:
-        rel_branch, rel_extra = _v2_rel_branch(ext_s, ext_t)
+    w_rot, w_tdir = (v2_rot_w or 0.0), (v2_tdir_w or 0.0)
+    rel = None
+    if w_rot > 0.0 or w_tdir > 0.0 or v2_split:
+        rot_l, tdir_l, rel_extra = _v2_rel_branch(
+            ext_s, ext_t, q_rot=teacher_cache.get("q_rot"),
+            q_tdir=teacher_cache.get("q_tdir"))
         extra.update(rel_extra)
         if not v2_split:
-            total = total + v2_rel_weight * rel_branch
+            total = total + w_rot * rot_l + w_tdir * tdir_l
+        else:
+            rel = {"rot": rot_l, "tdir": tdir_l}
     if v2_split:
-        return total, extra, rel_branch
+        return total, extra, rel
     return total, extra
 
 
 def compute_c2m_loss(student, teacher_cache: Dict, images4_in: torch.Tensor, patch_mask: torch.Tensor,
-                     pose_weight: float = 1.0, v2_rel_weight: float = 0.0,
-                     v2_split: bool = False):
+                     pose_weight: float = 1.0, v2_rot_w: Optional[float] = None,
+                     v2_tdir_w: Optional[float] = None, v2_split: bool = False):
     """C2M = maskdistill + pose_weight * rel-pose, the VGGT C2M_maskrel arm.
     pose_weight=0 recovers the protocol's pure-maskdistill fine variant
     (recommended for tau <= 0.55 datasets). Teacher cache tensors live on CPU
-    and are moved to the GPU here per step. v2_rel_weight>0 appends the robust
-    relative-pose branch (see compute_rkdc1h_loss); v2_split returns
-    (base_total, extra, rel_branch) for --v2_grad_cap."""
+    and are moved to the GPU here per step. v2_rot_w/v2_tdir_w (>0) append the
+    robust relative-pose branches (see compute_rkdc1h_loss); v2_split returns
+    (base_total, extra, {"rot","tdir"}) for --v2_grad_cap."""
     tap_feats_s, ext_s, _ = student_forward_c2m(student, images4_in)
     device = images4_in.device
     cache = {
@@ -990,14 +1204,17 @@ def compute_c2m_loss(student, teacher_cache: Dict, images4_in: torch.Tensor, pat
     rel_loss, rel_extra = loss_pose_rel(ext_s, ext_t)
     total = feat_loss + pose_weight * rel_loss
     extra = {**feat_extra, **rel_extra, "rel": float(rel_loss)}
-    rel_branch = None
-    if v2_rel_weight > 0:
-        rel_branch, v2_extra = _v2_rel_branch(ext_s, ext_t)
+    w_rot, w_tdir = (v2_rot_w or 0.0), (v2_tdir_w or 0.0)
+    rel = None
+    if w_rot > 0.0 or w_tdir > 0.0 or v2_split:
+        rot_l, tdir_l, v2_extra = _v2_rel_branch(ext_s, ext_t)
         extra.update(v2_extra)
         if not v2_split:
-            total = total + v2_rel_weight * rel_branch
+            total = total + w_rot * rot_l + w_tdir * tdir_l
+        else:
+            rel = {"rot": rot_l, "tdir": tdir_l}
     if v2_split:
-        return total, extra, rel_branch
+        return total, extra, rel
     return total, extra
 
 
@@ -1034,6 +1251,31 @@ def install_token_mask(vit, pmask, where: str, mask_layer: int = 12):
 
     target = vit.patch_embed if where == "shallow" else vit.blocks[mask_layer]
     return target.register_forward_hook(_hook)
+
+
+@torch.no_grad()
+def _unmasked_rot_median(student, probe_caches: List[Dict],
+                         probe_images: List[torch.Tensor], device: str) -> float:
+    """Scene-level rel-gate signal: with the student in its B=0 baseline state
+    (right after reset_lora_, before any update), run each probe pair's shared
+    4 frames UNMASKED through the student and measure the per-edge
+    teacher-student relative-rotation angle (gauge-free, edges_from_w2c).
+    Returns the median angle in degrees over all probe pairs' edges.
+    Masked-probe-high + unmasked-low => occlusion-caused (learnable), gate
+    passes; unmasked also high => untrustworthy/unlearnable teacher target,
+    the caller disables the v2 rel branch for this scene."""
+    from free_geometry.tta_v2 import edges_from_w2c
+
+    angs = []
+    for cache, imgs4 in zip(probe_caches, probe_images):
+        images4 = imgs4.unsqueeze(0).to(device)  # clean input, no masking
+        _, ext_s, _ = student_forward_c2m(student, images4)
+        e_s = edges_from_w2c(ext_s)
+        e_t = edges_from_w2c(cache["ext4"].to(device).float())
+        z = ((e_s["R_rel"] - e_t["R_rel"]) ** 2).sum(dim=(-2, -1))
+        d = (z / 8.0).sqrt().clamp(0.0, 1.0)  # |sin(phi/2)|
+        angs.append(2.0 * torch.asin(d) * (180.0 / math.pi))
+    return float(torch.cat(angs).median())
 
 
 def train_scene_c2m(
@@ -1080,23 +1322,37 @@ def train_scene_c2m(
     from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
     all_pairs = protocol["train_pairs"] + protocol["probe_pairs"]
+    n_train = len(protocol["train_pairs"])
+    use_ab = bool(v2 and v2.ab)  # dual-teacher A/B contexts (--v2_ab_manifest)
 
     # ---- teacher caches (once per scene; zero teacher forwards in the loop) ----
     student.to("cpu")  # idle during caching; previous scene's LoRA is already saved
     teacher.to(device)
     caches, pair_images4 = [], []
-    for pair in all_pairs:
+    for pi, pair in enumerate(all_pairs):
         imgs = load_images_da3([image_files[i] for i in pair["teacher_frames"]])
         imgs = imgs.unsqueeze(0).to(device)  # [1,teacher_N,3,H,W] (teacher_N varies per pair in ratio_mix mode)
         ph, pw = imgs.shape[-2] // PATCH_SIZE, imgs.shape[-1] // PATCH_SIZE
         slots = list(range(0, 2 * len(pair["student_frames"]), 2))  # per-pair slots
-        caches.append(cache_teacher_pair(teacher, imgs, slots, (ph, pw)))
+        cache = cache_teacher_pair(teacher, imgs, slots, (ph, pw))
+        if use_ab and pi < n_train:
+            # context B: second frozen teacher forward, same teacher_N, no mask.
+            if "teacher_frames_B" not in pair:
+                raise ValueError(
+                    f"v2.ab ({scene} train pair {pi}): missing 'teacher_frames_B' "
+                    f"— the AB manifest must provide dual contexts for train pairs")
+            imgs_b = load_images_da3([image_files[i] for i in pair["teacher_frames_B"]])
+            imgs_b = imgs_b.unsqueeze(0).to(device)
+            cache["B"] = cache_teacher_pair(
+                teacher, imgs_b, slots,
+                (imgs_b.shape[-2] // PATCH_SIZE, imgs_b.shape[-1] // PATCH_SIZE))
+            del imgs_b
+        caches.append(cache)
         pair_images4.append(imgs[0, slots].cpu().contiguous())  # [n_shared,3,H,W] CPU
         del imgs
     teacher.to("cpu")
     torch.cuda.empty_cache()
     patch_hw = caches[0]["patch_hw"]
-    n_train = len(protocol["train_pairs"])
     train_caches, train_images = caches[:n_train], pair_images4[:n_train]
     # v2: the probe pairs' caches used to be built and dropped; keep them.
     probe_caches, probe_images = caches[n_train:], pair_images4[n_train:]
@@ -1130,16 +1386,43 @@ def train_scene_c2m(
     stop = False
 
     # ---- protocol v2 state (all inert when v2 is None / defaults) ----
-    use_v2_gc = bool(v2 and v2.grad_cap and v2.rel_weight > 0)
-    if v2 is not None and v2.grad_cap and v2.rel_weight <= 0:
-        raise ValueError("v2.grad_cap requires v2.rel_weight > 0")
-    v2_rel_w = v2.rel_weight if v2 is not None else 0.0
     v2_cf = bool(v2 and v2.couple_fix)
     v2_gR_hist: List[float] = []
-    v2_C_R = None  # set after the first 10 updates: 4 * median(||g_R||)
+    v2_C_R = None  # set after the first 10 updates: 4 * median(||g_aux||)
+    # R/T split: per-branch weights fall back to --v2_rel_weight when unset.
+    w_rot_base = w_tdir_base = 0.0
+    if v2 is not None:
+        w_rot_base = v2.rel_weight if v2.rot_weight is None else v2.rot_weight
+        w_tdir_base = v2.rel_weight if v2.tdir_weight is None else v2.tdir_weight
+    rel_requested = (w_rot_base > 0.0) or (w_tdir_base > 0.0)
+    # scene-level rel gate: B=0 student, UNMASKED probe forwards. If even the
+    # clean-input teacher-student rotation disagreement is huge, the rel target
+    # is untrustworthy/unlearnable for this scene -> disable the rel branch.
+    rel_gate = 1
+    rot_deg_unmasked_median = None
+    if rel_requested and v2 is not None and v2.rel_gate_deg > 0:
+        rot_deg_unmasked_median = _unmasked_rot_median(
+            student, probe_caches, probe_images, device)
+        if rot_deg_unmasked_median > v2.rel_gate_deg:
+            rel_gate = 0
+            w_rot_base = 0.0
+            w_tdir_base = 0.0
+            log_fn(f"[{scene}] rel GATE TRIPPED: unmasked probe rot median "
+                   f"{rot_deg_unmasked_median:.1f} deg > {v2.rel_gate_deg:.1f} "
+                   f"-> v2 rel branch disabled for this scene (rel_gate=0)")
+        else:
+            log_fn(f"[{scene}] rel gate passed: unmasked probe rot median "
+                   f"{rot_deg_unmasked_median:.1f} deg <= {v2.rel_gate_deg:.1f}")
+    rel_active = (w_rot_base > 0.0) or (w_tdir_base > 0.0)
+    use_v2_gc = bool(v2 and v2.grad_cap and rel_active)
+    if v2 is not None and v2.grad_cap and not rel_requested:
+        raise ValueError(
+            "v2.grad_cap requires --v2_rel_weight > 0 or --v2_rot_weight / "
+            "--v2_tdir_weight > 0")
     probe_evaluator = None
     probe_forward_fn = None
     probe_overlap = False
+    q_summary = None
     if v2 is not None and v2.probe:
         probe_evaluator = _build_probe_evaluator(
             student, scene, protocol, probe_caches, probe_images, device)
@@ -1155,11 +1438,38 @@ def train_scene_c2m(
             log_fn(f"[{scene}] WARNING: a probe pair is identical to a train pair "
                    f"(probe_train_overlap=true); the probe is not held out here")
 
+    if use_ab:
+        # layer 2: frozen reliability weights, ONCE, from the two teacher
+        # contexts (student residuals never enter). Scene medians need all pairs.
+        head_norm = student.da3.model.head.norm
+        for cache in train_caches:
+            cache.update(compute_pair_reliability(
+                cache, cache["B"], head_norm, device))
+        finalize_reliability_(train_caches)
+        qf = torch.cat([c["q_feat"].reshape(-1) for c in train_caches]).numpy()
+        qr = torch.cat([c["q_rot"].reshape(-1) for c in train_caches]).numpy()
+        qt = torch.cat([c["q_tdir"].reshape(-1) for c in train_caches]).numpy()
+        qt = qt[np.isfinite(qt)]
+        q_summary = {
+            "q_feat_mean": float(qf.mean()), "q_feat_q10": float(np.quantile(qf, 0.1)),
+            "q_feat_q50": float(np.quantile(qf, 0.5)),
+            "q_rot_mean": float(qr.mean()), "q_rot_q10": float(np.quantile(qr, 0.1)),
+            "q_rot_q50": float(np.quantile(qr, 0.5)),
+            "q_tdir_mean": float(qt.mean()) if qt.size else float("nan"),
+            "q_tdir_q50": float(np.quantile(qt, 0.5)) if qt.size else float("nan"),
+            "geo_w_mean": float(np.mean([c["geo_w"] for c in train_caches])),
+        }
+        log_fn(f"[{scene}] AB reliability: q_feat mean={q_summary['q_feat_mean']:.3f} "
+               f"q10={q_summary['q_feat_q10']:.3f} | q_rot mean={q_summary['q_rot_mean']:.3f} "
+               f"q10={q_summary['q_rot_q10']:.3f} | geo_w mean={q_summary['geo_w_mean']:.3f}")
+
     def _run_probe(step_n: int) -> None:
         res = probe_evaluator.evaluate(step_n, probe_forward_fn)
         rec = {"scene": scene, **res}
         if probe_overlap:
             rec["probe_train_overlap"] = True
+        if rel_gate == 0:
+            rec["rel_gate"] = 0  # explicit: rel branch disabled for this scene
         from free_geometry.tta_v2 import append_jsonl
         append_jsonl(os.path.join(v2.run_dir, "probe_trace", f"{scene}.jsonl"), rec)
         if on_probe is not None:
@@ -1225,55 +1535,91 @@ def train_scene_c2m(
                     "shallow" if mask_mode == "token_shallow" else "feat",
                     mask_layer=mask_layer)
             torch.manual_seed(stable_seed("cf_rng", scene, epoch, pi, seed))
-            base_loss, rel_branch = None, None
+            # ramp: lambda(t) = w * min(1, t/20), t = completed updates (0-based)
+            ramp = min(1.0, step / 20.0)
+            w_rot_eff, w_tdir_eff = w_rot_base * ramp, w_tdir_base * ramp
+            base_loss, rel = None, None
             if arm == "rkdc1hc":
                 if use_v2_gc:
-                    base_loss, extra, rel_branch = compute_rkdc1hc_loss(
+                    base_loss, extra, rel = compute_rkdc1hc_loss(
                         student, cache, images4_in, pmask, ctk_weight=ctk_weight,
-                        v2_rel_weight=v2_rel_w, v2_couple_fix=v2_cf, v2_split=True)
-                    loss = base_loss + v2.rel_weight * rel_branch
+                        v2_rot_w=w_rot_eff, v2_tdir_w=w_tdir_eff,
+                        v2_couple_fix=v2_cf, v2_split=True)
+                    loss = (base_loss if rel is None
+                            else base_loss + w_rot_eff * rel["rot"] + w_tdir_eff * rel["tdir"])
                 else:
                     loss, extra = compute_rkdc1hc_loss(
                         student, cache, images4_in, pmask, ctk_weight=ctk_weight,
-                        v2_rel_weight=v2_rel_w, v2_couple_fix=v2_cf)
+                        v2_rot_w=w_rot_eff, v2_tdir_w=w_tdir_eff,
+                        v2_couple_fix=v2_cf)
             elif arm == "rkdc1hr":
                 loss, extra = compute_rkdc1h_loss(student, cache, images4_in, pmask,
                                                   rel_weight=rel_weight,
                                                   v2_couple_fix=v2_cf)
             elif arm == "rkdc1h":
                 if use_v2_gc:
-                    base_loss, extra, rel_branch = compute_rkdc1h_loss(
+                    base_loss, extra, rel = compute_rkdc1h_loss(
                         student, cache, images4_in, pmask,
-                        v2_rel_weight=v2_rel_w, v2_couple_fix=v2_cf, v2_split=True)
-                    loss = base_loss + v2.rel_weight * rel_branch
+                        v2_rot_w=w_rot_eff, v2_tdir_w=w_tdir_eff,
+                        v2_couple_fix=v2_cf, v2_split=True)
+                    loss = (base_loss if rel is None
+                            else base_loss + w_rot_eff * rel["rot"] + w_tdir_eff * rel["tdir"])
                 else:
                     loss, extra = compute_rkdc1h_loss(
                         student, cache, images4_in, pmask,
-                        v2_rel_weight=v2_rel_w, v2_couple_fix=v2_cf)
+                        v2_rot_w=w_rot_eff, v2_tdir_w=w_tdir_eff,
+                        v2_couple_fix=v2_cf)
             else:
                 if use_v2_gc:
-                    base_loss, extra, rel_branch = compute_c2m_loss(
+                    base_loss, extra, rel = compute_c2m_loss(
                         student, cache, images4_in, pmask, pose_weight=pose_weight,
-                        v2_rel_weight=v2_rel_w, v2_split=True)
-                    loss = base_loss + v2.rel_weight * rel_branch
+                        v2_rot_w=w_rot_eff, v2_tdir_w=w_tdir_eff, v2_split=True)
+                    loss = (base_loss if rel is None
+                            else base_loss + w_rot_eff * rel["rot"] + w_tdir_eff * rel["tdir"])
                 else:
                     loss, extra = compute_c2m_loss(
                         student, cache, images4_in, pmask, pose_weight=pose_weight,
-                        v2_rel_weight=v2_rel_w)
+                        v2_rot_w=w_rot_eff, v2_tdir_w=w_tdir_eff)
             if not torch.isfinite(loss):
                 raise FloatingPointError(
                     f"non-finite loss at scene={scene} step={step + 1}: {float(loss)}")
-            g_base_norm = g_R_norm = c_R = None
+            if use_ab:
+                # frozen reliability diagnostics for this pair (constant per pair)
+                extra.setdefault("geo_w", cache["geo_w"])
+                extra["q_feat_mean"] = float(cache["q_feat"].mean())
+                extra["q_rot_mean"] = float(cache["q_rot"].mean())
+            g_base_norm = g_R_norm = g_rot_norm = g_tdir_norm = c_R = None
             if use_v2_gc:
                 g_base = torch.autograd.grad(base_loss, params, allow_unused=True,
                                              retain_graph=True)
-                g_rel = torch.autograd.grad(rel_branch, params, allow_unused=True)
                 g_base = [torch.zeros_like(p) if g is None else g
                           for p, g in zip(params, g_base)]
-                g_rel = [torch.zeros_like(p) if g is None else g
-                         for p, g in zip(params, g_rel)]
                 g_base_norm = float(torch.norm(torch.stack([g.norm() for g in g_base])))
-                g_R_norm = float(torch.norm(torch.stack([g.norm() for g in g_rel])))
+                if rel is not None and step < 10:
+                    # calibration steps: THREE backwards (base/rot/tdir) so the
+                    # per-branch gradient norms are visible in the trace
+                    g_rot = torch.autograd.grad(rel["rot"], params, allow_unused=True,
+                                                retain_graph=True)
+                    g_tdir = torch.autograd.grad(rel["tdir"], params, allow_unused=True)
+                    g_rot = [torch.zeros_like(p) if g is None else g
+                             for p, g in zip(params, g_rot)]
+                    g_tdir = [torch.zeros_like(p) if g is None else g
+                              for p, g in zip(params, g_tdir)]
+                    # merge by linearity: g_aux = w_rot*g_rot + w_tdir*g_tdir
+                    g_aux = [w_rot_eff * a + w_tdir_eff * b
+                             for a, b in zip(g_rot, g_tdir)]
+                    g_rot = [w_rot_eff * g for g in g_rot]
+                    g_tdir = [w_tdir_eff * g for g in g_tdir]
+                    g_rot_norm = float(torch.norm(torch.stack([g.norm() for g in g_rot])))
+                    g_tdir_norm = float(torch.norm(torch.stack([g.norm() for g in g_tdir])))
+                elif rel is not None:
+                    aux = w_rot_eff * rel["rot"] + w_tdir_eff * rel["tdir"]
+                    g_aux = torch.autograd.grad(aux, params, allow_unused=True)
+                    g_aux = [torch.zeros_like(p) if g is None else g
+                             for p, g in zip(params, g_aux)]
+                else:  # gate closed the rel branch: aux is identically zero
+                    g_aux = [torch.zeros_like(p) for p in params]
+                g_R_norm = float(torch.norm(torch.stack([g.norm() for g in g_aux])))
                 if len(v2_gR_hist) < 10:
                     v2_gR_hist.append(g_R_norm)  # record only, no cap yet
                     scale_R, c_R = 1.0, float("nan")
@@ -1283,8 +1629,8 @@ def train_scene_c2m(
                     scale_R = min(1.0, v2_C_R / max(g_R_norm, 1e-12))
                     c_R = v2_C_R
                 with torch.no_grad():
-                    for p, gb, gr in zip(params, g_base, g_rel):
-                        p.grad = gb + v2.rel_weight * scale_R * gr
+                    for p, gb, ga in zip(params, g_base, g_aux):
+                        p.grad = gb + scale_R * ga
                 if hook is not None:
                     hook.remove()
                 gn = torch.nn.utils.clip_grad_norm_(params, CLIP)
@@ -1314,6 +1660,16 @@ def train_scene_c2m(
                 row["g_base_norm"] = g_base_norm
                 row["g_R_norm"] = g_R_norm
                 row["v2_C_R"] = c_R
+                if g_rot_norm is not None:
+                    row["g_rot_norm"] = g_rot_norm
+                    row["g_tdir_norm"] = g_tdir_norm
+            if rel_requested:
+                row["rel_w_eff"] = w_rot_eff + w_tdir_eff
+                row["w_rot_eff"] = w_rot_eff
+                row["w_tdir_eff"] = w_tdir_eff
+            if rot_deg_unmasked_median is not None:
+                row["rel_gate"] = rel_gate
+                row["rot_deg_unmasked_median"] = rot_deg_unmasked_median
             if trace_rows is not None:
                 trace_rows.append(row)
             if on_step is not None:
@@ -1354,6 +1710,8 @@ def train_scene_c2m(
         "loss_max": float(np.max(losses)),
         "peak_mem_mib": peak_mib,
     }
+    if q_summary is not None:
+        stats["q_summary"] = q_summary
     log_fn(
         f"[{scene}] done: steps={step} loss {stats['loss_first10']:.4f} -> "
         f"{stats['loss_last10']:.4f} peak_mem={peak_mib:.0f}MiB")

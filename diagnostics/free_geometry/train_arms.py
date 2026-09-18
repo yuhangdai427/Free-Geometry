@@ -45,8 +45,8 @@ from common import STUDENT_INDICES, TAP_LAYERS, get_scene_data, gt_ixt_raw, load
 import modeling as M
 import abs_pose_loss as _apl
 from abs_pose_loss import (loss_abs_pose_norm, loss_abs_pose_raw, loss_abs_t_fl,
-                           loss_rkd_triplet_pose, loss_rkd_shared_pose,
-                           loss_rkd_shared_pose_huber, loss_rkd_local_huber,
+                           loss_rkd_triplet_pose,
+                           loss_rkd_local_huber,
                            loss_rkd_mix_pose,
                            loss_xac_camtok, loss_xac2_camtok,
                            loss_scale_gauge, loss_couple16,
@@ -86,6 +86,15 @@ _loss_couple_orig = _apl.loss_couple
 # ones in the training loop, so mask_ratio reports 1.0 and every other pmask
 # consumer is affected).
 _V2_ALLPOS = False
+
+# Protocol v2 A/B (--v2_ab): dual teacher context (A/B) with FROZEN reliability
+# weights. _V2_AB gates the w/edge_w application in loss_b5_maskdistill and
+# v2_rel_pose_loss; _V2_GEO_W is set per optimizer step by the training loop
+# from cache["geo_w"] and scales the rkd/couple terms (they don't receive the
+# cache, so the module global is the dispatch channel — same pattern as
+# _V2_COUPLE_FIX).
+_V2_AB = False
+_V2_GEO_W = None
 
 
 def loss_couple_sharedmask(pose_enc_s, depth_s, pose_enc_t_shared, depth4_t,
@@ -133,20 +142,113 @@ def loss_couple_sharedmask(pose_enc_s, depth_s, pose_enc_t_shared, depth4_t,
 
 def loss_couple(*args, **kwargs):
     if _V2_COUPLE_FIX:
-        return loss_couple_sharedmask(*args, **kwargs)
-    return _loss_couple_orig(*args, **kwargs)
+        loss, extra = loss_couple_sharedmask(*args, **kwargs)
+    else:
+        loss, extra = _loss_couple_orig(*args, **kwargs)
+    if _V2_GEO_W is not None:
+        loss = loss * _V2_GEO_W
+        extra = {**extra, "geo_w": _V2_GEO_W}
+    return loss, extra
+
+
+# --v2_ab geo_w wrappers for the rkd terms (RKDC1H uses the huber variant; the
+# plain variant covers the RKDC/XSH sibling arms). Same dispatch rationale as
+# loss_couple: the call sites keep passing (pose_s, pt) only.
+_loss_rkd_orig = _apl.loss_rkd_shared_pose
+_loss_rkd_huber_orig = _apl.loss_rkd_shared_pose_huber
+
+
+def loss_rkd_shared_pose(*args, **kwargs):
+    loss, extra = _loss_rkd_orig(*args, **kwargs)
+    if _V2_GEO_W is not None:
+        loss = loss * _V2_GEO_W
+        extra = {**extra, "geo_w": _V2_GEO_W}
+    return loss, extra
+
+
+def loss_rkd_shared_pose_huber(*args, **kwargs):
+    loss, extra = _loss_rkd_huber_orig(*args, **kwargs)
+    if _V2_GEO_W is not None:
+        loss = loss * _V2_GEO_W
+        extra = {**extra, "geo_w": _V2_GEO_W}
+    return loss, extra
+
+
+# --------------------------------------------------------------------------
+# protocol v2 A/B reliability weights (frozen at cache time, no student
+# residual). Local helpers equivalent to tta_v2.reliability (agent-10) — that
+# module did not exist at implementation time, so the formulas live here:
+#   per-patch  uF = 1 - cos(zA, zB)   (post-norm readout, mean over TAP layers)
+#   per-edge   uR = Angle(R_rel_A, R_rel_B) in degrees (edges_from_w2c)
+#              uT = 1 - cos(t_rel_A, t_rel_B)   (near-zero baselines dropped)
+#   scene tau_* = median of the pooled u_* over ALL train pairs; q = 1/(1+(u/tau)^2)
+# --------------------------------------------------------------------------
+
+def _ab_u_features(cacheA, cacheB, depth_head) -> torch.Tensor:
+    """Per-patch feature disagreement uF [1,S,P]: 1 - cosine similarity of the
+    A/B teacher readouts on the shared frames, post depth_head.norm (the same
+    readout space as the feature loss), averaged over TAP_LAYERS. Frozen
+    (no_grad caller-side)."""
+    u = None
+    for l in TAP_LAYERS:
+        zA = M.to_norm(depth_head, M.to_patch(
+            cacheA["feats"][l][:, STUDENT_INDICES].float()))
+        zB = M.to_norm(depth_head, M.to_patch(
+            cacheB["feats"][l][:, STUDENT_INDICES].float()))
+        u_l = 1.0 - torch.nn.functional.cosine_similarity(zA, zB, dim=-1)
+        u = u_l if u is None else u + u_l
+    return (u / len(TAP_LAYERS)).detach()
+
+
+def _ab_u_edges(cacheA, cacheB, image_hw):
+    """Per-edge pose disagreement between the A/B teacher contexts:
+    uR = relative-rotation angle in degrees [E]; uT = translation-direction
+    1-cos [E]; keep = baseline >= 1e-3 * mean(baseline) (near-zero-baseline
+    edges are numerically garbage and get a neutral q=1 later)."""
+    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+    with torch.autocast(device_type="cuda", enabled=False):
+        extA, _ = pose_encoding_to_extri_intri(
+            cacheA["pose_enc8"][:, STUDENT_INDICES].float(), image_hw,
+            pose_encoding_type="absT_quaR_FoV")
+        extB, _ = pose_encoding_to_extri_intri(
+            cacheB["pose_enc8"][:, STUDENT_INDICES].float(), image_hw,
+            pose_encoding_type="absT_quaR_FoV")
+        eA = edges_from_w2c(extA[0])
+        eB = edges_from_w2c(extB[0])
+        uR = rot_edges_huber(eA["R_rel"], eB["R_rel"])["angle_deg"]   # [E]
+        base = eA["baseline"]
+        keep = base >= 1e-3 * base.mean()
+        tnA = torch.nn.functional.normalize(eA["t_rel"], dim=-1, eps=1e-8)
+        tnB = torch.nn.functional.normalize(eB["t_rel"], dim=-1, eps=1e-8)
+        uT = 1.0 - (tnA * tnB).sum(dim=-1)                            # [E]
+    return uR.detach(), uT.detach(), keep.detach()
+
+
+def _q_from_u(u: torch.Tensor, tau: float) -> torch.Tensor:
+    tau = max(float(tau), 1e-12)
+    return 1.0 / (1.0 + (u / tau) ** 2)
 
 
 # --------------------------------------------------------------------------
 # protocol v2 wiring (GT-free rel branch, grad cap, probe, ckpt)
 # --------------------------------------------------------------------------
 
-def v2_rel_pose_loss(pose_enc_s, teacher_cache, image_hw, weight):
-    """v2 robust relative-pose branch: rot_edges_huber + tdir_cos_loss on the
-    student shared views vs the DETACHED cached teacher shared views, both in
-    the corrected w2c convention (T_{i<-j} = E_i @ inv(E_j), same as
-    losses.loss_rel_pose). weight multiplies (rot + tdir). Student pose_enc may
-    carry extra views (SS8M: 8 at STUDENT_INDICES; XRKD: shared first 4)."""
+def v2_rel_pose_loss(pose_enc_s, teacher_cache, image_hw, weight, weight_tdir=None):
+    """v2 robust relative-pose branches, ROTATION and TRANSLATION-DIRECTION
+    SPLIT: rot_edges_huber / tdir_cos_loss on the student shared views vs the
+    DETACHED cached teacher shared views, both in the corrected w2c convention
+    (T_{i<-j} = E_i @ inv(E_j), same as losses.loss_rel_pose).
+
+    weight scales the rotation branch; weight_tdir (None -> weight) scales the
+    translation-direction branch. Returns (loss_rot, loss_tdir, extra) with
+    UNWEIGHTED branch values in extra (v2_rel_rot/v2_rel_tdir) and the weighted
+    sum as extra["v2_rel"] — the caller combines them (ramp / grad cap).
+
+    --v2_ab: frozen reliability edge weights q_rot/q_tdir are passed through
+    (plain weighted mean inside the terms — the scale-down is intentional).
+    Student pose_enc may carry extra views (SS8M: 8 at STUDENT_INDICES; XRKD:
+    shared first 4)."""
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
     pe = pose_enc_s
@@ -161,64 +263,96 @@ def v2_rel_pose_loss(pose_enc_s, teacher_cache, image_hw, weight):
                                                 pose_encoding_type="absT_quaR_FoV")
         e_s = edges_from_w2c(ext_s[0])
         e_t = edges_from_w2c(ext_t[0])
-        rot = rot_edges_huber(e_s["R_rel"], e_t["R_rel"].detach())
-        tdir = tdir_cos_loss(e_s["t_rel"], e_t["t_rel"].detach(), e_t["baseline"])
-        loss = weight * (rot["loss"] + tdir["loss"])
-    return loss, {"v2_rel": float(loss), "v2_rel_rot": float(rot["loss"]),
-                  "v2_rel_tdir": float(tdir["loss"])}
+        # --v2_ab: frozen reliability edge weights (q in (0,1], plain weighted
+        # mean inside the loss terms — the scale-down is intentional)
+        qR = teacher_cache.get("q_rot") if _V2_AB else None
+        qT = teacher_cache.get("q_tdir") if _V2_AB else None
+        rot = rot_edges_huber(e_s["R_rel"], e_t["R_rel"].detach(), edge_w=qR)
+        tdir = tdir_cos_loss(e_s["t_rel"], e_t["t_rel"].detach(), e_t["baseline"],
+                             edge_w=qT)
+        loss_rot = weight * rot["loss"]
+        loss_tdir = (weight if weight_tdir is None else weight_tdir) * tdir["loss"]
+    extra = {"v2_rel": float(loss_rot + loss_tdir),
+             "v2_rel_rot": float(rot["loss"]),
+             "v2_rel_tdir": float(tdir["loss"]),
+             "v2_rel_n_kept": float(tdir["n_kept"])}
+    if qR is not None:
+        extra["v2ab"] = 1.0
+        extra["q_rot"] = float(qR.mean())
+    return loss_rot, loss_tdir, extra
 
 
-def v2_grad_cap_backward(loss_base, loss_rel, params, scaler, state):
-    """GradScaler-exact split backward with a per-param cap on the rel branch.
+def v2_grad_cap_backward(loss_base, loss_rel, params, scaler, state,
+                         loss_rel_b=None):
+    """GradScaler-exact split backward with a GLOBAL-norm cap on the combined
+    aux (rel) gradient — direction-preserving, aligned with the DA3 semantics:
+    g_R_global = sqrt(sum_p ||g_R,p||^2) in unscaled space, one scalar
+    scale = min(1, C_R / g_R_global) applied to the WHOLE aux gradient.
 
-    Implementation: TWO ordinary fused backwards instead of autograd.grad —
-    bit-exactness matters: autograd.grad on an autocast-built graph computes
-    weight grads behind the autocast boundary with different precision rules
-    (measured: conv-weight grad off by >30% on a toy autocast model), while
-    backward(retain_graph=True) + backward() is bitwise identical to a single
-    fused backward. Each branch is scaled by scaler.scale() exactly like the
-    normal path; g_base is snapshotted between the two backwards, g_R is
-    per-param-norm-capped (the cap factor is scale-invariant, applied in
-    scaled space), then merged back into p.grad so the existing
-    scaler.unscale_ -> clip_grad_norm_ -> scaler.step -> scaler.update chain
-    runs UNCHANGED (inf detection / step skipping behave as usual).
+    GradScaler interaction: plain fused backwards (autograd.grad computes
+    weight grads behind the autocast boundary DIFFERENTLY — measured >30%
+    off), each branch scaled by scaler.scale() like the normal path; the cap
+    factor is scale-invariant so it is applied in scaled space; the merged
+    gradient stays in scaled space and the existing scaler.unscale_ ->
+    clip_grad_norm_ -> scaler.step -> scaler.update chain runs unchanged.
 
-    state: dict, mutated in place; keys "medians" (per-update median of
-    per-param unscaled ||g_R|| over the first 10 updates), "C_R" (float or
-    None until calibrated: C_R = 4 * median(medians), then constant).
-    Returns trace extras."""
+    R/T split: loss_rel and loss_rel_b are the two aux branches (rot / tdir).
+    During the 10-step calibration BOTH branches are backwarded separately
+    (three backwards total) and ||g_rot||/||g_tdir|| are recorded; afterwards
+    the branches are MERGED into one aux backward (two backwards total) and
+    only the combined g_R enters the cap. C_R = 4 * median(g_R_global over the
+    first 10 updates), then constant.
+
+    state: dict, mutated; keys "medians" (global g_R norms), "C_R".
+    Returns trace extras (g_base_norm / g_R_norm / g_rot_norm / g_tdir_norm /
+    C_R; -1 while uncalibrated)."""
+    calibrating = len(state["medians"]) < 10
+    g_base = None
+    g_rot = None
     for p in params:
         p.grad = None
     scaler.scale(loss_base).backward(retain_graph=True)
     g_base = [p.grad.clone() if p.grad is not None else None for p in params]
     for p in params:
         p.grad = None
-    scaler.scale(loss_rel).backward()
+    if calibrating and loss_rel_b is not None:
+        scaler.scale(loss_rel).backward(retain_graph=True)
+        g_rot = [p.grad.clone() if p.grad is not None else None for p in params]
+        for p in params:
+            p.grad = None
+        scaler.scale(loss_rel_b).backward()
+    else:
+        scaler.scale(loss_rel if loss_rel_b is None
+                     else loss_rel + loss_rel_b).backward()
     with torch.no_grad():
         s = scaler.get_scale()
-        g_base_norm = 0.0
-        for g in g_base:
-            if g is not None:
-                g_base_norm += float((g * g).sum()) / (s * s)
-        g_base_norm = g_base_norm ** 0.5
-        per = [float((p.grad * p.grad).sum()) ** 0.5 / s
-               for p in params if p.grad is not None]
-        g_R_norm = float(sum(v * v for v in per) ** 0.5) if per else 0.0
+
+        def _norm(tpls):
+            tot = 0.0
+            for g in tpls:
+                if g is not None:
+                    tot += float((g * g).sum()) / (s * s)
+            return tot ** 0.5
+
+        g_base_norm = _norm(g_base)
+        g_rot_norm = _norm(g_rot) if g_rot is not None else -1.0
+        g_R_norm = _norm([p.grad for p in params])
+        if calibrating and loss_rel_b is not None:
+            g_tdir_norm = g_R_norm
+            g_R_norm = (g_rot_norm ** 2 + g_tdir_norm ** 2) ** 0.5
+        else:
+            g_tdir_norm = -1.0
         if len(state["medians"]) < 10:
-            if per:
-                state["medians"].append(float(np.median(per)))
+            state["medians"].append(g_R_norm)
             if len(state["medians"]) == 10:
                 state["C_R"] = 4.0 * float(np.median(state["medians"]))
         C_R = state["C_R"]
         if C_R is not None:
-            for p in params:
-                if p.grad is None:
-                    continue
-                # per-param norm cap in unscaled space, applied to the scaled
-                # grad (factor is scale-invariant; no host sync per param)
-                f = torch.clamp(C_R * s / ((p.grad * p.grad).sum().sqrt() + 1e-12),
-                                max=1.0)
-                p.grad.mul_(f)
+            f = min(1.0, C_R / (g_R_norm + 1e-12))
+            if f < 1.0:
+                for p in params:
+                    if p.grad is not None:
+                        p.grad.mul_(f)
         for p, gb in zip(params, g_base):
             if gb is None and p.grad is None:
                 continue
@@ -227,6 +361,7 @@ def v2_grad_cap_backward(loss_base, loss_rel, params, scaler, state):
                 total = total + gb
             p.grad = total
     return {"g_base_norm": g_base_norm, "g_R_norm": g_R_norm,
+            "g_rot_norm": g_rot_norm, "g_tdir_norm": g_tdir_norm,
             "C_R": float(C_R) if C_R is not None else -1.0}
 
 
@@ -310,6 +445,35 @@ def make_v2_probe_forward(student, base):
                 "depth": depth}
 
     return fwd
+
+
+@torch.no_grad()
+def v2_rel_gate_check(student, base, probe_caches, probe_images4,
+                      gate_deg: float):
+    """Scene-level rel gate (PROTOCOL_V2_ROTATION_DESIGN.md §1d): ONE unmasked
+    (all-False mask) baseline-student forward per probe pair, per-edge teacher
+    relative-rotation angle, scene median across pairs/edges. Median >
+    gate_deg -> the teacher's rel-pose target is unlearnable for this scene
+    and the v2 rel branch is switched OFF (weights forced to 0 for the whole
+    scene). Returns (gate_off, median_deg)."""
+    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+    fwd = make_v2_probe_forward(student, base)
+    vals = []
+    for cache, im4 in zip(probe_caches, probe_images4):
+        ph, pw = cache["patch_hw"]
+        S = len(STUDENT_INDICES)
+        out = fwd(im4, torch.zeros(S, ph, pw, dtype=torch.bool))
+        with torch.autocast(device_type="cuda", enabled=False):
+            ext_t, _ = pose_encoding_to_extri_intri(
+                cache["pose_enc8"][:, STUDENT_INDICES].float(),
+                (im4.shape[-2], im4.shape[-1]),
+                pose_encoding_type="absT_quaR_FoV")
+        Rr_s = edges_from_w2c(out["ext_w2c"])["R_rel"]
+        Rr_t = edges_from_w2c(ext_t[0])["R_rel"]
+        vals.append(rot_edges_huber(Rr_s, Rr_t)["angle_deg"])
+    med = float(torch.cat(vals).median())
+    return med > gate_deg, med
 
 
 def run_v2_probe(evaluator, fwd, scene, arm, step, run_root, overlaps,
@@ -425,6 +589,15 @@ def _pair_metrics(pi, loss, extra) -> Dict[str, float]:
         m[f"pair/p{pi}/rel"] = float(e["rel_rot"]) + float(e["rel_tdir"])
     if _finite(e.get("v2_rel")):
         m[f"pair/p{pi}/v2_rel"] = float(e["v2_rel"])
+    # v2 rel gate / ramp / grad-cap scalars (trace extras surfaced to swanlab)
+    for sk in ("rel_w_eff", "rot_w", "tdir_w", "g_rot_norm", "g_tdir_norm",
+               "g_R_norm", "g_base_norm", "C_R"):
+        if _finite(e.get(sk)):
+            m[f"pair/p{pi}/{sk}"] = float(e[sk])
+    # --v2_ab frozen reliability stats (constant per pair; logged per visit)
+    for qk in ("q_feat", "q_rot", "q_tdir", "geo_w"):
+        if _finite(e.get(qk)):
+            m[f"pair/p{pi}/{qk}"] = float(e[qk])
     return m
 
 
@@ -1172,11 +1345,21 @@ def loss_b5_maskdistill(depth_head, teacher_cache, feats24_s, patch_hw, patch_ma
     --v2_allpos: masked input unchanged, but the loss runs on ALL patch
     positions (w = teacher_patch_conf, no *patch_mask) and extra carries
     "allpos": 1.0. A None patch_mask already means all positions and is
-    unaffected by the switch."""
+    unaffected by the switch.
+
+    --v2_ab: the conf weight is additionally multiplied by the FROZEN per-patch
+    reliability q_feat [1,S,P] (1 = A/B teachers agree) and the mean-1
+    renormalization is SKIPPED (per protocol spec) — q_feat itself carries the
+    scale. Independent from --v2_allpos: allpos picks WHICH positions are
+    supervised, q_feat scales HOW MUCH each supervised position weighs."""
     w_all = teacher_patch_conf(teacher_cache, patch_hw)
     mask_ratio = float(patch_mask.mean()) if patch_mask is not None else -1.0
     w = w_all if (_V2_ALLPOS or patch_mask is None) else w_all * patch_mask
-    w = w / w.mean().clamp_min(1e-8)
+    qf = teacher_cache.get("q_feat") if _V2_AB else None
+    if qf is not None:
+        w = w * qf
+    else:
+        w = w / w.mean().clamp_min(1e-8)
     total = 0.0
     for layer in TAP_LAYERS:
         hs = M.to_norm(depth_head, M.to_patch(feats24_s[layer].float()))
@@ -1188,6 +1371,9 @@ def loss_b5_maskdistill(depth_head, teacher_cache, feats24_s, patch_hw, patch_ma
              "feat": float(total / len(TAP_LAYERS))}
     if _V2_ALLPOS:
         extra["allpos"] = 1.0
+    if qf is not None:
+        extra["v2ab"] = 1.0
+        extra["q_feat"] = float(qf.mean())
     return total / len(TAP_LAYERS), extra
 
 
@@ -2654,6 +2840,27 @@ def main():
                          "allpos=1.0 while mask_ratio still reports the input "
                          "mask. Distinct from --loss_all_pos (loop-level pmask "
                          "replacement, mask_ratio becomes 1.0)")
+    ap.add_argument("--v2_ab", action="store_true",
+                    help="protocol v2 A/B: dual teacher context per train pair "
+                         "(manifest train_pairs must carry teacher_frames_B, "
+                         "same length, student frames at even slots — hard "
+                         "error otherwise). Frozen reliability weights from A/B "
+                         "disagreement at cache time: feature w *= q_feat (no "
+                         "renormalization), v2-rel edge_w = q_rot/q_tdir, "
+                         "rkd & couple *= geo_w=mean(q_rot). Target stays A; B "
+                         "only makes weights.")
+    ap.add_argument("--v2_rel_gate_deg", type=float, default=30.0,
+                    help="scene-level rel gate (0 = off): one UNMASKED baseline "
+                         "forward per probe pair; if the scene-median teacher "
+                         "relative-rotation angle exceeds this, the v2 rel "
+                         "branch is switched off for the scene (weights forced "
+                         "to 0). Active only when --v2_rel_weight > 0.")
+    ap.add_argument("--v2_rot_weight", type=float, default=None,
+                    help="rotation-branch weight (None -> fall back to "
+                         "--v2_rel_weight); ramped by min(1, step/20)")
+    ap.add_argument("--v2_tdir_weight", type=float, default=None,
+                    help="translation-direction-branch weight (None -> fall "
+                         "back to --v2_rel_weight); ramped by min(1, step/20)")
     ap.add_argument("--swanlab", action="store_true",
                     help="log to swanlab (project free-geometry-tta), one "
                          "experiment per (scene, arm) named {scene}_{arm}{suffix}. "
@@ -2684,9 +2891,11 @@ def main():
     if args.ema_teacher and args.teacher_consensus:
         raise ValueError("--ema_teacher and --teacher_consensus are mutually exclusive "
                          "(EMA refresh rebuilds single-context caches)")
-    global _V2_COUPLE_FIX, _V2_ALLPOS
+    global _V2_COUPLE_FIX, _V2_ALLPOS, _V2_AB, _V2_GEO_W
     _V2_COUPLE_FIX = bool(args.v2_couple_fix)
     _V2_ALLPOS = bool(args.v2_allpos)
+    _V2_AB = bool(args.v2_ab)
+    _V2_GEO_W = None
     if args.v2_grad_cap and args.v2_rel_weight <= 0:
         raise ValueError("--v2_grad_cap requires --v2_rel_weight > 0")
     if args.v2_grad_cap and args.sam_rho > 0:
@@ -2710,6 +2919,26 @@ def main():
                for sc_ in manifest["scenes"].values()
                for p in sc_["train_pairs"] + sc_["probe_pairs"]), \
         "manifest violates dynamic STUDENT_INDICES layout"
+    # --v2_ab: every TRAIN pair must carry teacher_frames_B (dual teacher
+    # context; probe pairs stay single-context A). Hard error, never silent.
+    if args.v2_ab:
+        for sc_name, sc_ in manifest["scenes"].items():
+            for pi_, p in enumerate(sc_["train_pairs"]):
+                if "teacher_frames_B" not in p:
+                    raise ValueError(
+                        f"--v2_ab: scene={sc_name} train pair {pi_} has no "
+                        f"teacher_frames_B — build an A/B manifest first")
+                if len(p["teacher_frames_B"]) != len(p["teacher_frames"]):
+                    raise ValueError(
+                        f"--v2_ab: scene={sc_name} train pair {pi_}: "
+                        f"teacher_frames_B length {len(p['teacher_frames_B'])} != "
+                        f"teacher_frames length {len(p['teacher_frames'])}")
+                if any(p["teacher_frames_B"][i] != p["teacher_frames"][i]
+                       for i in STUDENT_INDICES):
+                    raise ValueError(
+                        f"--v2_ab: scene={sc_name} train pair {pi_}: student "
+                        f"frames must sit at the same even slots of "
+                        f"teacher_frames_B")
     scenes = args.scenes or sorted(manifest["scenes"])
     device = "cuda"
 
@@ -2778,6 +3007,19 @@ def main():
                     seed_tag=(scene, pi_all), device=device)
             else:
                 cache = M.cache_teacher_pair(teacher, images8, (ph, pw))
+            # ---- protocol v2 A/B: second frozen teacher context (B) for train
+            #      pairs only; probe pairs stay single-context A. u_* raw
+            #      disagreements are pooled for the SCENE-level tau and turned
+            #      into frozen q_* weights after the loop.
+            if args.v2_ab and pi_all < n_train:
+                images8B, _ = M.load_pair_images(
+                    scene_data, pair["teacher_frames_B"], device)
+                cacheB = M.cache_teacher_pair(teacher, images8B, (ph, pw))
+                cache["_u_feat"] = _ab_u_features(cache, cacheB, base.depth_head)
+                uR, uT, keep = _ab_u_edges(
+                    cache, cacheB, (images8.shape[-2], images8.shape[-1]))
+                cache["_u_rot"], cache["_u_tdir"], cache["_u_keep"] = uR, uT, keep
+                del images8B, cacheB
             with torch.no_grad():
                 f24, psi, preds = M.student_preds(student, images4)
             sdepth = preds["depth"].squeeze(0)
@@ -2805,6 +3047,36 @@ def main():
         train_caches, probe_caches = caches[:n_train], caches[n_train:]
         train_images = pair_images[:n_train]
         train_images8 = pair_images8[:n_train]
+        # ---- protocol v2 A/B: scene-level tau -> frozen per-pair q_* weights
+        if args.v2_ab:
+            tau_F = float(np.median(torch.cat(
+                [c["_u_feat"].flatten() for c in train_caches]).cpu().numpy()))
+            tau_R = float(np.median(torch.cat(
+                [c["_u_rot"].flatten() for c in train_caches]).cpu().numpy()))
+            uT_pool = torch.cat([c["_u_tdir"][c["_u_keep"]] for c in train_caches])
+            tau_T = float(np.median(uT_pool.cpu().numpy())) if uT_pool.numel() \
+                else 1.0
+            qF_all, qR_all, qT_all, gw_all = [], [], [], []
+            for c in train_caches:
+                c["q_feat"] = _q_from_u(c.pop("_u_feat"), tau_F)
+                c["q_rot"] = _q_from_u(c.pop("_u_rot"), tau_R)
+                uT, keep = c.pop("_u_tdir"), c.pop("_u_keep")
+                qT = _q_from_u(uT, tau_T)
+                c["q_tdir"] = torch.where(keep, qT, torch.ones_like(qT))
+                c["geo_w"] = float(c["q_rot"].mean())
+                qF_all.append(c["q_feat"].flatten())
+                qR_all.append(c["q_rot"].flatten())
+                qT_all.append(c["q_tdir"].flatten())
+                gw_all.append(c["geo_w"])
+            qF_cat = torch.cat(qF_all)
+            print(f"[{scene}] v2_ab reliability (frozen): tau_F={tau_F:.4f} "
+                  f"tau_R={tau_R:.3f} deg tau_T={tau_T:.4f} | "
+                  f"qF[{float(qF_cat.min()):.3f},{float(qF_cat.max()):.3f}] "
+                  f"qR[{float(torch.cat(qR_all).min()):.3f},"
+                  f"{float(torch.cat(qR_all).max()):.3f}] "
+                  f"qT[{float(torch.cat(qT_all).min()):.3f},"
+                  f"{float(torch.cat(qT_all).max()):.3f}] "
+                  f"geo_w={min(gw_all):.3f}..{max(gw_all):.3f}", flush=True)
         # ---- protocol v2: GT-free probe contexts from the SAME caches ----
         v2_contexts, v2_overlaps = [], []
         if args.v2_probe or args.v2_ckpt:
@@ -2813,6 +3085,26 @@ def main():
             if any(v2_overlaps):
                 print(f"[{scene}] WARNING: probe/train pair key overlap "
                       f"(probe_train_overlap={v2_overlaps})", flush=True)
+        # ---- protocol v2 rel gate: unmasked baseline forward on the probe
+        #      pairs BEFORE any training; median teacher rel-rot angle >
+        #      threshold -> v2 rel switched off for this whole scene.
+        base_rot_w = args.v2_rot_weight if args.v2_rot_weight is not None \
+            else args.v2_rel_weight
+        base_tdir_w = args.v2_tdir_weight if args.v2_tdir_weight is not None \
+            else args.v2_rel_weight
+        rel_gate_off = False
+        rot_deg_unmasked_median = float("nan")
+        if args.v2_rel_weight > 0 and args.v2_rel_gate_deg > 0:
+            rel_gate_off, rot_deg_unmasked_median = v2_rel_gate_check(
+                student, base, probe_caches, pair_images[n_train:],
+                args.v2_rel_gate_deg)
+            print(f"[{scene}] rel gate: unmasked median rot_deg="
+                  f"{rot_deg_unmasked_median:.2f} (threshold "
+                  f"{args.v2_rel_gate_deg}) -> rel branch "
+                  f"{'OFF for this scene' if rel_gate_off else 'active'}",
+                  flush=True)
+        scene_rot_w = 0.0 if rel_gate_off else base_rot_w
+        scene_tdir_w = 0.0 if rel_gate_off else base_tdir_w
         if any("pose_disagree_deg" in c for c in probe_caches):
             dg = float(np.median([c["pose_disagree_deg"] for c in probe_caches
                                   if "pose_disagree_deg" in c]))
@@ -2880,6 +3172,10 @@ def main():
             # ---- swanlab experiment for this (scene, arm); None when disabled
             #      or init failed — every use below is exception-guarded.
             swan_run = _swan_safe_init(args, scene, arm)
+            if args.v2_rel_weight > 0 and args.v2_rel_gate_deg > 0:
+                _swan_log(swan_run, {
+                    "gate/rot_deg_unmasked_median": rot_deg_unmasked_median,
+                    "gate/rel_gate": 0.0 if rel_gate_off else 1.0})
 
             def _v2_probe_log(out, _run=swan_run):
                 _swan_log(_run, _probe_metrics(out), step=int(out["step"]))
@@ -2936,6 +3232,10 @@ def main():
                     cache = train_caches[pi]
                     images4 = train_images[pi]
                     preds = None  # set by every arm branch below (v2 rel consumes it)
+                    # ---- v2_ab: rkd/couple geo weight for THIS pair (frozen at
+                    #      cache time); consumed by the module-level wrappers.
+                    _V2_GEO_W = float(cache["geo_w"]) if (args.v2_ab and
+                                                          cache.get("geo_w") is not None) else None
                     if ema_params is not None and step % args.ema_teacher == 0:
                         t_ref = time.perf_counter()
                         images8_r, _ = M.load_pair_images(
@@ -3192,30 +3492,48 @@ def main():
                     if _feat_hook is not None:
                         _feat_hook.remove()
                         _feat_hook = None
-                    # ---- protocol v2 (flag-gated): robust rel branch + grad cap.
-                    #      With both flags off this block reduces to the original
-                    #      single scaler.scale(loss).backward() (regression-locked).
+                    # ---- protocol v2 (flag-gated): robust rel branch (R/T
+                    #      split, scene gate, ramp) + global-norm grad cap.
+                    #      With all v2 flags off this block reduces to the
+                    #      original single scaler.scale(loss).backward()
+                    #      (regression-locked).
                     loss_base = loss
                     loss_rel = None
-                    if args.v2_rel_weight > 0:
+                    loss_rel_b = None
+                    if scene_rot_w > 0 or scene_tdir_w > 0:
                         assert preds is not None and "pose_enc" in preds, \
                             f"--v2_rel_weight requires an arm branch that produces preds (arm={arm})"
-                        loss_rel, rel_extra = v2_rel_pose_loss(
+                        lam = min(1.0, (step + 1) / 20.0)  # ramp over first 20 updates
+                        w_rot = scene_rot_w * lam
+                        w_tdir = scene_tdir_w * lam
+                        loss_rel, loss_rel_b, rel_extra = v2_rel_pose_loss(
                             preds["pose_enc"], cache, images4.shape[-2:],
-                            args.v2_rel_weight)
-                        loss = loss_base + loss_rel
-                        extra = {**extra, **rel_extra}
-                    if args.v2_grad_cap:
+                            w_rot, w_tdir)
+                        loss = loss_base + loss_rel + loss_rel_b
+                        extra = {**extra, **rel_extra,
+                                 "rel_w_eff": w_rot + w_tdir,
+                                 "rot_w": w_rot, "tdir_w": w_tdir}
+                    elif rel_gate_off:
+                        extra = {**extra, "rel_w_eff": 0.0, "rel_gate_off": 1.0}
+                    if args.v2_grad_cap and loss_rel is not None:
                         # split backward: two fused backwards (bit-exact vs the
-                        # single fused path; autograd.grad is NOT — it computes
-                        # weight grads behind the autocast boundary differently),
-                        # rel branch per-param-norm-capped, merged into p.grad
-                        # in scaled space so unscale_/clip/scaler.step are exact.
+                        # single fused path); during the 10-step calibration
+                        # the rot/tdir branches run as a THIRD backward so
+                        # ||g_rot||/||g_tdir|| are recorded separately; the cap
+                        # is a GLOBAL-norm, direction-preserving scalar.
+                        calibrating = len(v2_grad_state["medians"]) < 10
                         cap_extra = v2_grad_cap_backward(
-                            loss_base, loss_rel, params, scaler, v2_grad_state)
+                            loss_base, loss_rel, params, scaler, v2_grad_state,
+                            loss_rel_b=loss_rel_b if calibrating else None)
                         extra = {**extra, **cap_extra}
                     else:
                         scaler.scale(loss).backward()
+                    # ---- v2_ab: frozen per-pair reliability stats into the trace
+                    if args.v2_ab and cache.get("q_feat") is not None:
+                        extra = {**extra, "q_feat": float(cache["q_feat"].mean()),
+                                 "q_rot": float(cache["q_rot"].mean()),
+                                 "q_tdir": float(cache["q_tdir"].mean()),
+                                 "geo_w": float(cache["geo_w"]), "v2ab": 1.0}
                     if args.sam_rho > 0:
                         # SAM: eps = rho*g/||g|| is invariant to the GradScaler factor,
                         # so it can be computed from scaled grads directly.
@@ -3330,6 +3648,21 @@ def main():
             _swan_selector_summary(args.run_root, scene, arm, swan_run)
             if swan_run is not None:
                 _swan_scene_eval(args, scene, arm, swan_run)
+            # ---- v2_ab scene-level q summary (frozen reliability stats)
+            if args.v2_ab and train_caches[0].get("q_feat") is not None:
+                qF_cat = torch.cat([c["q_feat"].flatten() for c in train_caches])
+                qR_cat = torch.cat([c["q_rot"].flatten() for c in train_caches])
+                qT_cat = torch.cat([c["q_tdir"].flatten() for c in train_caches])
+                gws = [c["geo_w"] for c in train_caches]
+                qsum = {
+                    "q/summary/qF_mean": float(qF_cat.mean()),
+                    "q/summary/qF_min": float(qF_cat.min()),
+                    "q/summary/qR_mean": float(qR_cat.mean()),
+                    "q/summary/qT_mean": float(qT_cat.mean()),
+                    "q/summary/geo_w_mean": float(np.mean(gws)),
+                }
+                _swan_log(swan_run, qsum)
+                print(f"[{scene}] {arm} q summary: {qsum}", flush=True)
             _swan_finish(swan_run)
             print(f"[{scene}] {arm} done ({time.time()-t0:.0f}s cumulative)", flush=True)
 

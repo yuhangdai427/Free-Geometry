@@ -313,11 +313,41 @@ def main() -> None:
     ap.add_argument("--v2_baselines_json", default="workspace/protocol_v2/baselines.json",
                     help="protocol v2: baselines.json for the scene-level "
                          "baseline-vs-TTA swanlab summary (da3.<dataset>.baseline.<scene>)")
+    ap.add_argument("--v2_ab_manifest", default=None,
+                    help="protocol v2 layer 1+2: per-scene AB manifest — a directory "
+                         "(<dir>/<dataset>/<scene>.json), a template with {scene}/"
+                         "{ds}/{dataset}, or a plain file. When set, the scene "
+                         "protocol comes from the manifest (NO on-the-fly "
+                         "sampling); train pairs must carry teacher_frames_B "
+                         "(context B). Enables dual teacher caches + frozen "
+                         "reliability weights (q_feat/q_rot/q_tdir/geo_w).")
+    ap.add_argument("--v2_rel_gate_deg", type=float, default=30.0,
+                    help="protocol v2: scene-level rel gate — before training, run "
+                         "UNMASKED B=0-student forwards on the probe pairs and "
+                         "median the per-edge teacher-student relative-rotation "
+                         "angle; above this threshold the v2 rel branch is "
+                         "disabled for the scene (0 = gate off)")
+    ap.add_argument("--v2_rot_weight", type=float, default=None,
+                    help="protocol v2: weight of the rotation branch (rot_edges_huber); "
+                         "default None -> fall back to --v2_rel_weight")
+    ap.add_argument("--v2_tdir_weight", type=float, default=None,
+                    help="protocol v2: weight of the translation-direction branch "
+                         "(tdir_cos_loss); default None -> fall back to --v2_rel_weight")
+    ap.add_argument("--v2_apply_selection", action="store_true",
+                    help="protocol v2: after training, replay controller.select on "
+                         "the probe trace and, when the selected step != last step, "
+                         "load that checkpoint (reset_lora_ for step 0) and re-run "
+                         "evaluate_scene into summary eval_selected (requires "
+                         "--v2_probe and --v2_ckpt)")
     args = ap.parse_args()
-    if args.v2_grad_cap and args.v2_rel_weight <= 0:
-        ap.error("--v2_grad_cap requires --v2_rel_weight > 0")
+    if args.v2_grad_cap and args.v2_rel_weight <= 0 \
+            and (args.v2_rot_weight or 0) <= 0 and (args.v2_tdir_weight or 0) <= 0:
+        ap.error("--v2_grad_cap requires --v2_rel_weight > 0 or --v2_rot_weight / "
+                 "--v2_tdir_weight > 0")
     if args.v2_probe_every <= 0:
         ap.error("--v2_probe_every must be > 0")
+    if args.v2_apply_selection and not (args.v2_probe and args.v2_ckpt):
+        ap.error("--v2_apply_selection requires --v2_probe and --v2_ckpt")
 
     device = "cuda"
     fg_common.set_dataset(args.dataset)
@@ -343,18 +373,27 @@ def main() -> None:
             for tok in args.ratio_mix.split(","):
                 t_, s_ = tok.strip().split(":")
                 ratio_mix.append((int(t_), int(s_)))
-        proto = P.build_scene_protocol(image_files, scene, dataset=args.dataset,
-                                       n_train=args.n_train,
-                                       n_shared=args.n_shared,
-                                       teacher_N=(args.teacher_N or None),
-                                       ratio_mix=ratio_mix,
-                                       selfevo=args.selfevo,
-                                       combo=args.combo,
-                                       combo_se_frac=args.combo_se_frac,
-                                       sparse_overlap=args.sparse_overlap)
-        print(f"[{scene}] N={proto['N']} tau={proto['tau']:.3f} "
-              f"teacher_N={proto['teacher_N']} strategy={proto['strategy']} "
-              f"n_shared={proto['n_shared']} eval_frames={len(proto['eval_frames'])}")
+        if args.v2_ab_manifest:
+            mpath = P.resolve_ab_manifest(args.v2_ab_manifest, args.dataset, scene)
+            proto = P.load_ab_manifest(mpath, args.dataset, scene, image_files)
+            print(f"[{scene}] protocol from AB manifest: {mpath} "
+                  f"(train_pairs={len(proto['train_pairs'])}, "
+                  f"probe_pairs={len(proto['probe_pairs'])}, dual-context)")
+        else:
+            proto = P.build_scene_protocol(image_files, scene, dataset=args.dataset,
+                                           n_train=args.n_train,
+                                           n_shared=args.n_shared,
+                                           teacher_N=(args.teacher_N or None),
+                                           ratio_mix=ratio_mix,
+                                           selfevo=args.selfevo,
+                                           combo=args.combo,
+                                           combo_se_frac=args.combo_se_frac,
+                                           sparse_overlap=args.sparse_overlap)
+        _tau = proto.get("tau")
+        tau_s = f"{_tau:.3f}" if isinstance(_tau, (int, float)) else str(_tau)
+        print(f"[{scene}] N={proto['N']} tau={tau_s} "
+              f"teacher_N={proto.get('teacher_N', '-')} strategy={proto.get('strategy', '-')} "
+              f"n_shared={proto.get('n_shared', '-')} eval_frames={len(proto['eval_frames'])}")
 
         run = None
         if args.swanlab:
@@ -376,13 +415,17 @@ def main() -> None:
 
         v2 = None
         if (args.v2_probe or args.v2_ckpt or args.v2_rel_weight > 0
-                or args.v2_grad_cap or args.v2_couple_fix):
+                or args.v2_grad_cap or args.v2_couple_fix or args.v2_ab_manifest):
             v2 = P.V2Config(
                 probe=args.v2_probe, probe_every=args.v2_probe_every,
                 ckpt=args.v2_ckpt, rel_weight=args.v2_rel_weight,
                 grad_cap=args.v2_grad_cap, couple_fix=args.v2_couple_fix,
                 run_dir=args.output_root,
-                ckpt_dir=os.path.join(args.output_root, "ckpts"))
+                ckpt_dir=os.path.join(args.output_root, "ckpts"),
+                ab=args.v2_ab_manifest is not None,
+                rel_gate_deg=args.v2_rel_gate_deg,
+                rot_weight=args.v2_rot_weight,
+                tdir_weight=args.v2_tdir_weight)
 
         def _on_step(row, _run=run):
             if _run is None:
@@ -392,10 +435,17 @@ def main() -> None:
                       "maskdistill", "rkd_sh_d", "rkd_sh_a", "couple",
                       "rel_rot", "rel_tdir", "ctk", "peak_mem_mib",
                       "v2_rel_rot", "v2_rel_tdir",
-                      "g_base_norm", "g_R_norm", "v2_C_R"):
+                      "g_base_norm", "g_R_norm", "v2_C_R",
+                      "g_rot_norm", "g_tdir_norm",
+                      "rel_w_eff", "w_rot_eff", "w_tdir_eff",
+                      "rel_gate", "rot_deg_unmasked_median",
+                      "q_feat_mean", "q_rot_mean", "geo_w"):
                 v = row.get(k)
                 if isinstance(v, (int, float)) and v == v:
                     m[k] = v
+            if "rel_gate" in m:
+                m["gate/rel_gate"] = m.pop("rel_gate")
+                m["gate/rot_deg_unmasked_median"] = m.pop("rot_deg_unmasked_median")
             try:
                 _run.log(m, step=int(row["step"]))
             except Exception as e:
@@ -422,6 +472,10 @@ def main() -> None:
                     normed["rel"] = row.get("rel_rot") + row.get("rel_tdir")
                 elif row.get("v2_rel_rot") is not None:  # v2 robust rel branch
                     normed["rel"] = row.get("v2_rel_rot") + row.get("v2_rel_tdir")
+                if row.get("q_feat_mean") is not None:  # AB reliability (frozen)
+                    normed["q_feat"] = row.get("q_feat_mean")
+                    normed["q_rot"] = row.get("q_rot_mean")
+                    normed["geo_w"] = row.get("geo_w")
                 for name, v in normed.items():
                     if isinstance(v, (int, float)) and v == v:
                         pm[f"pair/p{pi}/{name}"] = v
@@ -486,6 +540,12 @@ def main() -> None:
             except Exception as e:
                 print(f"[{scene}] WARNING: selector replay failed: {e}")
 
+        if run is not None and isinstance(stats.get("q_summary"), dict):
+            try:
+                run.log({f"q/{k}": v for k, v in stats["q_summary"].items()})
+            except Exception as e:
+                print(f"[{scene}] WARNING: q-summary logging failed: {e}")
+
         ckpt_dir = os.path.join(args.output_root, "ckpts", scene)
         os.makedirs(ckpt_dir, exist_ok=True)
         student.save_lora_weights(os.path.join(ckpt_dir, "c2m_final_lora.pt"))
@@ -547,6 +607,61 @@ def main() -> None:
                 except Exception as e:
                     print(f"[{scene}] WARNING: baseline comparison failed: {e}")
 
+        if args.v2_apply_selection and v2 is not None and v2.probe \
+                and not args.skip_eval and "eval" in summary["scenes"][scene]:
+            # execution chain: replay the selector, LOAD the selected checkpoint
+            # (reset_lora_ == step-0 theta0), re-evaluate on the same frames.
+            try:
+                from free_geometry.tta_v2.controller import ControllerConfig, select
+                trace_file = os.path.join(args.output_root, "probe_trace", f"{scene}.jsonl")
+                with open(trace_file) as f:
+                    trace = [json.loads(line) for line in f if line.strip()]
+                sel = select(trace, ControllerConfig())
+                sel_step, last_step = int(sel["selected_step"]), int(stats["steps"])
+                applied = sel_step
+                if sel_step != last_step:
+                    if sel_step == 0:
+                        P.reset_lora_(student)  # step-0 theta0 (B=0 LoRA)
+                    else:
+                        sel_ckpt = os.path.join(
+                            args.output_root, "ckpts", scene, "v2",
+                            f"step{sel_step}_lora.pt")
+                        assert os.path.exists(sel_ckpt), \
+                            f"selected ckpt missing: {sel_ckpt}"
+                        student.load_lora_weights(sel_ckpt)
+                    t0 = time.time()
+                    torch.cuda.reset_peak_memory_stats()
+                    ev_sel = evaluate_scene(
+                        student, scene_data, proto["eval_frames"],
+                        max_frames=args.eval_max_frames, scene=scene,
+                        dataset_obj=dataset_obj,
+                        export_dir=os.path.join(args.output_root, "recon_selected", scene))
+                    ev_sel["eval_time_s"] = time.time() - t0
+                    ev_sel["actual_loaded_step"] = applied
+                    summary["scenes"][scene]["eval_selected"] = ev_sel
+                    print(f"[{scene}] eval_selected (loaded step{applied}): "
+                          f"auc03={ev_sel['auc03']:.4f} "
+                          f"fscore={ev_sel.get('recon_fscore', float('nan')):.4f}")
+                else:
+                    print(f"[{scene}] selector picked the last step ({sel_step}); "
+                          f"no reload/re-eval needed")
+                if run is not None:
+                    m = {"selector/applied_step": applied,
+                         "selector/fell_back_to_baseline": sel["fell_back_to_baseline"]}
+                    if "eval_selected" in summary["scenes"][scene]:
+                        evs = summary["scenes"][scene]["eval_selected"]
+                        m["eval_selected/auc03"] = evs["auc03"]
+                        if evs.get("recon_fscore") is not None:
+                            m["eval_selected/f1"] = evs["recon_fscore"]
+                        elif evs.get("recon_overall") is not None:
+                            m["eval_selected/chamfer_overall"] = evs["recon_overall"]
+                    run.log(m)
+            except Exception as e:
+                # never mask the main eval result
+                print(f"[{scene}] WARNING: v2_apply_selection failed: {e}")
+            # note: no explicit restore — every scene starts with reset_lora_(),
+            # and the on-disk final ckpt was saved before eval.
+
         if run is not None:
             if not args.skip_eval and "eval" in summary["scenes"][scene]:
                 run.log({"eval_auc03": summary["scenes"][scene]["eval"]["auc03"],
@@ -561,7 +676,11 @@ def main() -> None:
                 "peak_mem_mib", "maskdistill", "rel", "rel_rot", "rel_tdir",
                 "rkd_sh_d", "rkd_sh_a", "couple", "ctk", "mask_ratio",
                 "v2_rel_rot", "v2_rel_tdir", "couple_skipped",
-                "g_base_norm", "g_R_norm", "v2_C_R"]
+                "g_base_norm", "g_R_norm", "v2_C_R",
+                "g_rot_norm", "g_tdir_norm",
+                "rel_w_eff", "w_rot_eff", "w_tdir_eff",
+                "rel_gate", "rot_deg_unmasked_median",
+                "q_feat_mean", "q_rot_mean", "geo_w"]
         with open(trace_path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
             w.writeheader()
