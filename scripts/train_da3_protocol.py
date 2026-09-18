@@ -257,6 +257,9 @@ def main() -> None:
     ap.add_argument("--early_stop", action="store_true",
                     help="stop training when tail-10 loss mean improves <2%% over "
                          "prev-10 (min 30 steps) — avoids over-training on saturated scenes")
+    ap.add_argument("--swanlab", action="store_true",
+                    help="log every step (loss components, lr, grad_norm, pair_idx) "
+                         "to swanlab cloud; one experiment per scene, named {scene}_{arm}")
     args = ap.parse_args()
 
     device = "cuda"
@@ -296,6 +299,43 @@ def main() -> None:
               f"teacher_N={proto['teacher_N']} strategy={proto['strategy']} "
               f"n_shared={proto['n_shared']} eval_frames={len(proto['eval_frames'])}")
 
+        run = None
+        if args.swanlab:
+            import swanlab
+            run = swanlab.init(
+                project="free-geometry-tta",
+                experiment_name=f"{scene}_{args.arm}",
+                description=f"{args.dataset} | {args.arm} | "
+                            f"loss_all_pos={args.loss_all_pos} | seed={args.seed}",
+                config={k: v for k, v in vars(args).items()
+                        if isinstance(v, (int, float, str, bool)) or v is None},
+            )
+
+        pair_visits = {}
+
+        def _on_step(row, _run=run):
+            if _run is None:
+                return
+            m = {}
+            for k in ("loss", "lr", "grad_norm", "pair_idx", "epoch",
+                      "maskdistill", "rkd_sh_d", "rkd_sh_a", "couple",
+                      "rel_rot", "rel_tdir", "ctk", "peak_mem_mib"):
+                v = row.get(k)
+                if isinstance(v, (int, float)) and v == v:
+                    m[k] = v
+            _run.log(m, step=int(row["step"]))
+            # per-pair curves: x-axis = visit index of THIS pair, so the 10
+            # interleaved tasks no longer blur into one chaotic global line
+            pi = int(row["pair_idx"])
+            pair_visits[pi] = pair_visits.get(pi, 0) + 1
+            pm = {}
+            for k in ("loss", "maskdistill", "rkd_sh_d", "rkd_sh_a", "couple",
+                      "rel_rot", "rel_tdir", "grad_norm"):
+                v = row.get(k)
+                if isinstance(v, (int, float)) and v == v:
+                    pm[f"pair{pi}/{k}"] = v
+            _run.log(pm, step=pair_visits[pi])
+
         pose_w = 0.0 if args.arm == "pw0" else args.pose_weight
         stats = P.train_scene_c2m(
             teacher, student, scene, image_files, proto,
@@ -306,7 +346,8 @@ def main() -> None:
             ctk_weight=args.ctk_weight, rel_weight=args.rel_weight,
             two_stage=args.two_stage,
             early_stop=args.early_stop,
-            mask_loss_positions=not args.loss_all_pos)
+            mask_loss_positions=not args.loss_all_pos,
+            on_step=_on_step)
 
         ckpt_dir = os.path.join(args.output_root, "ckpts", scene)
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -340,6 +381,12 @@ def main() -> None:
                   f"cd={ev.get('recon_overall', float('nan')):.4f} "
                   f"abs_rel={ev.get('abs_rel', float('nan')):.4f} "
                   f"({ev['n_eval_frames']} frames, peak {ev['eval_peak_mem_mib']:.0f}MiB)")
+
+        if run is not None:
+            if not args.skip_eval and "eval" in summary["scenes"][scene]:
+                run.log({"eval_auc03": summary["scenes"][scene]["eval"]["auc03"],
+                         "eval_fscore": summary["scenes"][scene]["eval"].get("recon_fscore")})
+            run.finish()
 
     del teacher
     torch.cuda.empty_cache()

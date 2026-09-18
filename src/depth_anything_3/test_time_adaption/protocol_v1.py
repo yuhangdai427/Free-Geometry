@@ -847,6 +847,7 @@ def train_scene_c2m(
     es_tol: float = 0.02,
     log_fn=print,
     trace_rows: Optional[list] = None,
+    on_step=None,  # per-step callback(row: dict) for external loggers (swanlab)
 ) -> Dict:
     """Run the fixed-100-step C2M adaptation for one scene. Returns stats.
 
@@ -987,6 +988,8 @@ def train_scene_c2m(
             }
             if trace_rows is not None:
                 trace_rows.append(row)
+            if on_step is not None:
+                on_step(row)
             if step % 10 == 0 or step == 1:
                 log_fn(
                     f"[{scene}] step {step}/{n_train * epochs} loss={float(loss):.4f} "
