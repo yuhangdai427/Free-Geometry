@@ -78,7 +78,7 @@ def rot_edges_huber(Rr_s: torch.Tensor, Rr_t: torch.Tensor,
     angle, for probe records).
     """
     z = ((Rr_s - Rr_t) ** 2).sum(dim=(-2, -1))
-    d = (z / 8.0).sqrt()
+    d = (z / 8.0).clamp_min(1e-12).sqrt()  # clamp: sqrt'(0)=inf -> NaN grad at z=0
     l = torch.where(d <= delta, 0.5 * d ** 2, delta * (d - 0.5 * delta)) * 16.0
     angle_deg = 2.0 * torch.asin(d.clamp(0.0, 1.0)) * (180.0 / math.pi)
     if l.numel() == 0:
@@ -108,7 +108,7 @@ def tdir_cos_loss(t_s: torch.Tensor, t_t: torch.Tensor, baseline_t: torch.Tensor
     [E] weighted per-edge values (defined for dropped edges as well),
     "n_kept", "n_skipped"}.
     """
-    keep = baseline_t >= skip_ratio * baseline_t.mean()
+    keep = baseline_t >= skip_ratio * torch.nanmean(baseline_t)  # NaN-safe: one NaN baseline must not drop all edges
     tn_s = F.normalize(t_s, dim=-1, eps=1e-8)
     tn_t = F.normalize(t_t, dim=-1, eps=1e-8)
     per = 1.0 - (tn_s * tn_t).sum(dim=-1)

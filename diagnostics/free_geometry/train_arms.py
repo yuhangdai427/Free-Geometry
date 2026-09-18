@@ -111,6 +111,11 @@ def loss_couple_sharedmask(pose_enc_s, depth_s, pose_enc_t_shared, depth4_t,
                 else conf4_t.float()
             q = torch.quantile(cf[m].flatten(), 0.05)
             m = m & (cf >= q)
+        if not bool(m.any()):
+            # degenerate teacher depth/conf (e.g. all-NaN conf): skip instead
+            # of producing a NaN couple term
+            z = torch.zeros((), device=depth4_t.device)
+            return z, {"couple": 0.0, "couple_skipped": 1.0}
 
         def stat(pose, depth):
             c = centers(pose)

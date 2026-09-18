@@ -396,7 +396,10 @@ def main() -> None:
                 v = row.get(k)
                 if isinstance(v, (int, float)) and v == v:
                     m[k] = v
-            _run.log(m, step=int(row["step"]))
+            try:
+                _run.log(m, step=int(row["step"]))
+            except Exception as e:
+                print(f"[warn] swanlab log failed: {e}")
             # per-pair curves: x-axis = visit index of THIS pair, so the 10
             # interleaved tasks no longer blur into one chaotic global line
             pi = int(row["pair_idx"])
@@ -424,7 +427,10 @@ def main() -> None:
                         pm[f"pair/p{pi}/{name}"] = v
             except Exception as e:
                 print(f"[warn] per-pair swanlab logging failed: {e}")
-            _run.log(pm, step=pair_visits[pi])
+            try:
+                _run.log(pm, step=pair_visits[pi])
+            except Exception as e:
+                print(f"[warn] swanlab per-pair log failed: {e}")
 
         def _on_probe(rec, _run=run):
             """probe curves at the REAL step: per (pair, mask) components + means"""
