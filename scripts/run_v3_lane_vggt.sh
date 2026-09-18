@@ -12,6 +12,7 @@ DG=diagnostics/free_geometry
 V2="--v2_ab --v2_probe --v2_ckpt --v2_rel_weight 1.0 --v2_grad_cap --v2_couple_fix --v2_rel_gate_deg 0 --loss_all_pos --v2_baselines_json workspace/protocol_v2/baselines.json"
 STOPF=workspace/protocol_v2/STOP
 ARM=C2M_RKDC1H
+MANIFEST_SRC="${MANIFEST_SRC:-workspace/protocol_v2/ab_scene_manifests_16}"
 
 mkdir -p logs
 while true; do
@@ -26,12 +27,12 @@ view_subset () { case "$1" in eth3d|hiroom) echo allv;; *) echo 100v;; esac; }
 
 run_ds () {
   local ds=$1
-  local RR=workspace/protocol_v2/full_vggt_$ds
+  local RR=workspace/protocol_v2/full16_vggt_$ds
   local VS
   VS=$(view_subset "$ds")
   [ -f "$STOPF" ] && exit 1
   mkdir -p "$RR"
-  cp "workspace/protocol_v2/ab_scene_manifests/$ds/scene_manifest.json" "$RR/scene_manifest.json"
+  cp "$MANIFEST_SRC/$ds/scene_manifest.json" "$RR/scene_manifest.json"
   # drop scenes whose final ckpt already exists (restart-safe)
   $PY - "$RR" <<'EOF'
 import json, os, sys
@@ -78,8 +79,6 @@ EOF
   echo "[v3-vggt] $ds DONE $(date '+%F %T')"
 }
 
-run_ds eth3d
-run_ds 7scenes
-run_ds scannetpp
-run_ds hiroom
-echo "[v3-vggt] ALL DONE $(date '+%F %T')"
+DATASETS="${DATASETS:-eth3d 7scenes scannetpp hiroom}"
+for ds in $DATASETS; do run_ds "$ds"; done
+echo "[v3-vggt] ALL DONE ($DATASETS) $(date '+%F %T')"
