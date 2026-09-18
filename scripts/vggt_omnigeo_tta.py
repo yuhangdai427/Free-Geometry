@@ -35,6 +35,7 @@ import torch.nn.functional as F
 ROOT = "/root/autodl-tmp/Free-Geometry"
 SELFEVO_RELPOSE = "/root/autodl-tmp/SelfEvo/relpose"
 OMNIGEO_DIR = "/root/autodl-tmp/OmniWorld/benchmark/geometric_prediction"
+OMNIVIDEO_DIR = "/root/autodl-tmp/OmniWorld/benchmark/video_generation"
 
 sys.path.insert(0, os.path.join(ROOT, "src"))              # our vggt (wins)
 sys.path.insert(0, os.path.join(ROOT, "diagnostics", "free_geometry"))
@@ -69,10 +70,10 @@ def _try_int_stem(fname):
         return 10 ** 18
 
 
-def list_sequences():
+def list_sequences(root=OMNIGEO_DIR):
     seqs = []
-    for d in sorted(os.listdir(OMNIGEO_DIR)):
-        seq_dir = os.path.join(OMNIGEO_DIR, d)
+    for d in sorted(os.listdir(root)):
+        seq_dir = os.path.join(root, d)
         image_dir = os.path.join(seq_dir, "image")
         cam = os.path.join(seq_dir, "camera_poses.npy")
         intr = os.path.join(seq_dir, "intrinsics.npy")
@@ -184,7 +185,7 @@ def eval_sequence(student, seq, device="cuda"):
 
 # ---------------------------------------------------------------- TTA (ours)
 def train_sequence(teacher, student, seq, device="cuda", seed=0,
-                   on_step=None, log=print):
+                   on_step=None, log=print, steps=STEPS, lr=LR):
     """One-sequence TTA, our unified protocol at 518."""
     from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
@@ -218,23 +219,24 @@ def train_sequence(teacher, student, seq, device="cuda", seed=0,
     torch.manual_seed(stable_seed("lora_init", seq["name"], seed))
     M.reset_lora_(student)
     params = [p for p in student.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=LR, weight_decay=WD)
-    warm = max(1, round(STEPS * WARMUP_RATIO))
+    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=WD)
+    warm = max(1, round(steps * WARMUP_RATIO))
     scheduler = SequentialLR(
         optimizer,
         [LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warm),
-         CosineAnnealingLR(optimizer, T_max=STEPS - warm, eta_min=1e-8)],
+         CosineAnnealingLR(optimizer, T_max=steps - warm, eta_min=1e-8)],
         [warm])
 
     student.train()
     step = 0
+    n_epochs = (steps + 9) // 10
     ones = torch.ones(1, 4, patch_hw[0] * patch_hw[1], device=device)
-    for epoch in range(10):
+    for epoch in range(n_epochs):
         order = [int(i) for i in torch.randperm(
             10, generator=torch.Generator().manual_seed(
                 stable_seed("train_order", seq["name"], epoch, seed)))]
         for pi in order:
-            if step >= STEPS:
+            if step >= steps:
                 break
             cache = caches[pi]
             images4 = images4_all[pi].unsqueeze(0).to(device)
@@ -267,7 +269,7 @@ def train_sequence(teacher, student, seq, device="cuda", seed=0,
                          "grad_norm": float(gn),
                          "lr": scheduler.get_last_lr()[0]})
             del images4, images4_in, feats24, preds
-        if step >= STEPS:
+        if step >= steps:
             break
     student.eval()
     return step
@@ -278,25 +280,41 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--shard", default="0/1", help="i/n shards by sequence index")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--out", default="workspace/omnigeo_vggt_rkdc")
+    ap.add_argument("--out", default=None,
+                    help="default: workspace/{benchmark}_vggt_rkdc[_s{steps}]")
     ap.add_argument("--skip_tta", action="store_true", help="baseline eval only")
     ap.add_argument("--swanlab", action="store_true")
+    ap.add_argument("--benchmark", default="omnigeo",
+                    choices=["omnigeo", "omnivideo"],
+                    help="omnigeo = benchmark/geometric_prediction (49 seqs); "
+                         "omnivideo = benchmark/video_generation (187 seqs x 81 frames)")
+    ap.add_argument("--steps", type=int, default=100,
+                    help="TTA steps per sequence (try 1000 for the "
+                         "longer-training hypothesis; epochs auto-adjust)")
+    ap.add_argument("--lr", type=float, default=3e-5)
     args = ap.parse_args()
 
+    bench_dir = OMNIGEO_DIR if args.benchmark == "omnigeo" else OMNIVIDEO_DIR
+
+    if args.out is None:
+        args.out = f"workspace/{args.benchmark}_vggt_rkdc"
+        if args.steps != 100:
+            args.out += f"_s{args.steps}"
     os.makedirs(args.out, exist_ok=True)
     device = "cuda"
-    seqs = list_sequences()
+    seqs = list_sequences(bench_dir)
     i, nshard = (int(x) for x in args.shard.split("/"))
     seqs = [s for k, s in enumerate(seqs) if k % nshard == i]
-    print(f"[OmniGeo] total sequences on disk: {len(list_sequences())}; "
+    print(f"[{args.benchmark}] total sequences on disk: "
+          f"{len(list_sequences(bench_dir))}; "
           f"this shard ({args.shard}): {len(seqs)}", flush=True)
 
     run = None
     if args.swanlab:
         import swanlab
-        run = swanlab.init(project="free-geometry-omnigeo",
-                           experiment_name=f"vggt_rkdc_shard{args.shard}",
-                           config={"arm": "rkdc1h", "steps": STEPS, "lr": LR,
+        run = swanlab.init(project=f"free-geometry-{args.benchmark.replace('omni', 'omni-')}",
+                           experiment_name=f"vggt_rkdc_s{args.steps}_shard{args.shard}",
+                           config={"arm": "rkdc1h", "steps": args.steps, "lr": args.lr,
                                    "image_hw": list(IMAGE_HW),
                                    "protocol": "SelfEvo eval-branch relpose-angular"})
 
@@ -319,7 +337,8 @@ def main():
             trace = []
             nsteps = train_sequence(
                 teacher, student, seq, device, seed=args.seed,
-                on_step=(lambda r: trace.append(r)) if run is not None else None)
+                on_step=(lambda r: trace.append(r)) if run is not None else None,
+                steps=args.steps, lr=args.lr)
             tta_row, _, _ = eval_sequence(student, seq, device)
         else:
             nsteps, tta_row, trace = 0, None, []
