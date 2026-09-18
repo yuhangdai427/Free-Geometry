@@ -185,7 +185,8 @@ def eval_sequence(student, seq, device="cuda"):
 
 # ---------------------------------------------------------------- TTA (ours)
 def train_sequence(teacher, student, seq, device="cuda", seed=0,
-                   on_step=None, log=print, steps=STEPS, lr=LR):
+                   on_step=None, log=print, steps=STEPS, lr=LR, n_pairs=10,
+                   ckpt_steps=(), on_ckpt=None):
     """One-sequence TTA, our unified protocol at 518."""
     from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
@@ -193,9 +194,9 @@ def train_sequence(teacher, student, seq, device="cuda", seed=0,
     rng = np.random.RandomState(
         stable_seed("omnigeo_pairs", seq["name"], seed) % (2 ** 32))
 
-    # 10 training pairs: 8 seeded-random teacher frames each
+    # n_pairs training pairs: 8 seeded-random teacher frames each
     pairs = []
-    for _ in range(10):
+    for _ in range(n_pairs):
         t = sorted(rng.choice(n, size=8, replace=False).tolist())
         pairs.append(t)
 
@@ -229,11 +230,11 @@ def train_sequence(teacher, student, seq, device="cuda", seed=0,
 
     student.train()
     step = 0
-    n_epochs = (steps + 9) // 10
+    n_epochs = (steps + n_pairs - 1) // n_pairs
     ones = torch.ones(1, 4, patch_hw[0] * patch_hw[1], device=device)
     for epoch in range(n_epochs):
         order = [int(i) for i in torch.randperm(
-            10, generator=torch.Generator().manual_seed(
+            n_pairs, generator=torch.Generator().manual_seed(
                 stable_seed("train_order", seq["name"], epoch, seed)))]
         for pi in order:
             if step >= steps:
@@ -262,6 +263,8 @@ def train_sequence(teacher, student, seq, device="cuda", seed=0,
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             step += 1
+            if on_ckpt is not None and step in ckpt_steps:
+                on_ckpt(step)  # save weights + in-place dual-metric eval
             if on_step is not None:
                 on_step({"step": step, "pair_idx": pi, "epoch": epoch,
                          "loss": float(loss), "maskdistill": float(feat),
@@ -292,14 +295,20 @@ def main():
                     help="TTA steps per sequence (try 1000 for the "
                          "longer-training hypothesis; epochs auto-adjust)")
     ap.add_argument("--lr", type=float, default=3e-5)
+    ap.add_argument("--n_pairs", type=int, default=10,
+                    help="training pairs per sequence (try 20 for the "
+                         "more-pairs hypothesis)")
+    ap.add_argument("--ckpt_steps", nargs="+", type=int, default=[],
+                    help="steps at which to SAVE LoRA weights and run the "
+                         "dual-metric eval in place (e.g. 100 120 140 160 180 200)")
     args = ap.parse_args()
 
     bench_dir = OMNIGEO_DIR if args.benchmark == "omnigeo" else OMNIVIDEO_DIR
 
     if args.out is None:
         args.out = f"workspace/{args.benchmark}_vggt_rkdc"
-        if args.steps != 100:
-            args.out += f"_s{args.steps}"
+        if args.steps != 100 or args.n_pairs != 10:
+            args.out += f"_s{args.steps}" + (f"_p{args.n_pairs}" if args.n_pairs != 10 else "")
     os.makedirs(args.out, exist_ok=True)
     device = "cuda"
     seqs = list_sequences(bench_dir)
@@ -335,24 +344,49 @@ def main():
         # ---- our TTA ----
         if not args.skip_tta:
             trace = []
+            ckpt_rows = {}
+
+            def _on_ckpt(step, _seq=seq):
+                """save LoRA at this step + dual-metric eval in place"""
+                sd = os.path.join(args.out, "ckpts", _seq["name"], f"step{step}")
+                os.makedirs(sd, exist_ok=True)
+                student.save_lora_weights(os.path.join(sd, "lora.pt"))
+                student.eval()
+                r, _, _ = eval_sequence(student, _seq, device)
+                student.train()
+                r["ckpt_step"] = step
+                ckpt_rows[step] = r
+                print(f"    [ckpt] {_seq['name']} step{step}: "
+                      f"AUC15={r['Auc_15']:.2f} absrel={r.get('depth_Abs Rel', float('nan')):.4f}",
+                      flush=True)
+
             nsteps = train_sequence(
                 teacher, student, seq, device, seed=args.seed,
                 on_step=(lambda r: trace.append(r)) if run is not None else None,
-                steps=args.steps, lr=args.lr)
-            tta_row, _, _ = eval_sequence(student, seq, device)
+                steps=args.steps, lr=args.lr, n_pairs=args.n_pairs,
+                ckpt_steps=tuple(args.ckpt_steps), on_ckpt=_on_ckpt)
+            if args.ckpt_steps and max(args.ckpt_steps) == args.steps:
+                tta_row = ckpt_rows.get(args.steps)      # final step already evaled
+            else:
+                tta_row, _, _ = eval_sequence(student, seq, device)
         else:
-            nsteps, tta_row, trace = 0, None, []
+            nsteps, tta_row, trace, ckpt_rows = 0, None, [], {}
 
-        row = {"seq": seq["name"], "n_frames": seq["n"]}
         keys = [k for k in base_row if k != "seq"]
-        for k in keys:
-            row[f"base_{k}"] = base_row[k]
-            if tta_row is not None:
-                row[f"tta_{k}"] = tta_row[k]
-                row[f"d_{k}"] = tta_row[k] - base_row[k]
-        row["train_steps"] = nsteps
-        row["time_s"] = time.time() - t0
-        all_rows.append(row)
+        emit = ([(cr.get("ckpt_step", args.steps), cr) for cr in ckpt_rows.values()]
+                if ckpt_rows else [(args.steps, tta_row)])
+        for ck_step, tr in emit:
+            if tr is None:
+                continue
+            row = {"seq": seq["name"], "n_frames": seq["n"], "ckpt_step": ck_step}
+            for k in keys:
+                row[f"base_{k}"] = base_row[k]
+                if tr is not None:
+                    row[f"tta_{k}"] = tr[k]
+                    row[f"d_{k}"] = tr[k] - base_row[k]
+            row["train_steps"] = nsteps
+            row["time_s"] = time.time() - t0
+            all_rows.append(row)
         with open(results_path, "w") as f:
             json.dump(all_rows, f, indent=1)
         keys = list(row.keys())
@@ -390,9 +424,21 @@ def main():
                 out[k] = float(np.mean(vals))
         return out
 
-    summary = {"shard": args.shard, "n_seq": len(all_rows),
+    per_step = {}
+    if args.ckpt_steps:
+        for st in sorted(set(r.get("ckpt_step") for r in all_rows)):
+            sub = [r for r in all_rows if r.get("ckpt_step") == st]
+            m = {}
+            for k in ("Auc_5", "Auc_15", "Auc_30", "depth_Abs Rel", "depth_δ < 1.25"):
+                vals = [r[f"tta_{k}"] for r in sub if f"tta_{k}" in r]
+                if vals:
+                    m[k] = float(np.mean(vals))
+            per_step[st] = m
+    summary = {"shard": args.shard, "steps": args.steps, "n_pairs": args.n_pairs,
+               "n_seq": len(set(r["seq"] for r in all_rows)),
                "base": overall("base_"),
                "tta": overall("tta_") if not args.skip_tta else None,
+               "per_ckpt_step": per_step,
                "per_sequence": all_rows}
     with open(results_path.replace(".json", "_summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
