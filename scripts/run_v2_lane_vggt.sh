@@ -8,7 +8,7 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=0
 PY=/root/miniconda3/envs/da3/bin/python
 DG=diagnostics/free_geometry
-V2="--v2_probe --v2_ckpt --v2_rel_weight 1.0 --v2_grad_cap --v2_couple_fix --v2_allpos --v2_baselines_json workspace/protocol_v2/baselines.json"
+V2="--v2_probe --v2_ckpt --v2_rel_weight 1.0 --v2_grad_cap --v2_couple_fix --loss_all_pos --v2_baselines_json workspace/protocol_v2/baselines.json"
 GATE=workspace/protocol_v2/GATE_ETH3D_OK
 STOPF=workspace/protocol_v2/STOP
 ARM=C2M_RKDC1H
@@ -21,13 +21,15 @@ while true; do
   echo "[v2-vggt] waiting for GPU (used ${used}MiB) $(date '+%F %T')"
   sleep 60
 done
-$PY $DG/train_arms.py --help 2>&1 | grep -q -- '--v2_allpos' \
-  || { echo "[v2-vggt] FATAL: --v2_allpos missing in train_arms.py"; exit 1; }
+$PY $DG/train_arms.py --help 2>&1 | grep -q -- '--loss_all_pos' \
+  || { echo "[v2-vggt] FATAL: --loss_all_pos missing in train_arms.py"; exit 1; }
 
 view_subset () { case "$1" in eth3d|hiroom) echo allv;; *) echo 100v;; esac; }
 
 run_ds () {
-  local ds=$1 RR=workspace/protocol_v2/vggt_$ds VS
+  local ds=$1
+  local RR=workspace/protocol_v2/vggt_$ds
+  local VS
   VS=$(view_subset "$ds")
   [ -f "$STOPF" ] && { echo "[v2-vggt] STOP file present, abort"; exit 1; }
   mkdir -p "$RR"
