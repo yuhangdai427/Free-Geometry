@@ -1055,13 +1055,13 @@ def finalize_reliability_(caches: List[Dict]) -> None:
     u_feats = torch.cat([c["u_feat"].reshape(-1) for c in caches])
     u_rots = torch.cat([c["u_rot"].reshape(-1) for c in caches])
     u_tdirs = torch.cat([c["u_tdir"].reshape(-1) for c in caches])
-    # floors: identical A/B contexts (or a scene where >50% of values are
-    # exactly 0) would otherwise give tau=0 -> q=NaN. Same convention as
-    # train_arms._q_from_u (max(tau, 1e-12)).
-    tau_f = u_feats.median().clamp_min(1e-12)
-    tau_r = u_rots.median().clamp_min(1e-12)
+    # tau = 80th percentile (NOT median): with tau=median, ~50% of targets get
+    # q<=0.5 -> global halving of supervision (regressed 7scenes). Q80 keeps
+    # the majority at q~1 and only soft-downweights the disputed tail.
+    tau_f = torch.quantile(u_feats, 0.8).clamp_min(1e-12)
+    tau_r = torch.quantile(u_rots, 0.8).clamp_min(1e-12)
     finite_t = u_tdirs[torch.isfinite(u_tdirs)]
-    tau_t = (finite_t.median() if finite_t.numel()
+    tau_t = (torch.quantile(finite_t, 0.8) if finite_t.numel()
              else torch.tensor(1.0)).clamp_min(1e-12)
     for c in caches:
         qf = 1.0 / (1.0 + (c["u_feat"] / tau_f) ** 2)

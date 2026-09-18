@@ -147,9 +147,16 @@ def main():
                  "overall": get_metric(ev, "recon_overall")}
             tta[scene] = {k: v for k, v in m.items() if v is not None}
     else:
-        src = os.path.join(args.run_dir, "eval32_metrics_V2.json")
-        if not os.path.exists(src):
-            print(f"ANALYSIS SKIP: {src} missing (run failed?)")
+        # lane writes V2final (final-step pass) and V2selected (selector pass)
+        src = None
+        for cand in ("eval32_metrics_V2final.json", "eval32_metrics_V2.json",
+                     "eval32_metrics.json"):
+            p = os.path.join(args.run_dir, cand)
+            if os.path.exists(p):
+                src = p
+                break
+        if src is None:
+            print(f"ANALYSIS SKIP: no eval32_metrics*.json in {args.run_dir}")
             return
         tta = {}
         walk_metrics(load_json(src), tta)

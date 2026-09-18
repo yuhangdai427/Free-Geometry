@@ -3049,12 +3049,16 @@ def main():
         train_images8 = pair_images8[:n_train]
         # ---- protocol v2 A/B: scene-level tau -> frozen per-pair q_* weights
         if args.v2_ab:
-            tau_F = float(np.median(torch.cat(
-                [c["_u_feat"].flatten() for c in train_caches]).cpu().numpy()))
-            tau_R = float(np.median(torch.cat(
-                [c["_u_rot"].flatten() for c in train_caches]).cpu().numpy()))
+            # tau = 80th percentile (NOT median): tau=median gives ~50% of
+            # targets q<=0.5 -> global halving of supervision (regressed
+            # DA3-7scenes). Q80 keeps the majority at q~1 and only
+            # soft-downweights the disputed tail.
+            tau_F = float(np.quantile(torch.cat(
+                [c["_u_feat"].flatten() for c in train_caches]).cpu().numpy(), 0.8))
+            tau_R = float(np.quantile(torch.cat(
+                [c["_u_rot"].flatten() for c in train_caches]).cpu().numpy(), 0.8))
             uT_pool = torch.cat([c["_u_tdir"][c["_u_keep"]] for c in train_caches])
-            tau_T = float(np.median(uT_pool.cpu().numpy())) if uT_pool.numel() \
+            tau_T = float(np.quantile(uT_pool.cpu().numpy(), 0.8)) if uT_pool.numel() \
                 else 1.0
             qF_all, qR_all, qT_all, gw_all = [], [], [], []
             for c in train_caches:
