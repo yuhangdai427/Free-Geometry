@@ -309,7 +309,9 @@ def test_probe_evaluate_is_deterministic_and_step_aware(tmp_path):
     assert rec["total"] == pytest.approx(
         rec["components"]["feature"] + 1.5 * rec["components"]["rkd"]
         + rec["components"]["couple"] + rec["components"]["rot_deg"])
-    assert "couple_skipped" not in rec
+    assert rec["couple_status"] == "ok"
+    assert rec["valid"] is True
+    assert rec["invalid_reason"] is None
 
     # dict features (DA3 multi-tap style): mean over readout dicts
     feats_s = torch.randn(1, S, 16, 8, generator=gen, dtype=torch.float64)
@@ -357,8 +359,10 @@ def test_probe_evaluate_marks_skipped_couple():
     evaluator = ProbeEvaluator([ctx])
     res = evaluator.evaluate(0, lambda meta, mask: out)
     for rec in res["records"]:
-        assert rec["components"]["couple"] == 0.0
-        assert rec["couple_skipped"] == "empty student valid mask"
+        assert rec["components"]["couple"] is None
+        assert rec["couple_status"] == "teacher_unavailable"
+        assert rec["valid"] is False
+        assert rec["invalid_reason"] == "couple:teacher_unavailable"
 
 
 def test_make_patch_mask_reproducible_and_rng_isolated():

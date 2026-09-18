@@ -7,8 +7,9 @@ Per (model, dataset) run dir:
      (baselines are NEVER recomputed).
   3. Replay the offline checkpoint selector on probe traces (no retraining).
   4. Write workspace/protocol_v2/analysis/{model}_{dataset}.{md,json}.
-  5. Cleanup: remove recon/point-cloud exports; prune v2 ckpt series to
-     {step0, final, selected} per scene. Prints freed bytes.
+  5. Cleanup (ONLY with --cleanup): remove recon/point-cloud exports; prune
+     v2 ckpt series to {step0, final, selected} per scene. Prints freed bytes.
+     Cleanup is opt-in — analysis must never destroy artifacts by default.
 """
 import argparse
 import glob
@@ -124,7 +125,11 @@ def main():
     ap.add_argument("--run_dir", required=True)
     ap.add_argument("--baselines", default="workspace/protocol_v2/baselines.json")
     ap.add_argument("--out_dir", default="workspace/protocol_v2/analysis")
-    ap.add_argument("--no_cleanup", action="store_true")
+    ap.add_argument("--cleanup", action="store_true",
+                    help="DESTRUCTIVE: also remove recon exports and prune the "
+                         "intermediate v2 ckpt series to {step0, final, "
+                         "selected}. Off by default; analysis never deletes "
+                         "artifacts unless explicitly asked.")
     args = ap.parse_args()
 
     # ---- 1. TTA per-scene metrics
@@ -223,9 +228,9 @@ def main():
                     f"{' FB' if sel.get('fell_back_to_baseline') else ''} |\n")
         f.write(f"\ndegraded: {summary['degraded']}\n")
 
-    # ---- 5. cleanup (metrics already extracted above)
+    # ---- 5. cleanup (opt-in; metrics already extracted above)
     freed = 0
-    if not args.no_cleanup:
+    if args.cleanup:
         recon = os.path.join(args.run_dir, "recon")
         if os.path.isdir(recon):
             freed += sum(os.path.getsize(os.path.join(dp, f))

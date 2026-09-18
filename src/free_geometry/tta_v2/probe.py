@@ -8,6 +8,7 @@ probe never touches pixels.
 """
 import hashlib
 import json
+import math
 import os
 from typing import Callable, Dict, List, Optional
 
@@ -97,11 +98,22 @@ class ProbeEvaluator:
 
     def evaluate(self, step: int, forward_fn: Callable) -> Dict:
         """Score every context x fixed mask via forward_fn. Returns
-        {"step", "records": [{pair_id, mask_id, components, total}]} with
-        components {"feature", "rot_deg", "rkd", "couple"} and
-        total = feature + 1.5*rkd + couple + rot_deg — a raw unnormalized
-        sum recorded for inspection only; checkpoint selection must run the
-        controller on the per-component traces, never on total.
+        {"step", "records": [...]} where each record carries:
+          pair_id, mask_id,
+          components {"feature", "rot_deg", "rkd", "couple"} — "couple" is
+            None when the couple term was skipped (never a fake 0.0),
+          couple_status  "ok" | "teacher_unavailable" | "student_invalid" |
+            "skipped" (degenerate geometry),
+          valid          False if any component is missing/non-finite,
+          invalid_reason first offending component ("couple:...", "non-finite:..."),
+          total          feature + 1.5*rkd + couple + rot_deg over the available
+            components — a raw unnormalized sum recorded for inspection only;
+            checkpoint selection must run the controller on the per-component
+            traces, never on total.
+        A component that is invalid at step 0 is permanently unavailable and
+        is excluded from selection at every step; a component that turns
+        invalid at a later step disqualifies that candidate (see
+        tta_v2.controller).
         """
         was_training = None
         if self.model is not None:
@@ -121,28 +133,44 @@ class ProbeEvaluator:
 
     def _score(self, unit: Dict, out: Dict, mask_id: int) -> Dict:
         ctx, teacher = unit["ctx"], unit["teacher"]
-        feat = self._feature_loss(out["features"], teacher)
+        components: Dict[str, Optional[float]] = {}
+        invalid_reason: Optional[str] = None
+        components["feature"] = float(self._feature_loss(out["features"], teacher))
+        if not math.isfinite(components["feature"]):
+            invalid_reason = invalid_reason or "non-finite:feature"
         edges_s = edges_from_w2c(out["ext_w2c"])
         if edges_s["R_rel"].shape[0]:
-            rot = rot_edges_huber(edges_s["R_rel"], unit["R_rel_t"])
-            rot_deg = rot["angle_deg"].mean()
+            rot_deg = float(rot_edges_huber(edges_s["R_rel"], unit["R_rel_t"])["angle_deg"].mean())
         else:
-            rot_deg = edges_s["baseline"].sum() * 0.0
-        rkd = loss_rkd_centers(out["centers"], teacher["centers"])
+            rot_deg = float(edges_s["baseline"].sum() * 0.0)
+        components["rot_deg"] = rot_deg
+        if not math.isfinite(rot_deg):
+            invalid_reason = invalid_reason or "non-finite:rot_deg"
+        components["rkd"] = float(loss_rkd_centers(out["centers"], teacher["centers"]))
+        if not math.isfinite(components["rkd"]):
+            invalid_reason = invalid_reason or "non-finite:rkd"
         cp = couple_robust(out["centers"], teacher["centers"].detach(),
                            out["depth"], teacher["depth"].detach(),
                            teacher["valid"], huber_delta=None)
-        components = {"feature": float(feat), "rot_deg": float(rot_deg),
-                      "rkd": float(rkd), "couple": 0.0}
-        record = {"pair_id": ctx["pair_id"], "mask_id": mask_id,
-                  "components": components}
         if cp["skipped"]:
-            record["couple_skipped"] = cp["reason"]
+            components["couple"] = None
+            if cp["teacher_unavailable"]:
+                couple_status = "teacher_unavailable"
+            elif cp["student_invalid"]:
+                couple_status = "student_invalid"
+            else:
+                couple_status = "skipped"
+            invalid_reason = invalid_reason or f"couple:{couple_status}"
         else:
             components["couple"] = float(cp["loss"])
-        record["total"] = float(components["feature"] + 1.5 * components["rkd"]
-                                + components["couple"] + components["rot_deg"])
-        return record
+            couple_status = "ok"
+        total = components["feature"] + 1.5 * components["rkd"] + components["rot_deg"] \
+            + (components["couple"] or 0.0)
+        return {"pair_id": ctx["pair_id"], "mask_id": mask_id,
+                "components": components, "couple_status": couple_status,
+                "valid": invalid_reason is None,
+                "invalid_reason": invalid_reason,
+                "total": float(total)}
 
     @staticmethod
     def _feature_loss(out_feat, teacher) -> torch.Tensor:
