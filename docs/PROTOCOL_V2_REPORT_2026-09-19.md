@@ -53,7 +53,7 @@ macro 均值：AUC final +3.62% / sel +2.01%；F1 final +1.94% / sel +2.58%。
 - probe 分量漂移（含 rkd）与 GT 变化统计不相关（Spearman ρ=−0.24, p=0.31）——不能当新信号用。
 - 离线修补尝试（step0 信任门）不优于现 selector，已否决。**selector 改进需要新信息源（如固定对应点重投影误差），不是调阈值。**
 
-## D. 消融实验（冻结副本 fg_abl，DA3 eth3d 5 场景子集，selected vs selected）
+## D. 消融实验（冻结副本 fg_abl，DA3 eth3d 全 11 场景，selected vs selected）
 
 | 臂 | n=5（最差F1子集） | n=11（全部） | 判定 |
 |---|---|---|---|
@@ -79,11 +79,11 @@ macro 均值：AUC final +3.62% / sel +2.01%；F1 final +1.94% / sel +2.58%。
 
 - **+5% 双指标目标未达成。** 达到的是：VGGT/eth3d AUC、VGGT/hiroom 双指标（final）、VGGT/7scenes F1。DA3 的 F1 全线偏弱是系统性问题。
 - saturated 数据集（scannetpp、DTU 的 AUC）上 TTA 空间本就很小；主要价值是不退化（selector 的回退正是为此）。
-- **下一步最高价值方向**（按证据排序）：①给 selector 加独立于 teacher 的观测（固定对应点重投影误差）以补盲区；②quantile-couple 上门控后全量验证；③masked-boost 全量验证（F1 稳定小正）；④VGGT/7scenes AUC 回归的根因（AUC↔F1 前沿现象）需专门研究。
+- **下一步最高价值方向**（按证据排序）：①给 selector 加独立于 teacher 的观测（固定对应点重投影误差）以补盲区；②masked-boost 可进主线候选（n=11 双指标非负，+0.19/+0.59pp）；quantile-couple 已否决；④VGGT/7scenes AUC 回归的根因（AUC↔F1 前沿现象）需专门研究。
 - VGGT/7scenes 的 AUC −9.4%：dense 视频场景 rel-on 对 VGGT 有利有弊（F1 +6.3%），呈现 AUC↔F1 互换，非 bug。
 
 ## G. 复现与审计入口
 
 - 车道脚本：`scripts/run_v3_lane_{da3,vggt}.sh`；分析：`scripts/protocol_v2_analyze.py`、`v2_final_report.py`、`v2_selector_quality.py`、`v2_selector_variants.py`、`v2_prune_running.py`。
 - 消融副本：`/root/autodl-tmp/fg_abl`（ABL_MASK_BOOST / ABL_COUPLE_Q 环境变量开关，合成测试验证 boost=0 与主线逐位一致）。
-- 时间线与全部中间结论：`workspace/protocol_v2/NIGHT_OPS_STATE.md`（§1-31）。
+- 时间线与全部中间结论：`workspace/protocol_v2/NIGHT_OPS_STATE.md`（§1-33）。
