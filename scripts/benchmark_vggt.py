@@ -24,8 +24,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 # Add vggt submodule to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src', 'vggt'))
 
-from vggt.vggt.bench.evaluator import VGGTEvaluator
-from vggt.vggt.test_time_adaption.models import VGGTStudentModel
+from vggt.bench.evaluator import VGGTEvaluator
+from vggt.test_time_adaption.models import VGGTStudentModel
 from vggt.models.vggt import VGGT
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 

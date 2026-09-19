@@ -135,7 +135,7 @@ class LoRAVGGT:
         device="cuda",
         image_size=504,
     ):
-        from vggt.vggt.test_time_adaption.models import VGGTStudentModel
+        from vggt.test_time_adaption.models import VGGTStudentModel
         from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
         print(f"Loading VGGT base model: {base_model}")
@@ -643,7 +643,7 @@ def run_evaluation(
     if model_family == "da3":
         from depth_anything_3.bench.evaluator import Evaluator as EvalCls
     else:
-        from vggt.vggt.bench.evaluator import VGGTEvaluator as EvalCls
+        from vggt.bench.evaluator import VGGTEvaluator as EvalCls
 
     for experiment in experiments:
         exp_work_dir = os.path.join(work_dir, experiment)
@@ -940,7 +940,7 @@ def main():
     if args.model_family == "da3":
         from depth_anything_3.bench.registries import MV_REGISTRY
     else:
-        from vggt.vggt.bench.registries import VGGT_MV_REGISTRY as MV_REGISTRY
+        from vggt.bench.registries import VGGT_MV_REGISTRY as MV_REGISTRY
 
     scenes_by_dataset: Dict[str, List[str]] = {}
     datasets = []

@@ -1,3 +1,0 @@
-[submodule "da3_streaming/loop_utils/salad"]
-	path = da3_streaming/loop_utils/salad
-	url = https://github.com/serizba/salad.git

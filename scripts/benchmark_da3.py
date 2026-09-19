@@ -2,12 +2,7 @@
 """
 Benchmark script for a Free-Geometry adapted DepthAnything3 model.
 
-Usage:
-    python scripts/train_da3.py \
-      --data_root ./data \
-      --mse_only \
-      --epochs 1 \
-      --output_dir ./checkpoints/tta_mse &&
+Usage (legacy-format checkpoints; new runs use fg evaluate):
     python scripts/benchmark_da3.py \
         --lora_path checkpoints/tta/best_lora.pt \
         --datasets scannetpp \

@@ -1,51 +1,169 @@
-"""Adapter interface: the ONLY model-specific layer of the unified TTA protocol.
+"""The only boundary allowed to know model internals."""
 
-An adapter provides, per model:
-  load(device)                     — frozen teacher (original checkpoint)
-  reset_student(device)            — fresh trainable student (LoRA re-init or
-                                     full-model reload for full-FT models)
-  student_params()                 — trainable parameter list for the optimizer
-  student_label()                  — e.g. "lora_r32" / "fullft_117M"
-  forward_teacher(images_N, slots) — cache dict on shared slots:
-      readouts {name: [1,S,P,C]}   — native readout space, patch tokens only
-      depth [S,H,W], conf [S,H,W]  — teacher depth + confidence
-      centers [S,3]                — camera centers (any gauge, teacher's own)
-      valid [S,H,W] bool           — teacher-derived valid-pixel mask
-  forward_student(images_M)        — SAME keys, plus differentiable centers
-  export_eval(images_eval)         — {depth [N,H,W], conf, extr_w2c [N,4,4],
-                                     intr [N,3,3]} for the metric chain
-  patch_hw                         — (ph, pw) of the last forward
-Convention: centers live in the model's own world frame on BOTH sides; the
-losses are gauge-free so no cross-model alignment is needed.
-"""
-from typing import Dict, List, Tuple
+from pathlib import Path
+
+import torch
+
+from ..types import ModelOutput
 
 
 class BaseAdapter:
-    model_key: str = "base"
-    uses_lora: bool = True
+    model_key = "base"
+    uses_lora = True
+    patch_size = 14
+    default_resolution = 504
+    mask_fill = (0.485, 0.456, 0.406)
 
-    def load(self, device="cuda"):
-        raise NotImplementedError
+    def configure(self, config):
+        self.config = config
+        self.weight_path = config.weights
+        self.lora_rank, self.lora_alpha = config.rank, config.alpha
+        self.resolution = config.resolution or self.default_resolution
+        if not config.weights:
+            raise ValueError(
+                "model.weights is required (local checkpoint or supported Hub ID)"
+            )
+        if config.source:
+            import sys
 
-    def reset_student(self, device="cuda"):
-        raise NotImplementedError
+            source = str(Path(config.source).resolve())
+            if not Path(source).is_dir():
+                raise FileNotFoundError(source)
+            sys.path.insert(0, source)
+            if (Path(source) / "src").is_dir():
+                sys.path.insert(0, str(Path(source) / "src"))
+        return self
 
-    def student_params(self) -> List:
-        raise NotImplementedError
+    def resolve_weights(self):
+        """Resolve Hub IDs once so Teacher and Student load identical immutable files."""
+        source = self.config.weights
+        if source and not Path(source).exists():
+            if self.model_key in ("omega", "pi3"):
+                raise FileNotFoundError(source)
+            from huggingface_hub import snapshot_download
 
-    def student_label(self) -> str:
-        raise NotImplementedError
+            source = snapshot_download(
+                repo_id=source,
+                allow_patterns=[
+                    "*.json",
+                    "*.yaml",
+                    "*.safetensors",
+                    "*.bin",
+                    "*.pt",
+                    "*.pth",
+                ],
+            )
+        self.weight_path = source
+        return source
 
-    def forward_teacher(self, images_N, shared_slots: List[int]) -> Dict:
-        raise NotImplementedError
+    def prepare_images(self, paths):
+        """Scene-fixed resize/padding, never recomputed per teacher context."""
+        import numpy as np
+        from PIL import Image
 
-    def forward_student(self, images_M) -> Dict:
-        raise NotImplementedError
+        images, metadata = [], []
+        p = self.patch_size
+        for path in paths:
+            with Image.open(path) as im:
+                im = im.convert("RGB")
+                w, h = im.size
+                scale = self.resolution / max(h, w)
+                nh, nw = (
+                    max(p, round(h * scale / p) * p),
+                    max(p, round(w * scale / p) * p),
+                )
+                array = (
+                    np.asarray(
+                        im.resize((nw, nh), Image.Resampling.BICUBIC), dtype=np.float32
+                    ).copy()
+                    / 255
+                )
+            images.append(torch.from_numpy(array).permute(2, 0, 1))
+            metadata.append(
+                {
+                    "path": str(path),
+                    "original_hw": [h, w],
+                    "resized_hw": [nh, nw],
+                    "image_transform": [[nw / w, 0, 0], [0, nh / h, 0], [0, 0, 1]],
+                    "padding": "bottom_right",
+                }
+            )
+        h, w = max(x.shape[-2] for x in images), max(x.shape[-1] for x in images)
+        output = (
+            torch.tensor(self.mask_fill)
+            .view(1, 3, 1, 1)
+            .expand(len(images), 3, h, w)
+            .clone()
+        )
+        valid = torch.zeros(len(images), h, w, dtype=torch.bool)
+        for i, image in enumerate(images):
+            nh, nw = image.shape[-2:]
+            output[i, :, :nh, :nw] = image
+            valid[i, :nh, :nw] = True
+        return output, valid, metadata
 
-    def export_eval(self, images_eval) -> Dict:
-        raise NotImplementedError
+    def predict(self, images, frame_ids, valid, teacher=False, slots=None):
+        if teacher:
+            slots = list(range(len(frame_ids))) if slots is None else list(slots)
+            with torch.no_grad():
+                out = self.forward_teacher(images, slots)
+            ids = tuple(frame_ids[i] for i in slots)
+            support = valid[slots]
+        else:
+            out = self.forward_student(images)
+            ids, support = tuple(frame_ids), valid
+        result = ModelOutput(
+            ids,
+            out["readouts"],
+            out["depth"],
+            out["conf"],
+            out["ext_w2c"],
+            out["centers"],
+            support,
+            self.patch_hw,
+        ).check()
+        return result.to(images.device, detach=True) if teacher else result
 
-    @property
-    def patch_hw(self) -> Tuple[int, int]:
-        raise NotImplementedError
+    def trainable_model(self):
+        return self.net
+
+    def student_params(self):
+        return [p for p in self.trainable_model().parameters() if p.requires_grad]
+
+    def trainable_state(self):
+        return {
+            n: p.detach().cpu().clone()
+            for n, p in self.trainable_model().named_parameters()
+            if p.requires_grad
+        }
+
+    def load_trainable_state(self, state):
+        params = {
+            n: p
+            for n, p in self.trainable_model().named_parameters()
+            if p.requires_grad
+        }
+        if params.keys() != state.keys():
+            raise ValueError("checkpoint trainable parameter names do not match model")
+        with torch.no_grad():
+            for name, p in params.items():
+                if p.shape != state[name].shape:
+                    raise ValueError(f"checkpoint shape mismatch: {name}")
+                p.copy_(state[name].to(p.device, p.dtype))
+
+    def describe(self):
+        params = {
+            n: p.numel()
+            for n, p in self.trainable_model().named_parameters()
+            if p.requires_grad
+        }
+        if not params:
+            raise ValueError("adapter has no trainable parameters")
+        return {
+            "model": self.model_key,
+            "weights": self.config.weights,
+            "trainable_parameters": params,
+            "total_trainable": sum(params.values()),
+            "resolution": self.resolution,
+            "patch_size": self.patch_size,
+        }

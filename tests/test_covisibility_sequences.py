@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from vggt.vggt.test_time_adaption.covisibility_sequences import ResolvedScene, make_sequence
+from vggt.test_time_adaption.covisibility_sequences import ResolvedScene, make_sequence
 
 
 def test_sequence_rejects_scene_without_eight_unique_views():

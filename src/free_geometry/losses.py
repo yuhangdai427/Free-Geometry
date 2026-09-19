@@ -1,147 +1,321 @@
-"""Unified GT-free TTA losses operating on the adapter interface.
+"""Five independent terms, one scalar backward, fixed teacher-only supervision."""
 
-All feature terms run in each model's NATIVE readout space (adapter-provided,
-already post-norm / post-projection); all geometry terms consume camera
-CENTERS only — gauge-free, so no per-model coordinate plumbing lives here
-(the adapter is responsible for producing centers in a consistent world frame).
-"""
-from typing import Dict, List
+import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 
-HUBER_BETA = 1.0
+from .config import LOSS_NAMES, LossConfig, ReliabilityConfig
+from .geometry import couple_stat, edges, rkd_statistics, rotation_angle
 
 
-def _huber_cos(hs: torch.Tensor, ht: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """hs/ht: [B,S,P,C]; w: [B,S,P] normalized to mean 1. Huber(beta=1) + 2(1-cos)."""
-    huber_t = F.smooth_l1_loss(hs, ht, beta=HUBER_BETA, reduction="none").mean(dim=-1)
-    cos_t = F.cosine_similarity(hs, ht, dim=-1)
-    return (huber_t * w).mean() + 2.0 * (1.0 - (cos_t * w).mean())
+def _finite(x):
+    return torch.isfinite(x)
 
 
-def loss_maskdistill(readouts_s: Dict[str, torch.Tensor], readouts_t: Dict[str, torch.Tensor],
-                     conf_patch: torch.Tensor) -> torch.Tensor:
-    """ALL-position masked-input distillation (2026-09-16 ablation winner).
-
-    readouts_*: {name: [1,S,P,C]} in native readout space (teacher detached).
-    conf_patch: [1,S,P] teacher depth-confidence per patch, mean-normalized.
-    """
-    w = conf_patch / conf_patch.mean().clamp_min(1e-8)
-    total = 0.0
-    for name in readouts_s:
-        total = total + _huber_cos(readouts_s[name].float(),
-                                   readouts_t[name].float().detach(), w)
-    return total / max(1, len(readouts_s))
+def _require(mask, name):
+    if not bool(mask.any()):
+        raise ValueError(f"{name}: no valid teacher supervision")
 
 
-def loss_rkd_centers(centers_s: torch.Tensor, centers_t: torch.Tensor,
-                     delta: float = 0.2) -> torch.Tensor:
-    """RKD on camera centers: mean-normalized pairwise distances + triangle
-    angles, per-residual Huber(delta). centers_*: [S,3] (teacher detached)."""
-    cs, ct = centers_s.float(), centers_t.float().detach()
-    S = cs.shape[0]
-    if S < 3:
-        return (cs - ct).sum() * 0.0
-    pairs = [(i, j) for i in range(S) for j in range(i + 1, S)]
-    ds = torch.stack([(cs[i] - cs[j]).norm() for i, j in pairs]).clamp_min(1e-6)
-    dt = torch.stack([(ct[i] - ct[j]).norm() for i, j in pairs]).clamp_min(1e-6)
-    dloss = F.huber_loss(ds / ds.mean().clamp_min(1e-8), dt / dt.mean().clamp_min(1e-8), delta=delta)
-    if S < 4:
-        return dloss
-    aterms = []
-    for k in range(S):
-        rest = [x for x in range(S) if x != k]
-        for a, b in [(rest[0], rest[1]), (rest[0], rest[2]), (rest[1], rest[2])]:
-            vs1 = F.normalize(cs[a] - cs[k], dim=-1, eps=1e-8)
-            vs2 = F.normalize(cs[b] - cs[k], dim=-1, eps=1e-8)
-            vt1 = F.normalize(ct[a] - ct[k], dim=-1, eps=1e-8)
-            vt2 = F.normalize(ct[b] - ct[k], dim=-1, eps=1e-8)
-            aterms.append(F.huber_loss((vs1 * vs2).sum(), (vt1 * vt2).sum(), delta=delta))
-    return dloss + torch.stack(aterms).mean()
+def _safe(x):
+    return torch.nan_to_num(x.float(), nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def loss_couple_centers(centers_s: torch.Tensor, depth_s: torch.Tensor,
-                        centers_t: torch.Tensor, depth_t: torch.Tensor,
-                        valid_t: torch.Tensor) -> torch.Tensor:
-    """Gauge coupling scalar: (log RMS(centers) - log mean_depth), student vs
-    teacher. FIX (2026-09-17): both sides take mean depth over the SAME
-    teacher-derived valid-pixel mask — removes the old asymmetric conf filter.
-
-    depth_*: [S,H,W]; valid_t: [S,H,W] bool from teacher confidence quantile.
-    """
-    def stat(centers, depth, valid):
-        spr = (centers - centers.mean(0, keepdim=True)).norm(dim=-1).pow(2).mean().sqrt()
-        d = depth.float()
-        m = torch.isfinite(d) & (d > 0) & valid
-        md = d[m].mean().clamp_min(1e-6)
-        return torch.log(spr.clamp_min(1e-6)) - torch.log(md)
-
-    cs = stat(centers_s.float(), depth_s, valid_t)   # student depth on SAME mask
-    ct = stat(centers_t.float().detach(), depth_t, valid_t)
-    return (cs - ct) ** 2
+def _q(disagreement, threshold, available):
+    # Numerical cosine/matmul noise is not evidence of disagreement.
+    d = torch.where(
+        disagreement.abs() < 1e-6,
+        torch.zeros_like(disagreement),
+        disagreement.clamp_min(0),
+    )
+    return torch.where(
+        available, 1 / (1 + (d / threshold).square()), torch.ones_like(d)
+    ).detach()
 
 
-def valid_mask_from_conf(conf: torch.Tensor, q: float = 0.05) -> torch.Tensor:
-    """conf: [S,H,W] teacher confidence -> bool mask keeping 1-q fraction."""
-    c = conf.float()
-    thr = torch.quantile(c.flatten(), q)
-    return torch.isfinite(c) & (c >= thr)
+def _weighted(per, mask, q):
+    _require(mask, "loss")
+    return (per[mask] * q[mask]).mean()
 
 
-def loss_rel_pose(ext_s: torch.Tensor, ext_t: torch.Tensor) -> torch.Tensor:
-    """Corrected relative-pose loss for w2c inputs (2026-09-18 fix).
+@dataclass
+class LossBundle:
+    total: torch.Tensor
+    raw: dict
+    weighted: dict
+    contributions: dict
+    counts: dict
 
-    FIX: the relative transform from camera j to camera i is
-      T_{i<-j} = E_i @ inv(E_j)  (NOT inv(E_i) @ E_j)
-    For w2c [R|t]:
-      R_rel = R_i @ R_j^T
-      t_rel = t_i - R_i @ R_j^T @ t_j
-
-    Loss form (unchanged): per-pair rotation Frobenius + translation-direction
-    1-cos, scale-free. ext_*: [S,3,4] or [1,S,3,4] w2c (student grad, teacher
-    detached)."""
-    if ext_s.dim() == 4:
-        ext_s = ext_s[0]
-    if ext_t.dim() == 4:
-        ext_t = ext_t[0]
-    R_s, t_s = ext_s[..., :3, :3], ext_s[..., :3, 3]
-    R_t, t_t = ext_t[..., :3, :3], ext_t[..., :3, 3]
-    S = R_s.shape[0]
-    rot_loss, tdir_loss, npairs = 0.0, 0.0, 0
-    for i in range(S):
-        for j in range(i + 1, S):
-            # Correct: T_{i<-j} = E_i @ inv(E_j)
-            Rr_s = R_s[i] @ R_s[j].transpose(-1, -2)
-            Rr_t = R_t[i] @ R_t[j].transpose(-1, -2)
-            tr_s = t_s[i] - Rr_s @ t_s[j]
-            tr_t = t_t[i] - Rr_t @ t_t[j]
-            rot_loss = rot_loss + ((Rr_s - Rr_t) ** 2).sum(dim=(-2, -1)).mean()
-            # Skip direction for near-zero baselines (teacher criterion)
-            tn_t = F.normalize(tr_t.squeeze(-1) if tr_t.dim() > 1 else tr_t,
-                               dim=-1, eps=1e-8)
-            tn_s = F.normalize(tr_s.squeeze(-1) if tr_s.dim() > 1 else tr_s,
-                               dim=-1, eps=1e-8)
-            tdir_loss = tdir_loss + (1.0 - (tn_s * tn_t).sum(-1)).mean()
-            npairs += 1
-    return rot_loss / npairs + tdir_loss / npairs
+    def record(self):
+        return {
+            "total": float(self.total.detach()),
+            "raw": {k: float(v.detach()) for k, v in self.raw.items()},
+            "weighted": {k: float(v.detach()) for k, v in self.weighted.items()},
+            "contributions": {
+                k: float(v.detach()) for k, v in self.contributions.items()
+            },
+            "counts": self.counts,
+        }
 
 
-def compute_arm_loss(arm: str, student_out: Dict, teacher_cache: Dict) -> torch.Tensor:
-    """arm: 'm_allpos' | 'rkdc_allpos' | 'maskrel_allpos' | 'rkdcr_allpos'.
-    All-position maskdistill base."""
-    feat = loss_maskdistill(student_out["readouts"], teacher_cache["readouts"],
-                            teacher_cache["conf_patch"])
-    if arm == "m_allpos":
-        return feat
-    if arm == "maskrel_allpos":
-        return feat + 1.0 * loss_rel_pose(student_out["ext_w2c"], teacher_cache["ext_w2c"])
-    rkd = loss_rkd_centers(student_out["centers"], teacher_cache["centers"])
-    cp = loss_couple_centers(student_out["centers"], student_out["depth"],
-                             teacher_cache["centers"], teacher_cache["depth"],
-                             teacher_cache["valid"])
-    base = feat + 1.5 * rkd + 1.0 * cp
-    if arm == "rkdcr_allpos":
-        # rkdc + corrected rel (2026-09-18: E_i @ inv(E_j) construction)
-        return base + 1.0 * loss_rel_pose(student_out["ext_w2c"], teacher_cache["ext_w2c"])
-    return base
+@torch.no_grad()
+def prepare_supervision(a, b=None, loss=None, reliability=None, informative=True):
+    """Cache all masks and q once; CPU-compatible, no student-derived gating."""
+    loss = loss or LossConfig()
+    reliability = reliability or ReliabilityConfig()
+    a.check()
+    if b is not None:
+        b.check()
+        if (
+            a.frame_ids != b.frame_ids
+            or a.patch_hw != b.patch_hw
+            or a.readouts.keys() != b.readouts.keys()
+        ):
+            raise ValueError("A/B frame/readout mapping mismatch")
+    use_b = b is not None and informative and reliability.enabled
+    cache = {
+        "q": {},
+        "masks": {},
+        "targets": {},
+        "availability": {},
+        "ab_informative": bool(informative and b is not None),
+    }
+    q, masks, targets = cache["q"], cache["masks"], cache["targets"]
+    ph, pw = a.patch_hw
+    real = a.valid.bool()
+    finite_conf = _finite(a.conf) & (a.conf >= 0) & real
+    conf = torch.where(finite_conf, a.conf.float(), torch.zeros_like(a.conf.float()))
+    cp = F.adaptive_avg_pool2d(conf[:, None], (ph, pw)).flatten(1)[None]
+    # Exclude patches containing padding/nonfinite confidence, keeping positional semantics.
+    patch_valid = (
+        F.adaptive_avg_pool2d(finite_conf.float()[:, None], (ph, pw)).flatten(1)[None]
+        >= 1 - 1e-6
+    )
+    if bool(patch_valid.any()):
+        cp = cp / cp[patch_valid].mean().clamp_min(1e-8)
+    cache["confidence"] = cp
+    if loss.feature:
+        q["feature"], masks["feature"], targets["feature"] = {}, {}, {}
+        for name, fa in a.readouts.items():
+            mask = patch_valid & _finite(fa).all(-1) & (cp > 0)
+            _require(mask, "feature:" + name)
+            masks["feature"][name] = mask
+            targets["feature"][name] = _safe(fa)
+            available = torch.zeros_like(mask)
+            weight = torch.ones_like(cp)
+            if use_b and reliability.feature:
+                fb = b.readouts[name]
+                if fb.shape != fa.shape:
+                    raise ValueError("A/B feature shape mismatch")
+                available = mask & _finite(fb).all(-1)
+                d = 1 - F.cosine_similarity(_safe(fa), _safe(fb), dim=-1)
+                weight = _q(d, reliability.feature_threshold, available)
+            q["feature"][name] = weight
+            cache["availability"]["feature:" + name] = int(available.sum())
+    ext = _safe(a.ext_w2c)
+    ra, ta, ii, jj = edges(ext)
+    finite_pose = _finite(a.ext_w2c).all((-2, -1))
+    pose_mask = finite_pose[ii] & finite_pose[jj]
+    rb, tb = None, None
+    bpose = torch.zeros_like(pose_mask)
+    if use_b:
+        rb, tb, _, _ = edges(_safe(b.ext_w2c))
+        bp = _finite(b.ext_w2c).all((-2, -1))
+        bpose = bp[ii] & bp[jj]
+    if loss.rotation:
+        _require(pose_mask, "rotation")
+        targets["rotation"], masks["rotation"] = ra, pose_mask
+        available = pose_mask & bpose
+        q["rotation"] = (
+            _q(
+                rotation_angle(ra, rb),
+                math.radians(reliability.rotation_threshold_deg),
+                available,
+            )
+            if use_b and reliability.rotation
+            else torch.ones_like(ta[:, 0])
+        )
+        cache["availability"]["rotation"] = (
+            int(available.sum()) if use_b and reliability.rotation else 0
+        )
+    if loss.translation:
+        baseline = ta.norm(dim=-1)
+        ref = (
+            baseline[pose_mask].mean()
+            if bool(pose_mask.any())
+            else baseline.new_tensor(0.0)
+        )
+        keep = pose_mask & (baseline > 1e-12) & (baseline >= 1e-3 * ref)
+        _require(keep, "translation")
+        targets["translation"], masks["translation"] = F.normalize(ta, dim=-1), keep
+        available = keep & bpose
+        weight = torch.ones_like(baseline)
+        if use_b and reliability.translation:
+            bn = tb.norm(dim=-1)
+            bref = bn[bpose].mean() if bool(bpose.any()) else bn.new_tensor(0.0)
+            available &= (bn > 1e-12) & (bn >= 1e-3 * bref)
+            cosine = (
+                (F.normalize(ta, dim=-1) * F.normalize(tb, dim=-1)).sum(-1).clamp(-1, 1)
+            )
+            cosine = torch.where(cosine > 1 - 1e-6, torch.ones_like(cosine), cosine)
+            weight = _q(
+                cosine.acos(),
+                math.radians(reliability.translation_threshold_deg),
+                available,
+            )
+        q["translation"] = weight
+        cache["availability"]["translation"] = (
+            int(available.sum()) if use_b and reliability.translation else 0
+        )
+    if loss.rkd:
+        # Keep nonfinite centers as NaN while determining validity, sanitize only afterwards.
+        da, aa, md, ma, _triples = rkd_statistics(a.centers.float())
+        _require(md, "rkd_distance")
+        if len(a.centers) >= 3:
+            _require(ma, "rkd_angle")
+        targets["rkd_distance"], targets["rkd_angle"] = _safe(da), _safe(aa)
+        masks["rkd_distance"], masks["rkd_angle"] = md, ma
+        for key, value in [("rkd_distance", da), ("rkd_angle", aa)]:
+            q[key] = torch.ones_like(value)
+            cache["availability"][key] = 0
+        if use_b and reliability.rkd:
+            db, ab, mbd, mba, _ = rkd_statistics(b.centers.float())
+            for key, x, y, available, threshold in (
+                ("rkd_distance", da, db, md & mbd, reliability.rkd_distance_threshold),
+                ("rkd_angle", aa, ab, ma & mba, reliability.rkd_angle_threshold),
+            ):
+                q[key] = _q((_safe(x) - _safe(y)).abs(), threshold, available)
+                cache["availability"][key] = int(available.sum())
+    if loss.couple:
+        support = real & finite_conf & _finite(a.depth) & (a.depth > 0)
+        _require(support, "couple")
+        threshold = torch.quantile(a.conf[support].float(), 0.05)
+        support &= a.conf >= threshold
+        stat = couple_stat(a.centers.float(), a.depth.float(), support)
+        masks["couple"], targets["couple"] = support, stat
+        q["couple"] = stat.new_ones(())
+        cache["availability"]["couple"] = 0
+        if use_b and reliability.couple:
+            try:
+                if not bool(b.valid[support].all()):
+                    raise ValueError("B lacks A support")
+                other = couple_stat(b.centers.float(), b.depth.float(), support)
+                q["couple"] = _q(
+                    (stat - other).abs(),
+                    reliability.couple_threshold,
+                    stat.new_tensor(True, dtype=torch.bool),
+                )
+                cache["availability"]["couple"] = 1
+            except ValueError:
+                pass  # q=1 means unavailable comparison, not reliable teacher
+    return cache
+
+
+def compute_losses(student, teacher, cache, config=None):
+    config = config or LossConfig()
+    student.check()
+    if student.frame_ids != teacher.frame_ids or student.patch_hw != teacher.patch_hw:
+        raise ValueError("student/teacher frame or patch correspondence mismatch")
+    raw, weighted, counts = {}, {}, {}
+    targets, masks, q = cache["targets"], cache["masks"], cache["q"]
+
+    def record(name, per, mask, weight):
+        if not bool(_finite(per[mask]).all()):
+            raise FloatingPointError(f"{name}: invalid student output")
+        raw[name] = per[mask].mean()
+        weighted[name] = _weighted(per, mask, weight)
+        counts[name] = int(mask.sum())
+
+    if config.feature:
+        raws, ws, n = [], [], 0
+        if student.readouts.keys() != teacher.readouts.keys():
+            raise ValueError("feature readout names mismatch")
+        for name, fs in student.readouts.items():
+            ft = targets["feature"][name]
+            mask = masks["feature"][name]
+            if fs.shape != ft.shape or not bool(_finite(fs[mask]).all()):
+                raise FloatingPointError("feature shape mismatch/nonfinite student")
+            # Index before nonlinear ops so excluded NaN patches cannot poison gradients.
+            x, y = fs.float()[mask], ft[mask]
+            per = F.smooth_l1_loss(x, y, reduction="none", beta=1).mean(-1) + 2 * (
+                1 - F.cosine_similarity(x, y, dim=-1)
+            )
+            base = cache["confidence"][mask] * per
+            raws.append(base.mean())
+            ws.append((base * q["feature"][name][mask]).mean())
+            n += int(mask.sum())
+        raw["feature"], weighted["feature"], counts["feature"] = (
+            torch.stack(raws).mean(),
+            torch.stack(ws).mean(),
+            n,
+        )
+    if config.rotation or config.translation:
+        if not bool(_finite(student.ext_w2c).all()):
+            raise FloatingPointError("nonfinite student camera")
+        rs, ts, _, _ = edges(student.ext_w2c.float())
+        if config.rotation:
+            z = (rs - targets["rotation"]).square().sum((-2, -1))
+            delta = math.sin(math.radians(config.rotation_knee_deg) / 2)
+            per = torch.where(
+                z <= 8 * delta**2,
+                z,
+                16 * delta * ((z / 8).clamp_min(delta**2).sqrt() - 0.5 * delta),
+            )
+            record("rotation", per, masks["rotation"], q["rotation"])
+        if config.translation:
+            per = 1 - (F.normalize(ts, dim=-1, eps=1e-8) * targets["translation"]).sum(
+                -1
+            )
+            record("translation", per, masks["translation"], q["translation"])
+    if config.rkd:
+        if not bool(_finite(student.centers).all()):
+            raise FloatingPointError("nonfinite student centers")
+        ds, aa, _, _, _ = rkd_statistics(student.centers.float())
+        for key, value in [("rkd_distance", ds), ("rkd_angle", aa)]:
+            mask = masks[key]
+            if bool(mask.any()):
+                per = F.huber_loss(
+                    value, targets[key], reduction="none", delta=config.rkd_delta
+                )
+                record(key, per, mask, q[key])
+        raw["rkd"] = sum(raw[k] for k in ("rkd_distance", "rkd_angle") if k in raw)
+        weighted["rkd"] = sum(
+            weighted[k] for k in ("rkd_distance", "rkd_angle") if k in weighted
+        )
+        counts["rkd"] = sum(counts.get(k, 0) for k in ("rkd_distance", "rkd_angle"))
+    if config.couple:
+        stat = couple_stat(
+            student.centers.float(), student.depth.float(), masks["couple"]
+        )
+        raw["couple"] = (stat - targets["couple"]).square()
+        weighted["couple"] = raw["couple"] * q["couple"]
+        counts["couple"] = int(masks["couple"].sum())
+    contributions = {
+        name: weighted[name] * getattr(config, name)
+        for name in LOSS_NAMES
+        if getattr(config, name) > 0
+    }
+    total = sum(contributions.values())
+    if not bool(torch.isfinite(total)):
+        raise FloatingPointError("nonfinite total loss")
+    return LossBundle(total, raw, weighted, contributions, counts)
+
+
+def supervision_summary(cache):
+    def stats(v):
+        if isinstance(v, dict):
+            return {k: stats(x) for k, x in v.items()}
+        return (
+            {"min": float(v.min()), "mean": float(v.mean()), "max": float(v.max())}
+            if v.numel()
+            else None
+        )
+
+    return {
+        "ab_informative": cache["ab_informative"],
+        "q": stats(cache["q"]),
+        "available_comparisons": cache["availability"],
+        "comparison_error": cache.get("comparison_error"),
+    }

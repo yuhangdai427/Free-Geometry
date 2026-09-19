@@ -1,0 +1,56 @@
+sampling:
+  teacher_frames: 8
+  student_frames: 4
+  train_tasks: 10
+  probe_tasks: 2
+  dense_min_frames: 50
+  sift_threshold: 0.6
+  sift_mode: auto
+  dense_candidates: 40
+  seed: 0
+model:
+  name: da3
+  weights: ''
+  source: ''
+  rank: 32
+  alpha: 32.0
+  dropout: 0.0
+  resolution: 0
+loss:
+  feature: 1.0
+  rotation: 1.0
+  translation: 1.0
+  rkd: 1.0
+  couple: 1.0
+  rkd_delta: 0.2
+  rotation_knee_deg: 20.0
+reliability:
+  enabled: true
+  feature: true
+  rotation: true
+  translation: true
+  rkd: true
+  couple: true
+  feature_threshold: 0.1
+  rotation_threshold_deg: 20.0
+  translation_threshold_deg: 20.0
+  rkd_distance_threshold: 0.2
+  rkd_angle_threshold: 0.2
+  couple_threshold: 0.22314355131420976
+train:
+  max_steps: 100
+  lr: 3.0e-05
+  weight_decay: 1.0e-05
+  warmup_ratio: 0.15
+  clip_grad: 1.0
+  input_mask_ratio: 0.5
+  seed: 0
+  device: cuda
+  amp: true
+probe:
+  every: 20
+  decision: false
+  min_candidate_step: 20
+  min_stop_step: 40
+  patience: 3
+  min_delta: 0.005

@@ -1,4 +1,4 @@
-from vggt.vggt.test_time_adaption.nested_view_sampling import make_records, nested_subset
+from vggt.test_time_adaption.nested_view_sampling import make_records, nested_subset
 
 
 def test_nested_pools_are_reproducible_and_nested():

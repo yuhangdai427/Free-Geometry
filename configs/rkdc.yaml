@@ -1,0 +1,6 @@
+loss:
+  feature: 1
+  rotation: 0
+  translation: 0
+  rkd: 1
+  couple: 1

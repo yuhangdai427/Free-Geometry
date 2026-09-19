@@ -7,48 +7,25 @@ name = "depth-anything-3"
 version = "0.0.0"
 description = "Depth Anything 3"
 readme = "README.md"
-requires-python = ">=3.9, <=3.13"
+requires-python = ">=3.10,<3.14"
 license = { text = "CC-BY-4.0" }
 authors = [{ name = "Your Name" }]
 
-dependencies = [
-    "pre-commit",
-    "trimesh",
-    "torch>=2",
-    "torchvision",
-    "einops",
-    "huggingface_hub",
-    "imageio",
-    "numpy<2",
-    "opencv-python",
-    "xformers",
-    "open3d",
-    "fastapi",
-    "uvicorn",
-    "requests",
-    "typer",
-    "pillow",
-    "omegaconf",
-    "evo",
-    "e3nn",
-    "moviepy",
-    "plyfile",
-    "pillow_heif",
-    "safetensors",
-    "uvicorn",
-    "moviepy==1.0.3",
-    "typer>=0.9.0",
-    "pycolmap",
-]
+dependencies = ["torch>=2.3", "numpy>=1.24,<3", "pillow>=9", "pyyaml>=6"]
+
 
 [project.optional-dependencies]
-app = ["gradio>=5", "pillow>=9.0"] # requires that python3>=3.10
+sift = ["opencv-python-headless>=4.8"]
+models = ["torchvision", "einops", "huggingface_hub", "safetensors", "peft>=0.14", "omegaconf", "addict", "e3nn", "opencv-python-headless>=4.8", "pillow_heif", "imageio", "tqdm"]
+benchmark = ["open3d", "evo", "trimesh", "plyfile", "pycolmap", "scipy", "imageio", "tqdm"]
+app = ["gradio>=5", "fastapi", "uvicorn", "moviepy==1.0.3", "typer>=0.9.0"]
+dev = ["pytest>=8", "build", "ruff"]
 gs = ["gsplat @ git+https://github.com/nerfstudio-project/gsplat.git@0b4dddf04cb687367602c01196913cde6a743d70"]
-all = ["depth-anything-3[app,gs]"]
-
+all = ["depth-anything-3[sift,models,benchmark,app,gs]"]
 
 [project.scripts]
 da3 = "depth_anything_3.cli:app"
+fg = "free_geometry.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/ByteDance-Seed/Depth-Anything-3"
@@ -57,13 +34,22 @@ Homepage = "https://github.com/ByteDance-Seed/Depth-Anything-3"
 source = "vcs"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/depth_anything_3"]
+packages = ["src/depth_anything_3", "src/free_geometry", "src/vggt/vggt"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src/vggt/vggt" = "vggt"
+"src/free_geometry" = "free_geometry"
+"src/depth_anything_3" = "depth_anything_3"
 
 [tool.hatch.build.targets.sdist]
 include = [
   "/README.md",
   "/pyproject.toml",
   "/src/depth_anything_3",
+  "/src/free_geometry",
+  "/src/vggt/vggt",
+  "/configs",
+  "/tests",
 ]
 
 [tool.hatch.metadata]

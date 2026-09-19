@@ -15,7 +15,6 @@
 from typing import List
 import numpy as np
 import torch
-from evo.core.trajectory import PosePath3D
 
 from depth_anything_3.utils.geometry import affine_inverse, affine_inverse_np
 
@@ -82,6 +81,8 @@ def _poses_from_ext(ext_ref, ext_est):
 
 
 def _umeyama_sim3_from_paths(pose_ref, pose_est):
+    from evo.core.trajectory import PosePath3D
+
     path_ref = PosePath3D(poses_se3=pose_ref.copy())
     path_est = PosePath3D(poses_se3=pose_est.copy())
     r, t, s = path_est.align(path_ref, correct_scale=True)
@@ -193,35 +194,6 @@ def align_poses_umeyama(
         return r, t, s, ext_est_aligned
     return r, t, s
 
-
-# def align_poses_umeyama(ext_ref: np.ndarray, ext_est: np.ndarray, return_aligned=False):
-#     """
-#     Align estimated trajectory to reference trajectory using Umeyama Sim(3)
-#     alignment (via evo PosePath3D). # noqa
-#     Returns rotation, translation, and scale.
-#     """
-#     # If input extrinsics are 3x4, convert to 4x4 by padding
-#     if ext_ref.shape[1] == 3:
-#         ext_ref_ = np.eye(4)[None].repeat(len(ext_ref), 0)
-#         ext_ref_[:, :3] = ext_ref
-#         ext_ref = ext_ref_
-#     if ext_est.shape[1] == 3:
-#         ext_est_ = np.eye(4)[None].repeat(len(ext_est), 0)
-#         ext_est_[:, :3] = ext_est
-#         ext_est = ext_est_
-
-#     # Convert to camera poses (inverse extrinsics)
-#     pose_ref = affine_inverse_np(ext_ref)
-#     pose_est = affine_inverse_np(ext_est)
-
-#     # Create evo PosePath3D objects
-#     path_ref = PosePath3D(poses_se3=pose_ref)
-#     path_est = PosePath3D(poses_se3=pose_est)
-#     r, t, s = path_est.align(path_ref, correct_scale=True)
-#     if return_aligned:
-#         return r, t, s, affine_inverse_np(np.stack(path_est.poses_se3))
-#     else:
-#         return r, t, s
 
 
 def apply_umeyama_alignment_to_ext(

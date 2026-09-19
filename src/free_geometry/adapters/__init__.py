@@ -1,14 +1,18 @@
-from .base import BaseAdapter  # noqa: F401
+"""Lazy model registry. Importing the protocol never imports a model package."""
+
+from importlib import import_module
+
+REGISTRY = {
+    "da3": ("da3", "DA3Adapter"),
+    "vggt": ("vggt", "VGGTAdapter"),
+    "omega": ("vggt_omega", "VGGTOmegaAdapter"),
+    "pi3": ("pi3", "Pi3Adapter"),
+    "dvlt": ("dvlt", "DVLTAdapter"),
+}
 
 
-def get_adapter(model_key: str, **kw) -> BaseAdapter:
-    if model_key == "omega":
-        from .vggt_omega import VGGTOmegaAdapter
-        return VGGTOmegaAdapter(**kw)
-    if model_key == "pi3":
-        from .pi3 import Pi3Adapter
-        return Pi3Adapter(**kw)
-    if model_key == "dvlt":
-        from .dvlt import DVLTAdapter
-        return DVLTAdapter(**kw)
-    raise ValueError(f"unknown model {model_key}")
+def get_adapter(config):
+    if config.name not in REGISTRY:
+        raise ValueError(f"unknown model: {config.name}")
+    module, name = REGISTRY[config.name]
+    return getattr(import_module("." + module, __name__), name)().configure(config)

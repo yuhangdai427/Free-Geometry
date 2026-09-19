@@ -1,30 +1,25 @@
 """Pi3 (original pi^3, large) adapter — LoRA r32 on the 36-block trunk decoder.
 
-Verified against /root/autodl-tmp/pi3/pi3/models/pi3.py (2026-09-17):
+Native Pi3 interface (2026-09-17):
 - trunk: even blocks frame-attn, odd blocks global; taps h34||h35 -> (B*N, 5+P, 2048)
 - 5 register tokens, NO camera token; camera branch reads PATCH tokens
 - readout (plan section 4.3): point_decoder.blocks[0].norm1(point_decoder.projects(h))
   — recomputed exactly (same frozen modules, one extra Linear pass), registers stripped
 - outputs: local_points (depth = [...,2]), conf logits (sigmoid), camera_poses c2w
-  (center = translation column), NO intrinsics -> eval uses GT-K (labeled)
+  (center = translation column), intrinsics estimated from predicted local point maps (no GT)
 - forward mirrors Pi3.forward: bf16 autocast trunk, fp32 heads
 """
-import sys
-from typing import Dict, List
 
 import torch
 
-PI3_ROOT = "/root/autodl-tmp/pi3"
-PI3_WEIGHTS = "/root/autodl-tmp/models/pi3"
 PI3_RES = 504
 PI3_PATCH = 14
 
-sys.path.insert(0, PI3_ROOT)
 
-from .base import BaseAdapter  # noqa: E402
+from .base import BaseAdapter
 
 
-def _lora_targets() -> List[str]:
+def _lora_targets() -> list[str]:
     targets = []
     for i in range(36):
         for sub in ("attn.qkv", "attn.proj", "mlp.fc1", "mlp.fc2"):
@@ -42,9 +37,11 @@ class Pi3Adapter(BaseAdapter):
 
     def _fresh_model(self):
         from pi3.models.pi3 import Pi3
+
         m = Pi3(pos_type="rope100", decoder_size="large")
         from safetensors.torch import load_file
-        m.load_state_dict(load_file(f"{PI3_WEIGHTS}/model.safetensors"))
+
+        m.load_state_dict(load_file(f"{self.weight_path}/model.safetensors"))
         m.eval()
         return m
 
@@ -56,13 +53,17 @@ class Pi3Adapter(BaseAdapter):
     def reset_student(self, device="cuda"):
         import math
 
-        import torch.nn as nn
         from peft import LoraConfig, get_peft_model
+        from torch import nn
 
         base = self._fresh_model()
-        cfg = LoraConfig(r=self.lora_rank, lora_alpha=self.lora_alpha,
-                         lora_dropout=0.0, target_modules=_lora_targets(),
-                         bias="none")
+        cfg = LoraConfig(
+            r=self.lora_rank,
+            lora_alpha=self.lora_alpha,
+            lora_dropout=self.config.dropout,
+            target_modules=_lora_targets(),
+            bias="none",
+        )
         self.net = get_peft_model(base, cfg)
         self.net.eval()
         self.model = self.net.base_model.model
@@ -88,8 +89,11 @@ class Pi3Adapter(BaseAdapter):
     def _full_forward(self, model, imgs, want_readouts):
         B, N, _, H, W = imgs.shape
         self._ph, self._pw = H // PI3_PATCH, W // PI3_PATCH
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16,
-                            enabled=imgs.is_cuda):
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.bfloat16,
+            enabled=imgs.is_cuda and getattr(self, "amp_enabled", True),
+        ):
             x = (imgs - model.image_mean) / model.image_std
             x = x.reshape(B * N, *x.shape[2:])
             hidden = model.encoder(x, is_training=True)
@@ -106,33 +110,41 @@ class Pi3Adapter(BaseAdapter):
                 # exact recompute of projects -> blocks[0].norm1 (frozen modules)
                 proj = model.point_decoder.projects(hidden)
                 phi = model.point_decoder.blocks[0].norm1(proj)
-                phi_patch = phi[:, model.patch_start_idx:]      # (B*N, P, C)
+                phi_patch = phi[:, model.patch_start_idx :]  # (B*N, P, C)
                 readouts["point_proj_ln"] = phi_patch.reshape(
-                    B, N, phi_patch.shape[1], -1).float()
+                    B, N, phi_patch.shape[1], -1
+                ).float()
 
         with torch.autocast(device_type="cuda", enabled=False):
             point_hidden = point_hidden.float()
-            ret = model.point_head([point_hidden[:, model.patch_start_idx:]], (H, W)) \
-                .reshape(B, N, H, W, -1)
+            ret = model.point_head(
+                [point_hidden[:, model.patch_start_idx :]], (H, W)
+            ).reshape(B, N, H, W, -1)
             xy, z = ret.split([2, 1], dim=-1)
             z = torch.exp(z)
             local_points = torch.cat([xy * z, z], dim=-1)
 
             conf_hidden = conf_hidden.float()
-            conf = model.conf_head([conf_hidden[:, model.patch_start_idx:]], (H, W)) \
-                .reshape(B, N, H, W, -1)
+            conf = model.conf_head(
+                [conf_hidden[:, model.patch_start_idx :]], (H, W)
+            ).reshape(B, N, H, W, -1)
 
             camera_hidden = camera_hidden.float()
             camera_poses = model.camera_head(
-                camera_hidden[:, model.patch_start_idx:], self._ph, self._pw) \
-                .reshape(B, N, 4, 4)
+                camera_hidden[:, model.patch_start_idx :], self._ph, self._pw
+            ).reshape(B, N, 4, 4)
 
-        depth = local_points[..., 2]                     # [B,N,H,W]
-        conf_sig = torch.sigmoid(conf[..., 0])           # [B,N,H,W]
-        centers = camera_poses[:, :, :3, 3]              # c2w translation
-        return {"readouts": readouts, "depth": depth, "conf": conf_sig,
-                "centers": centers, "camera_poses": camera_poses,
-                "local_points": local_points}
+        depth = local_points[..., 2]  # [B,N,H,W]
+        conf_sig = torch.sigmoid(conf[..., 0])  # [B,N,H,W]
+        centers = camera_poses[:, :, :3, 3]  # c2w translation
+        return {
+            "readouts": readouts,
+            "depth": depth,
+            "conf": conf_sig,
+            "centers": centers,
+            "camera_poses": camera_poses,
+            "local_points": local_points,
+        }
 
     @staticmethod
     def _estimate_k(local_points: torch.Tensor, conf: torch.Tensor) -> torch.Tensor:
@@ -142,9 +154,11 @@ class Pi3Adapter(BaseAdapter):
         Scale-invariant (X/Z cancels any global scale)."""
         B, N, H, W, _ = local_points.shape
         dev = local_points.device
-        ys, xs = torch.meshgrid(torch.arange(H, device=dev, dtype=torch.float32),
-                                torch.arange(W, device=dev, dtype=torch.float32),
-                                indexing="ij")
+        ys, xs = torch.meshgrid(
+            torch.arange(H, device=dev, dtype=torch.float32),
+            torch.arange(W, device=dev, dtype=torch.float32),
+            indexing="ij",
+        )
         u = xs.reshape(-1) + 0.5
         v = ys.reshape(-1) + 0.5
         K = torch.eye(3).repeat(B * N, 1, 1)
@@ -159,7 +173,7 @@ class Pi3Adapter(BaseAdapter):
                 fx, cx = torch.linalg.lstsq(A1, u[ok]).solution
                 A2 = torch.stack([yz[ok], torch.ones_like(yz[ok])], -1)
                 fy, cy = torch.linalg.lstsq(A2, v[ok]).solution
-                r = ((u - (fx * xz + cx)).abs() + (v - (fy * yz + cy)).abs())
+                r = (u - (fx * xz + cx)).abs() + (v - (fy * yz + cy)).abs()
                 ok = ok & (r < max(4.0, float(r[ok].median()) * 4))
             K[idx, 0, 0], K[idx, 0, 2] = fx, cx
             K[idx, 1, 1], K[idx, 1, 2] = fy, cy
@@ -169,29 +183,46 @@ class Pi3Adapter(BaseAdapter):
         with torch.no_grad():
             o = self._full_forward(self.teacher, images_N, want_readouts=True)
         return {
-            "readouts": {k: v[:, shared_slots].detach() for k, v in o["readouts"].items()},
+            "readouts": {
+                k: v[:, shared_slots].detach() for k, v in o["readouts"].items()
+            },
             "depth": o["depth"][0, shared_slots].detach(),
             "conf": o["conf"][0, shared_slots].detach(),
             "centers": o["centers"][0, shared_slots].detach(),
+            "ext_w2c": torch.linalg.inv(o["camera_poses"][0].float())[
+                shared_slots
+            ].detach(),
         }
 
     def forward_student(self, images_M):
         o = self._full_forward(self.model, images_M, want_readouts=True)
-        return {"readouts": o["readouts"], "depth": o["depth"][0], "conf": o["conf"][0],
-                "centers": o["centers"][0], "camera_poses": o["camera_poses"].detach()}
+        return {
+            "readouts": o["readouts"],
+            "depth": o["depth"][0],
+            "conf": o["conf"][0],
+            "centers": o["centers"][0],
+            "ext_w2c": torch.linalg.inv(o["camera_poses"][0].float()),
+        }
 
     def export_eval(self, images_eval):
         with torch.no_grad():
-            o = self._full_forward(getattr(self, "model", None) or self.teacher,
-                                   images_eval, want_readouts=False)
-        c2w = o["camera_poses"][0]                        # [N,4,4]
+            o = self._full_forward(
+                getattr(self, "model", None) or self.teacher,
+                images_eval,
+                want_readouts=False,
+            )
+        c2w = o["camera_poses"][0]  # [N,4,4]
         w2c = torch.inverse(c2w.float()).cpu()
         # K from Pi3's OWN pointmap at model resolution (2026-09-17 fix: the
         # previous GT-K was stored at native resolution and got re-scaled by
         # _prep_unposed -> 12x focal error on eth3d -> F1 collapse)
         k = self._estimate_k(o["local_points"].float(), o["conf"].float())[0].cpu()
-        return {"depth": o["depth"][0].float().cpu(), "conf": o["conf"][0].float().cpu(),
-                "extr_w2c": w2c, "intr": k}
+        return {
+            "depth": o["depth"][0].float().cpu(),
+            "conf": o["conf"][0].float().cpu(),
+            "extr_w2c": w2c,
+            "intr": k,
+        }
 
     @property
     def patch_hw(self):
