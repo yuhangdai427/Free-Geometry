@@ -298,6 +298,12 @@ def main():
     ap.add_argument("--n_pairs", type=int, default=10,
                     help="training pairs per sequence (try 20 for the "
                          "more-pairs hypothesis)")
+    ap.add_argument("--skip_base_eval", action="store_true",
+                    help="reuse baseline numbers from --base_from results "
+                         "(deterministic frozen-model eval) instead of "
+                         "re-running the baseline forward")
+    ap.add_argument("--base_from", nargs="+", default=[],
+                    help="historical results JSON(s) providing base_* values")
     ap.add_argument("--ckpt_steps", nargs="+", type=int, default=[],
                     help="steps at which to SAVE LoRA weights and run the "
                          "dual-metric eval in place (e.g. 100 120 140 160 180 200)")
@@ -327,6 +333,16 @@ def main():
                                    "image_hw": list(IMAGE_HW),
                                    "protocol": "SelfEvo eval-branch relpose-angular"})
 
+    base_hist = {}
+    for bp in args.base_from:
+        for r in json.load(open(bp)):
+            if "base_Auc_15" in r:
+                base_hist[r["seq"]] = {
+                    k[len("base_"):]: v for k, v in r.items()
+                    if k.startswith("base_")}
+    print(f"[base_from] reusable baselines: {len(base_hist)} sequences",
+          flush=True)
+
     teacher = M.load_teacher(device)
     student = M.load_student(device)
 
@@ -337,9 +353,13 @@ def main():
     for seq in seqs:
         t0 = time.time()
         # ---- baseline (zero-LoRA == frozen VGGT) ----
-        M.reset_lora_(student)
-        student.eval()
-        base_row, _, _ = eval_sequence(student, seq, device)
+        if args.skip_base_eval and seq["name"] in base_hist:
+            base_row = dict(base_hist[seq["name"]])
+            base_row["seq"] = seq["name"]
+        else:
+            M.reset_lora_(student)
+            student.eval()
+            base_row, _, _ = eval_sequence(student, seq, device)
 
         # ---- our TTA ----
         if not args.skip_tta:
