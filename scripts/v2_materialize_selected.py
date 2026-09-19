@@ -43,9 +43,11 @@ def _read_trace_dir(trace_dir, default_arm):
     arms; previously the last line's arm silently won). Whole-line (DA3)
     entries carry no arm and go to default_arm."""
     groups = {}
-    for path in sorted(os.listdir(trace_dir)):
-        if not path.endswith(".jsonl"):
-            continue
+    import glob as _glob
+    jsonls = sorted(
+        os.path.relpath(p, trace_dir)
+        for p in _glob.glob(os.path.join(trace_dir, "**", "*.jsonl"), recursive=True))
+    for path in jsonls:
         scene = path[:-len(".jsonl")]
         per_key = {}  # (arm, step) -> evaluate()-shaped entry
         with open(os.path.join(trace_dir, path)) as f:

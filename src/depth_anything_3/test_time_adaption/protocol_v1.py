@@ -1718,8 +1718,8 @@ def train_scene_c2m(
             if step % 10 == 0 or step == 1:
                 log_fn(
                     f"[{scene}] step {step}/{n_train * epochs} loss={float(loss):.4f} "
-                    f"(md={extra['maskdistill']:.4f} rot={extra.get('rel_rot', 0.0):.4f} "
-                    f"tdir={extra.get('rel_tdir', 0.0):.4f} rkd={extra.get('rkd_sh_d', 0.0) + extra.get('rkd_sh_a', 0.0):.4f} "
+                    f"(md={extra['maskdistill']:.4f} rot={extra.get('rel_rot', extra.get('v2_rel_rot', 0.0)):.4f} "
+                    f"tdir={extra.get('rel_tdir', extra.get('v2_rel_tdir', 0.0)):.4f} rkd={extra.get('rkd_sh_d', 0.0) + extra.get('rkd_sh_a', 0.0):.4f} "
                     f"cp={extra.get('couple', 0.0):.4f} ctk={extra.get('ctk', 0.0):.4f}) lr={row['lr']:.2e} "
                     f"gn={row['grad_norm']:.3f} peak={row['peak_mem_mib']:.0f}MiB")
             if early_stop and stage_cut is None and step >= es_min and len(losses) >= 20:

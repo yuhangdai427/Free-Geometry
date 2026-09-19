@@ -59,8 +59,9 @@ def replay_selector(run_dir):
     """Return {scene: select() result} from probe_trace JSONLs."""
     from free_geometry.tta_v2 import ControllerConfig, select
     out = {}
-    for path in sorted(glob.glob(os.path.join(run_dir, "probe_trace", "*.jsonl"))):
-        scene = os.path.basename(path)[:-len(".jsonl")]
+    for path in sorted(glob.glob(os.path.join(run_dir, "probe_trace", "**", "*.jsonl"),
+                                 recursive=True)):
+        scene = os.path.relpath(path, os.path.join(run_dir, "probe_trace"))[:-len(".jsonl")]
         by_step = {}
         try:
             with open(path) as f:
