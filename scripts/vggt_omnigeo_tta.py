@@ -350,7 +350,26 @@ def main():
         args.out, f"results_shard{args.shard.replace('/', '_')}.json")
     rows_path = results_path.replace(".json", ".csv")
     all_rows = []
+    # resume: a previous run of this exact shard may have flushed rows before
+    # being killed; preload them and skip the sequences already complete
+    expected_per_seq = len(args.ckpt_steps) if args.ckpt_steps else 1
+    if os.path.exists(results_path):
+        try:
+            from collections import Counter
+            old = json.load(open(results_path))
+            cnt = Counter(r["seq"] for r in old)
+            all_rows = [r for r in old if cnt[r["seq"]] >= expected_per_seq]
+            done_seqs = {s_ for s_ in cnt if cnt[s_] >= expected_per_seq}
+            print(f"[resume] preloaded {len(all_rows)} rows; "
+                  f"{len(done_seqs)} sequences already complete -> skipped",
+                  flush=True)
+        except Exception as e:
+            print(f"[resume] could not preload ({e}); starting fresh", flush=True)
+    else:
+        done_seqs = set()
     for seq in seqs:
+        if seq["name"] in done_seqs:
+            continue
         t0 = time.time()
         # ---- baseline (zero-LoRA == frozen VGGT) ----
         if args.skip_base_eval and seq["name"] in base_hist:
