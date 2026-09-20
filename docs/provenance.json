@@ -1,0 +1,98 @@
+{
+  "python": "3.11.16 (main, Aug 27 2026, 14:44:21) [GCC 14.3.0]",
+  "platform": "Linux-6.8.0-101-generic-x86_64-with-glibc2.35",
+  "torch": "2.11.0+cu128",
+  "cuda": "12.8",
+  "weights": {
+    "path": "/localhdd02/yuhang/weights/VGGT-1B/model.pt",
+    "sha256": "d15bf50a8615c8225ed48b51ea5cac673d82442ec0309036df555a053253afe0"
+  },
+  "matcher_weights": {
+    "superpoint_lightglue_v0-1_arxiv.pth": "6ff7040d0a497fc6639337946d7538dae07428c18f77a067a0b5a960e7cc551a",
+    "superpoint_v1.pth": "52b6708629640ca883673b5d5c097c4ddad37d8048b33f09c8ca0d69db12c40e"
+  },
+  "source_sha256": {
+    "src/self_geometry/__init__.py": "7d0c5bba180faa1e5bfd09b0097419540abe49dfc4f62378e1bf11c5b884d74f",
+    "src/self_geometry/aggregate.py": "c6bfd39ce57a7abf1ba5c3c91fad49f6a416d503ebfebaa180fab25ce319bbd6",
+    "src/self_geometry/benchmark.py": "112c6ce6bf3cec3e16d56b1959e23a0d23cb31890896e36c22da69822e1a9cae",
+    "src/self_geometry/cache.py": "ca0b6a9934f7a8c8dfd8982dcfcc51c9c889d136beccd4e1f336c14fd6611d1b",
+    "src/self_geometry/cli.py": "f19438bdb729d35bf5b295f0a04e4812896076809d84fed3021dcdab88953e33",
+    "src/self_geometry/common.py": "c08b4f8726b702046168a8ba40365c4dc002334be4301ee003f9d896d803d256",
+    "src/self_geometry/data.py": "608963134796340659bdcfdb1ebd696306e70c424c5ceb8f81e654ae608314f4",
+    "src/self_geometry/geometry.py": "db3902d9c13b2d63a2ce258a3bcb10391985b6907f20061ea442fd7a554e3b7f",
+    "src/self_geometry/matching.py": "964e25bb20264a3774b1737f697f9ff85052dcbe173e873180dfed99c55a7838",
+    "src/self_geometry/model.py": "b7aed088c3286aff9f81649d10fe16f34d43ffd200173061a2e05298e377b895",
+    "src/self_geometry/optimization.py": "5b5964a4478067b975fd42db0f7305cee9a6d6c602d6125f0c96c7c618f0e368",
+    "src/self_geometry/report.py": "aea10bb06dd3938634e717d2e9f263eaba38b0b129141d5119e1591ca1deed73",
+    "src/self_geometry/training.py": "d32b0392301e8d74ee4ad353d8e8a59ece5cadd3f9da054d244e6bb1042601ed",
+    "scripts/benchmark_speed.py": "8185e0126c514cc1381a2c4b24b6667d8a8847f24d8b915305583e69cd23107e",
+    "scripts/bootstrap.sh": "2cb54f3559360280d044a1e0998d80725096a7e1029a7d7fd3398df891490e15",
+    "scripts/campaign.py": "69d5dd51c2d7610f0ba5ca9bcd7cab03c693a4ea56fcbd0549fd48eb5e2679e5",
+    "scripts/check_protocol.py": "ad804639355c0c022904a75b91efc0519c1f284a0c43c17e74030a0143dd86a3",
+    "scripts/check_resume.py": "3fa18363722fe67079d2ce7c62f89c3f27ff11a6c5460a9efbdc5ce9aa2ef7e8",
+    "scripts/diagnostics/diagnose_cached_losses.py": "53fb72c64b8d697026c05efdf6645832cfc8552fa80a427b1ce930fd86380ed0",
+    "scripts/diagnostics/diagnose_hiroom.py": "6c861bfc2abcefc29554445a56b9be79821448d3daef9d293e9d62610cf80dcd",
+    "scripts/diagnostics/experiments.py": "78b95f3586a7370d092032725a54869a0d4994ef40fa9e4458fdedb36c43658e",
+    "scripts/diagnostics/run_hiroom_controls.py": "f9e4233d962be85bd01f2a5ceb3ae807a3e10515d3bdf01a4c5038d9957ae1e3",
+    "scripts/diagnostics/summarize_experiments.py": "82196074301ed59ad7d164845ce0646738748758d06b9fcb41a2301093ed0ccd",
+    "scripts/experiments.py": "5b416dee893ab50b60fcc318b5a7d36dbfedf5bead2638790754c78d70b0e371",
+    "scripts/pipeline.py": "0775412d4716cc7077a1a74190bb309c11b2af99df6ce583ac274350d93f5050",
+    "scripts/preflight.py": "f151ca4ef65188a26f802946348f718663d0367357fbcdbcfc222ecf61de1c14",
+    "scripts/run.py": "5637a4f591f8f76b95697c6e0bfdb99a21b23aa65058a91c7e417ec60793ea35",
+    "scripts/run_full.py": "40637773533748da8c3ab4d4c930cef7b0f4be000add83cdc683ca9c7a8f4edc",
+    "scripts/run_full.sh": "94f38a498afffee79ab5caaa75ca0b56f49ba19c6ad92ce54fd3adeec3e6ddea",
+    "scripts/run_seeds_separately.py": "f484506c3405ce773adf9db66f56406d981952c31a5e5a3729b23624812a0aa4",
+    "scripts/scene_worker.py": "00790d2a3040894b27b0f82b8e6165302e02f1a23a8dafe22241a6bf29f70e22",
+    "scripts/status.py": "5e06cf0e0bb5989543e2cc41c8161fcf13085b4168eea3fb4928306270a6f313",
+    "scripts/summarize_experiments.py": "42241b13e7b240246bc393a1d3352b1bf9bf6f6c7796fbee4d252175a9569bb6",
+    "scripts/summarize_full.py": "7ad1c6a4ec7a7366ec686c064687396eb1516753400cd5de29cdfd9f779c405f",
+    "scripts/summarize_seeds_separately.py": "47ef03e489c078745f34705f7558c46e95885505c87abacb0ec830f33fc5a111",
+    "scripts/validate_models.py": "27fa1625e4fbe8c81280e5d2e91838172cd9623e0bf34a0afcca741e5e005c32",
+    "scripts/validate_runtime.py": "008fcc64dfe48ae37631f7eb5fd9742e681792b3fcf4c8d680b7633ffa426183",
+    "scripts/visualize.py": "576bb3fdfec8e71d9f260e1ba0c3d394bb458e4ef5bfe6219773fc253ca80c00",
+    "configs/da3.yaml": "1b0cd4e9f3d5c3505c1f9598832ba0f56b99ab5bd34ec200a5da9b5edc7db065",
+    "configs/fast.yaml": "ab981f53c4206fcfa9f0cfd5a69214b75d7bf57fca99b44685dce9ffd95dfa47",
+    "configs/paper.yaml": "676777c31f48f193a7c081521285382e139c6901181c5f702566175afec0910a",
+    "configs/variants/bins9.yaml": "1aebae4d1a1c85cdf08d8615904672e31f2a6cd52617c07e5591527fb7e2b1f4",
+    "configs/variants/camera_lora.yaml": "04ad237da7de39eb9312d7eed46af9056d33628c90d15c286e5d4634ca51e68a",
+    "configs/variants/conflict_only.yaml": "0ccf70c2fbf60a0dbc2a883751520ea1df8bea8c135a4a12452dd62cd77621d6",
+    "configs/variants/filter95.yaml": "61a90033500b4b068174c4cf750535f7a518e920e3ec2ef16efe7df71b006e8d",
+    "configs/variants/initial_filter.yaml": "e01a8d247c17aa203a4072d2e17ff6955b93018a9de731e0cbaea9be796f966a",
+    "configs/variants/no_fan.yaml": "b31b46dd0f132b6d14a1870daae0cdca28a2960dceb53b2e39d221e16eb5b6e2",
+    "configs/variants/no_gd.yaml": "449cf5b4ad674a90d2f3d299b66a57f83032efdaad36654e5b44b1bca9ea0b3b",
+    "configs/variants/resolution518.yaml": "67049a7dfbfe69b6fba39f553495be415c0efa0712f3c75987820bf9ef80b8ce",
+    "configs/variants/reverse_gd.yaml": "642eb23dea28a90edbe48808505382eaeb623eaf92aa878ca2ecd33442734bd4",
+    "configs/variants/seed1.yaml": "adf0396d435b4047092c20dada268d22d8db7f192fe2a8a9a283c9e9dea6af54",
+    "configs/variants/seed2.yaml": "2eacfc8d68e2260b879dc8695ab65091a3dc94c8ea499c967bd73b40b471d086",
+    "tests/test_benchmark.py": "9f0ada3c0c30a349c14e5fb1cea81161873e049e258f15548e018b39a3f1376d",
+    "tests/test_core.py": "51ace18e978ed9b7a13cda91d287a32e7c41b01f6e44541163733675f1409030"
+  },
+  "benchmark_scope": {
+    "models": [
+      "da3",
+      "vggt"
+    ],
+    "datasets": {
+      "eth3d": 11,
+      "7scenes": 7,
+      "scannetpp": 20,
+      "hiroom": 30,
+      "dtu": 22
+    },
+    "seeds": [
+      0,
+      1,
+      2
+    ],
+    "sampling_seed": 42,
+    "adaptations": 540,
+    "scene_workers": 180,
+    "rng_protocol": "isolated_preparation_v2"
+  },
+  "weights_da3": {
+    "path": "/localhdd02/yuhang/weights/DA3-GIANT-1.1/model.safetensors",
+    "sha256": "1e47a08338ca73a6d6a21d37fd060b26b993b672bc6ddf6295fe474df2592001",
+    "config_sha256": "74626a50d6dee2a11820291a4305c1a34aa5adc4f7260908bbdbc9a939ba8e93",
+    "version": "DA3-GIANT-1.1"
+  }
+}

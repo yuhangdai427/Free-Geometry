@@ -1,64 +1,8 @@
-# Python cache
+.venv/
 __pycache__/
-*.py[cod]
-
-# Distribution / packaging
-workspace/
-build/
-dist/
-*.egg-info/
-.gradio/
-
-# Test/coverage
-.coverage
 .pytest_cache/
-htmlcov/
-.tox/
-gallery*/
-debug*/
-DA3HF*/
-gradio_workspace/
-eval_workspace/
-FILTER*/
-input_images*/
-*.gradio/
-
-# Jupyter notebooks
-.ipynb_checkpoints
-
-# OS files
-.DS_Store
-
-.vscode
-src/debug_main.py
-temp*.png
-/outputs
-
-# Dataset
-data/
-checkpoints/
-# Local caches, downloaded checkpoints, and external experiment repos
-/.cache/
-/Free-Geo_ckpts/
-/Test3R/
-.claude
-workspace
-results
-logs
-
-# Experiment outputs and base model weights (never track)
-/artifacts/
-/model_weights/
-
-# Reference PDFs / screenshots at repo root (docs assets stay tracked)
-/*.pdf
-/*.PDF
-/*.png
-
-# Diagnostics runtime byproducts
-diagnostics/**/__pycache__/
-
-# Local-only working notes (not for publish)
-/docs/OVERNIGHT_RUNBOOK_*.md
-/Free_Geometry_Minimal_Diagnostic_Plan.md
-.zcode/
+*.pyc
+artifacts/
+weights/
+workspace/
+*.egg-info/

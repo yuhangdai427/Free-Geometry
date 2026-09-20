@@ -1,0 +1,591 @@
+{
+  "date": "2026-09-20",
+  "tests_passed": 24,
+  "preflight": {
+    "scenes": 90,
+    "expected_scenes": 90,
+    "selected_images": 4555,
+    "failures": []
+  },
+  "standard_smoke": {
+    "adaptations": 30,
+    "failures": 0,
+    "runs": [
+      {
+        "model": "da3",
+        "dataset": "7scenes",
+        "scene": "chess",
+        "seed": 0,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 43.663217703811824
+      },
+      {
+        "model": "da3",
+        "dataset": "7scenes",
+        "scene": "chess",
+        "seed": 1,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 12.44361046422273
+      },
+      {
+        "model": "da3",
+        "dataset": "7scenes",
+        "scene": "chess",
+        "seed": 2,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 12.09702564124018
+      },
+      {
+        "model": "da3",
+        "dataset": "scannetpp",
+        "scene": "09c1414f1b",
+        "seed": 0,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 40.85778510291129
+      },
+      {
+        "model": "da3",
+        "dataset": "scannetpp",
+        "scene": "09c1414f1b",
+        "seed": 1,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 12.882882428355515
+      },
+      {
+        "model": "da3",
+        "dataset": "scannetpp",
+        "scene": "09c1414f1b",
+        "seed": 2,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 18.31699041556567
+      },
+      {
+        "model": "da3",
+        "dataset": "eth3d",
+        "scene": "courtyard",
+        "seed": 0,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 30.98482866305858
+      },
+      {
+        "model": "da3",
+        "dataset": "eth3d",
+        "scene": "courtyard",
+        "seed": 1,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 8.672557125799358
+      },
+      {
+        "model": "da3",
+        "dataset": "eth3d",
+        "scene": "courtyard",
+        "seed": 2,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 9.667886040173471
+      },
+      {
+        "model": "da3",
+        "dataset": "hiroom",
+        "scene": "20241230/828738/cam_sampled_08",
+        "seed": 0,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 37.65672669932246
+      },
+      {
+        "model": "da3",
+        "dataset": "hiroom",
+        "scene": "20241230/828738/cam_sampled_08",
+        "seed": 1,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 15.081628561019897
+      },
+      {
+        "model": "da3",
+        "dataset": "hiroom",
+        "scene": "20241230/828738/cam_sampled_08",
+        "seed": 2,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 11.658248420804739
+      },
+      {
+        "model": "da3",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seed": 0,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 30.443039041012526
+      },
+      {
+        "model": "da3",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seed": 1,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 10.68465872388333
+      },
+      {
+        "model": "da3",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seed": 2,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 17.49631405621767
+      },
+      {
+        "model": "vggt",
+        "dataset": "7scenes",
+        "scene": "chess",
+        "seed": 0,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 26.50658282265067
+      },
+      {
+        "model": "vggt",
+        "dataset": "7scenes",
+        "scene": "chess",
+        "seed": 1,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 11.437449674122036
+      },
+      {
+        "model": "vggt",
+        "dataset": "7scenes",
+        "scene": "chess",
+        "seed": 2,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 10.942708817310631
+      },
+      {
+        "model": "vggt",
+        "dataset": "scannetpp",
+        "scene": "09c1414f1b",
+        "seed": 0,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 25.86099452804774
+      },
+      {
+        "model": "vggt",
+        "dataset": "scannetpp",
+        "scene": "09c1414f1b",
+        "seed": 1,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 12.532810030505061
+      },
+      {
+        "model": "vggt",
+        "dataset": "scannetpp",
+        "scene": "09c1414f1b",
+        "seed": 2,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 12.359037147834897
+      },
+      {
+        "model": "vggt",
+        "dataset": "eth3d",
+        "scene": "courtyard",
+        "seed": 0,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 41.66231045499444
+      },
+      {
+        "model": "vggt",
+        "dataset": "eth3d",
+        "scene": "courtyard",
+        "seed": 1,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 13.912062836810946
+      },
+      {
+        "model": "vggt",
+        "dataset": "eth3d",
+        "scene": "courtyard",
+        "seed": 2,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 13.220014793798327
+      },
+      {
+        "model": "vggt",
+        "dataset": "hiroom",
+        "scene": "20241230/828738/cam_sampled_08",
+        "seed": 0,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 22.6088802292943
+      },
+      {
+        "model": "vggt",
+        "dataset": "hiroom",
+        "scene": "20241230/828738/cam_sampled_08",
+        "seed": 1,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 10.083293008618057
+      },
+      {
+        "model": "vggt",
+        "dataset": "hiroom",
+        "scene": "20241230/828738/cam_sampled_08",
+        "seed": 2,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 10.567648376338184
+      },
+      {
+        "model": "vggt",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seed": 0,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 25.715180939994752
+      },
+      {
+        "model": "vggt",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seed": 1,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 10.491313337348402
+      },
+      {
+        "model": "vggt",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seed": 2,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 10.452187908813357
+      }
+    ]
+  },
+  "fast_smoke": {
+    "adaptations": 6,
+    "failures": 0,
+    "runs": [
+      {
+        "model": "da3",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seed": 0,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 20.758623628877103
+      },
+      {
+        "model": "da3",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seed": 1,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 7.975256708450615
+      },
+      {
+        "model": "da3",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seed": 2,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 9.23505514767021
+      },
+      {
+        "model": "vggt",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seed": 0,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 23.074562462046742
+      },
+      {
+        "model": "vggt",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seed": 1,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 9.278978836722672
+      },
+      {
+        "model": "vggt",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seed": 2,
+        "baseline": true,
+        "adapted": true,
+        "exit_code": 0,
+        "seconds": 9.586084543727338
+      }
+    ]
+  },
+  "model_validation": {
+    "da3": {
+      "passed": true,
+      "baseline_max_abs_error": {
+        "depth": 0.0,
+        "conf": 0.0,
+        "extrinsics": 0.0,
+        "intrinsics": 0.0
+      },
+      "zero_lora_exact": true,
+      "modules": 40,
+      "parameters": 15728640,
+      "finite_nonzero_gradients": true,
+      "optimized_load_seconds": 6.722693360410631
+    },
+    "vggt": {
+      "passed": true,
+      "baseline_max_abs_error": {
+        "depth": 0.0,
+        "conf": 0.0,
+        "extrinsics": 0.0,
+        "intrinsics": 0.0
+      },
+      "zero_lora_exact": true,
+      "modules": 72,
+      "parameters": 18874368,
+      "finite_nonzero_gradients": true,
+      "optimized_load_seconds": 4.646820449270308
+    }
+  },
+  "speed_microbenchmark": {
+    "da3": {
+      "views": 13,
+      "input_shape": [
+        13,
+        3,
+        378,
+        504
+      ],
+      "profiles": [
+        {
+          "checkpointing": true,
+          "fused_optimizer": false,
+          "step_seconds": [
+            2.7870977111160755,
+            2.7864900669083,
+            2.777786837890744
+          ],
+          "mean_seconds": 2.7837915386383734,
+          "peak_gib": 21.173367500305176
+        },
+        {
+          "checkpointing": false,
+          "fused_optimizer": true,
+          "step_seconds": [
+            2.0205899430438876,
+            2.02088619209826,
+            2.0175549453124404
+          ],
+          "mean_seconds": 2.019677026818196,
+          "peak_gib": 52.16537523269653
+        }
+      ],
+      "measured_speedup": 1.3783350019205622
+    },
+    "vggt": {
+      "views": 13,
+      "input_shape": [
+        13,
+        3,
+        378,
+        504
+      ],
+      "profiles": [
+        {
+          "checkpointing": true,
+          "fused_optimizer": false,
+          "step_seconds": [
+            2.5127961402758956,
+            2.520024785771966,
+            2.534866003319621
+          ],
+          "mean_seconds": 2.5225623097891607,
+          "peak_gib": 16.083611488342285
+        },
+        {
+          "checkpointing": false,
+          "fused_optimizer": true,
+          "step_seconds": [
+            1.7562948577106,
+            1.7428040727972984,
+            1.74446467962116
+          ],
+          "mean_seconds": 1.747854536709686,
+          "peak_gib": 45.81184101104736
+        }
+      ],
+      "measured_speedup": 1.4432335510813459
+    }
+  },
+  "dtu_split_evaluation": {
+    "passed": true,
+    "model": "da3",
+    "scene": "scan1",
+    "frames": 6,
+    "all_metrics_identical": true,
+    "max_abs_difference": 0.0
+  },
+  "da3_full_scene": {
+    "identity": "67939b9f7ff330418cdc98044a99b9a840ab80610696ac5a7a0e0b177d07b5e0",
+    "config": {
+      "model": "da3",
+      "weights": "/localhdd02/yuhang/weights/DA3-GIANT-1.1/model.safetensors",
+      "data_root": "/localhdd02/yuhang/datasets/DA3-BENCH",
+      "image_size": 504,
+      "max_frames": 100,
+      "seed": 0,
+      "rng_protocol": "isolated_preparation_v2",
+      "iterations": 50,
+      "lr": 5e-05,
+      "final_lr": 1e-08,
+      "warmup_fraction": 0.05,
+      "weight_decay": 0.05,
+      "clip": 5.0,
+      "rank": 64,
+      "alpha": 64.0,
+      "dropout": 0.1,
+      "camera_lora": false,
+      "bin_width": 15,
+      "bins_compat9": false,
+      "fan": true,
+      "filter_keep": 0.9,
+      "filter_each_step": true,
+      "gd": "mvc_orthogonal_ec",
+      "keypoints": 2048,
+      "precision": "bf16",
+      "checkpointing": false,
+      "checkpoint_every": 25,
+      "threads": 4,
+      "ref_view_strategy": "first",
+      "fused_optimizer": true
+    },
+    "updates": 50,
+    "selected_updates": 46,
+    "selected_iteration": 47,
+    "score": 0.9617859912992165,
+    "seconds": 117.97048048395663,
+    "peak_gib": 47.23255014419556
+  },
+  "resume_checks": {
+    "da3": {
+      "passed": true,
+      "updates": 6,
+      "interruption_after": 5,
+      "parameter_tensors": 80,
+      "max_parameter_difference": 5.4424162954092026e-09,
+      "absolute_tolerance": 1e-07,
+      "loss_history_equal": true
+    },
+    "vggt": {
+      "passed": true,
+      "updates": 6,
+      "interruption_after": 5,
+      "parameter_tensors": 144,
+      "max_parameter_difference": 3.725290298461914e-09,
+      "absolute_tolerance": 1e-07,
+      "loss_history_equal": true
+    }
+  },
+  "da3_full_scene_metrics": {
+    "baseline": {
+      "auc30": 0.9426268373636796,
+      "auc15": 0.8852536747273589,
+      "auc05": 0.6785206258890469,
+      "auc03": 0.5225225225225225,
+      "auc01": 0.12944523470839261,
+      "recon_unposed_acc": 0.1999633079292316,
+      "recon_unposed_comp": 0.16434918533288292,
+      "recon_unposed_overall": 0.18215624663105726,
+      "recon_unposed_precision": 0.6874962589411306,
+      "recon_unposed_recall": 0.8184106662830737,
+      "recon_unposed_fscore": 0.7472630106450456,
+      "recon_posed_acc": 0.1670816391657743,
+      "recon_posed_comp": 0.14705170038017887,
+      "recon_posed_overall": 0.15706666977297656,
+      "recon_posed_precision": 0.8007127834775108,
+      "recon_posed_recall": 0.878867022089563,
+      "recon_posed_fscore": 0.8379715655444299
+    },
+    "adapted": {
+      "auc30": 0.9434803224276908,
+      "auc15": 0.8869606448553817,
+      "auc05": 0.6842105263157895,
+      "auc03": 0.5282124229492651,
+      "auc01": 0.12944523470839261,
+      "recon_unposed_acc": 0.19553669919316416,
+      "recon_unposed_comp": 0.1631764169762648,
+      "recon_unposed_overall": 0.17935655808471448,
+      "recon_unposed_precision": 0.7054166603685174,
+      "recon_unposed_recall": 0.8308152550144297,
+      "recon_unposed_fscore": 0.7629979779835562,
+      "recon_posed_acc": 0.16332868035936043,
+      "recon_posed_comp": 0.14364074327095208,
+      "recon_posed_overall": 0.15348471181515627,
+      "recon_posed_precision": 0.8227665389175108,
+      "recon_posed_recall": 0.8979110663585935,
+      "recon_posed_fscore": 0.8586979664968049
+    }
+  }
+}

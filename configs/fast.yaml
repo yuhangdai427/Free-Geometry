@@ -1,0 +1,6 @@
+# Faster at the cost of activation memory. Validated on the local 96 GB GPU.
+checkpointing: false
+fused_optimizer: true
+# Same optimization trajectory; fewer large writes to the network filesystem.
+# A crash can replay at most 24 iterations instead of the default four.
+checkpoint_every: 25

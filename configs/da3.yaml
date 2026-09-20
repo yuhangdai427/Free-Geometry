@@ -1,0 +1,2 @@
+model: da3
+weights: /localhdd02/yuhang/weights/DA3-GIANT-1.1/model.safetensors
