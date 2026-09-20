@@ -30,6 +30,7 @@ def main(argv=None):
     p.add_argument('--dry-run', action='store_true')
     p.add_argument('--protocol', choices=['custom', 'paper'], default='custom')
     p.add_argument('--eval-workers', type=int, default=2)
+    p.add_argument('--gpu-workers', type=int, default=2, help='Concurrent scene processes, subject to GPU memory admission')
     p.add_argument('--reuse-model-root', type=Path, help='Reuse compatible frozen baselines from another matrix')
     p.add_argument('--da3-weights', type=Path)
     p.add_argument('--vggt-weights', type=Path)
@@ -37,7 +38,7 @@ def main(argv=None):
     for key in ('models','methods','datasets','seeds'):
         if len(set(getattr(a,key))) != len(getattr(a,key)):
             p.error('Duplicate ' + key)
-    if any(s < 0 or s >= 2**32 for s in a.seeds) or a.eval_workers < 1:
+    if any(s < 0 or s >= 2**32 for s in a.seeds) or min(a.eval_workers, a.gpu_workers) < 1:
         p.error('Invalid seed or worker count')
     if any(s.split('=')[0] in ('method','model','seed') for s in a.set):
         p.error('Use --methods/--models/--seeds')
@@ -93,7 +94,8 @@ def main(argv=None):
         write_json(cfg, dict(c, method=method))
         cmd = [sys.executable, str(ROOT/'scripts/run_full.py'), '--root', str(root/method),
                '--config', str(cfg), '--models', *a.models, '--datasets', *a.datasets,
-               '--seeds', *map(str,a.seeds), '--eval-workers', str(a.eval_workers)]
+               '--seeds', *map(str,a.seeds), '--eval-workers', str(a.eval_workers),
+               '--gpu-workers', str(a.gpu_workers)]
         if method != 'baseline' and 'baseline' in a.methods:
             cmd += ['--reuse-model-root', str(root/'baseline')]
         elif a.reuse_model_root:

@@ -59,6 +59,18 @@ def main(argv=None):
     p.add_argument('--reuse-from', type=Path)
     a = p.parse_args(argv)
     c = config(a.config)
+    from self_geometry.gpu_queue import reservation, reserve_gpu
+    source_protocol = None
+    if a.reuse_from:
+        stamp = a.reuse_from/a.dataset/a.scene/'baseline/protocol.json'
+        if stamp.exists():
+            source_protocol = json.loads(stamp.read_text())
+    with reserve_gpu(reservation(c, source_protocol)):
+        return run_scene(a, c)
+
+
+def run_scene(a, c):
+    import torch
     root = a.root.resolve()
     os.environ['TORCH_HOME'] = str(ROOT / 'weights')
     os.environ['HF_HUB_OFFLINE'] = '1'

@@ -4,6 +4,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -12,7 +13,7 @@ import threading
 import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from self_geometry import ROOT
-from self_geometry.benchmark import DATASETS, SEEDS
+from self_geometry.benchmark import DATASETS, SEEDS, metrics_for
 from self_geometry.common import config, write_json
 from self_geometry.data import dataset
 from self_geometry.cache import copy_cached
@@ -31,6 +32,14 @@ def build_plan(configs, names, seeds, first_only=False):
                 scene_workers=len(jobs) // len(seeds), schema=2)
 
 
+def metrics_complete(directory, name):
+    try:
+        metrics = json.loads((directory / "metrics.json").read_text())
+        return all(math.isfinite(float(metrics[k])) for k in metrics_for(name))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--root', type=Path, default=ROOT / 'artifacts/full_dual')
@@ -44,6 +53,7 @@ def main(argv=None):
     p.add_argument('--first-only', action='store_true')
     p.add_argument('--dry-run', action='store_true')
     p.add_argument('--eval-workers', type=int, default=2)
+    p.add_argument('--gpu-workers', type=int, default=2)
     p.add_argument('--skip-evaluation', action='store_true')
     p.add_argument('--no-reuse', action='store_true')
     p.add_argument('--reuse-model-root', type=Path, help='Import frozen baselines from ROOT/MODEL/seed_FIRST')
@@ -52,7 +62,7 @@ def main(argv=None):
     for label, values in [('models', a.models), ('datasets', a.datasets), ('seeds', a.seeds)]:
         if len(set(values)) != len(values):
             p.error(f'Duplicate {label}')
-    if any(s < 0 or s >= 2**32 for s in a.seeds) or a.eval_workers < 1:
+    if any(s < 0 or s >= 2**32 for s in a.seeds) or min(a.eval_workers, a.gpu_workers) < 1:
         p.error('Invalid seed or eval worker count')
     if any(x.split('=')[0] in ('model', 'seed') for x in a.set):
         p.error('Use --models and --seeds')
@@ -97,7 +107,8 @@ def main(argv=None):
         return 0
     state_path = root / 'suite.json'
     state = json.loads(state_path.read_text()) if state_path.exists() else {'jobs': {}}
-    state.update(pid=os.getpid(), started=time.time(), status='running', active=[])
+    state.update(pid=os.getpid(), started=time.time(), status='running', active=[],
+                 gpu_workers=a.gpu_workers, eval_workers=a.eval_workers)
     mutex = threading.Lock()
     failures = []
 
@@ -147,39 +158,49 @@ def main(argv=None):
     for model, c in configs.items():
         for seed in a.seeds:
             write_json(root / model / f'config_seed_{seed}.json', dict(c, seed=seed))
-    with ThreadPoolExecutor(max_workers=a.eval_workers) as pool:
+    def process_scene(item, pool):
+        model, name, scene = (item[k] for k in ('model', 'dataset', 'scene'))
+        c = configs[model]
+        env = dict(os.environ, HF_HUB_OFFLINE='1', PYTHONUNBUFFERED='1',
+                   TORCH_HOME=str(ROOT / 'weights'), OMP_NUM_THREADS=str(c['threads']),
+                   OPENBLAS_NUM_THREADS=str(c['threads']), MKL_NUM_THREADS=str(c['threads']),
+                   LOKY_MAX_CPU_COUNT=str(c['threads']), PYTORCH_ALLOC_CONF='expandable_segments:True')
+        run(f'{model}/{name}/{scene}/adapt_all_seeds', item['command'],
+            root / model / 'workers' / name / scene / 'worker.log', env)
+        if a.skip_evaluation:
+            return []
+        available = [s for s in a.seeds if (root / model / f'seed_{s}' / name / scene / 'baseline/protocol.json').exists()]
+        stages = ([(available[0], 'baseline')] if available else []) + ([(s, 'adapted') for s in a.seeds] if c.get('method') != 'baseline' else [])
         pending = []
-        for item in commands:
-            model, name, scene = (item[k] for k in ('model', 'dataset', 'scene'))
-            # Bound the CPU queue without idling the GPU at dataset boundaries.
-            # DTU fusion still runs serially on this thread; only scoring joins
-            # the CPU pool. Evaluation math and scene sampling are unchanged.
-            while len(pending) >= 2 * a.eval_workers:
-                pending.pop(0).result()
-            c = configs[model]
-            env = dict(os.environ, HF_HUB_OFFLINE='1', PYTHONUNBUFFERED='1',
-                       TORCH_HOME=str(ROOT / 'weights'), OMP_NUM_THREADS=str(c['threads']),
-                       OPENBLAS_NUM_THREADS=str(c['threads']), MKL_NUM_THREADS=str(c['threads']),
-                       LOKY_MAX_CPU_COUNT=str(c['threads']), PYTORCH_ALLOC_CONF='expandable_segments:True')
-            run(f'{model}/{name}/{scene}/adapt_all_seeds', item['command'],
-                root / model / 'workers' / name / scene / 'worker.log', env)
-            if a.skip_evaluation:
+        for seed, stage in stages:
+            folder = root/model/f'seed_{seed}'
+            directory = folder/name/scene
+            # In particular, never redo GPU TSDF fusion for imported DTU metrics.
+            if metrics_complete(directory/stage, name):
+                if stage == 'baseline':
+                    for other in available:
+                        if other != seed:
+                            copy_cached(directory/'baseline/metrics.json',
+                                        root/model/f'seed_{other}'/name/scene/'baseline/metrics.json')
                 continue
-            available = [s for s in a.seeds if (root / model / f'seed_{s}' / name / scene / 'baseline/protocol.json').exists()]
-            stages = ([(available[0], 'baseline')] if available else []) + ([(s, 'adapted') for s in a.seeds] if c.get('method') != 'baseline' else [])
-            for seed, stage in stages:
-                if name == 'dtu':
-                    folder = root/model/f'seed_{seed}'
-                    directory = folder/name/scene
-                    if not (directory/stage/'exports/mini_npz/results.npz').exists():
-                        continue
-                    cmd = [sys.executable, str(ROOT/'scripts/run.py'), 'fuse',
-                           '--config', str(root/model/f'config_seed_{seed}.json'),
-                           '--output', str(folder), '--dataset', name, '--scene', scene, '--stage', stage]
-                    if run(f'{model}/{name}/{scene}/seed_{seed}/{stage}_fuse', cmd,
-                           directory/f'fuse_{stage}.log', env):
-                        continue
-                pending.append(pool.submit(evaluate, item, seed, stage, env))
+            if name == 'dtu':
+                if not (directory/stage/'exports/mini_npz/results.npz').exists():
+                    continue
+                cmd = [sys.executable, str(ROOT/'scripts/run.py'), 'fuse',
+                       '--config', str(root/model/f'config_seed_{seed}.json'),
+                       '--output', str(folder), '--dataset', name, '--scene', scene, '--stage', stage]
+                if run(f'{model}/{name}/{scene}/seed_{seed}/{stage}_fuse', cmd,
+                       directory/f'fuse_{stage}.log', env):
+                    continue
+            pending.append(pool.submit(evaluate, item, seed, stage, env))
+        return pending
+
+    # Separate CPU evaluation and scene queues. Cross-process GPU admission
+    # limits memory use even when several method runners share the same card.
+    with ThreadPoolExecutor(max_workers=a.eval_workers) as pool:
+        with ThreadPoolExecutor(max_workers=a.gpu_workers) as gpu_pool:
+            scenes = [gpu_pool.submit(process_scene, item, pool) for item in commands]
+            pending = [future for scene in scenes for future in scene.result()]
         for future in pending:
             future.result()
     state.update(status='finished_with_failures' if failures else ('training_only' if a.skip_evaluation else 'complete'),

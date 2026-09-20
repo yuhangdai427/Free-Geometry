@@ -179,6 +179,15 @@ def test_dual_plan_540_adaptations_180_shared_workers(monkeypatch):
     assert configs['vggt']['weights'].endswith('model.pt')
 
 
+def test_completed_dtu_metrics_skip_fusion_but_partial_metrics_do_not(tmp_path):
+    runner = script('run_full')
+    assert not runner.metrics_complete(tmp_path, 'dtu')
+    write_json(tmp_path/'metrics.json', {k: 0.0 for k in metrics_for('dtu')})
+    assert runner.metrics_complete(tmp_path, 'dtu')
+    write_json(tmp_path/'metrics.json', {'auc03': 1.0})
+    assert not runner.metrics_complete(tmp_path, 'dtu')
+
+
 def test_lora_reset_preserves_base_and_changes_seed_initialization():
     import torch
     from torch import nn
@@ -237,6 +246,8 @@ def test_json_config_roundtrip_scientific_notation(tmp_path):
 def test_shared_worker_continues_and_loads_model_once(tmp_path, monkeypatch, method):
     import torch
     worker = script('scene_worker')
+    from contextlib import nullcontext
+    monkeypatch.setattr('self_geometry.gpu_queue.reserve_gpu', lambda *a: nullcontext())
     cfg = tmp_path / 'config.json'
     write_json(cfg, dict(config(model='da3'), method=method))
     loaded, seen = [], []

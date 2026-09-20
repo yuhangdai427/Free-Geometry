@@ -66,7 +66,7 @@ bash scripts/run_comparison.sh --config configs/comparison_fast.yaml --root arti
 .venv/bin/python scripts/summarize_comparison.py --root artifacts/comparison_fast
 ```
 
-模型、RGB、baseline 和评测缓存跨 seed 共用，适配参数和优化器独立重置。CPU 评测与 GPU 训练重叠；DTU GPU 融合串行，CPU 距离评测并行。单场景/seed 失败记日志后继续，有限退化照实保留。重跑相同命令恢复 `last.pt` 并跳过完成任务；改变配置需换 root。
+模型、RGB、baseline 和评测缓存跨 seed 共用，适配参数和优化器独立重置。CPU 评测与 GPU 训练重叠；DTU GPU 融合独占 GPU，CPU 距离评测并行；已有完整且有限的缓存指标时跳过重复融合。单场景/seed 失败记日志后继续，有限退化照实保留。重跑相同命令恢复 `last.pt` 并跳过完成任务；改变配置需换 root。
 
 每数据集先对全部场景等权平均，再跨 seed 计算均值和样本标准差。缺场景不输出完整跨 seed 均值；缩帧/首场景调试不算全量复现。原始配置、训练状态、完整失败列表均落盘。全量命令已准备，不自动占用 GPU 启动 1620 次训练。
 
@@ -74,12 +74,24 @@ bash scripts/run_comparison.sh --config configs/comparison_fast.yaml --root arti
 
 ## 接续当前验证
 
-`queue_comparison.py` 在前一 matrix 的训练和评测进程结束后启动命令；前一轮个别场景失败仍继续后续方法。当前 Test3R 双模型、五个首场景、seed 0 的上限验证单独保存至 `artifacts/paper_protocol_test3r_1000`，复用 `artifacts/paper_protocol_first/baseline`。分别查看两个 root 的 `SELECTED_RESULTS.md`，不会把旧的未设上限记录改成新协议。
+本轮仅双模型、五个首场景、seed 0，检查数据加载、训练及完整评测。Test3R 上限验证保存至 `artifacts/paper_protocol_test3r_1000`，复用 `artifacts/paper_protocol_first/baseline`。原先等待整轮结束的队列已取消，Test3R runner 立即加入共享 GPU 调度；分别查看两个 root 的 `SELECTED_RESULTS.md`。
 
 ```bash
-.venv/bin/python scripts/queue_comparison.py \
-  --after artifacts/paper_protocol_first --root artifacts/paper_protocol_test3r_1000 -- \
-  bash scripts/run_paper_comparison.sh --root artifacts/paper_protocol_test3r_1000 \
+bash scripts/run_paper_comparison.sh --root artifacts/paper_protocol_test3r_1000 \
   --methods test3r --seeds 0 --first-only \
-  --reuse-model-root artifacts/paper_protocol_first/baseline
+  --reuse-model-root artifacts/paper_protocol_first/baseline \
+  --gpu-workers 2 --eval-workers 2
 ```
+
+## 单卡并发
+
+`run_full.py` 默认两个场景进程、两个 CPU 评测进程；显存准入文件
+`artifacts/gpu_admission.json` 由进程锁保护，跨方法 runner 共用，按先到顺序调度。
+本机 96 GiB 卡预留 90 GiB 预算：已知 504 分辨率、至多 100 帧、pair batch 至多 2
+的 Test3R 根据缓存 baseline 的实际图像尺寸申请显存；378×504 时 DA3 42 GiB、
+VGGT 38 GiB，方形输入相应增加。它们依据既往实测峰值加余量，仍需监控实际峰值。
+未知配置、Self-Geometry、TCO 和 DTU 融合申请全部预算。这样两个适合的 Test3R
+场景可同时训练，高显存任务不会与它们重叠；CPU 指标计算独立并行。
+这是单张卡的吞吐优化，不保证两倍加速，不改变 seed、输入、更新数和指标。
+`--gpu-workers 1` 可关闭同一 runner 内的场景并发。未使用此准入器的外部 GPU
+进程不在调度范围内。`queue_comparison.py` 仍可用于需要整轮顺序执行的任务。

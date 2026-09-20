@@ -8,6 +8,7 @@
 它固定检查最多 100 帧、Self-Geometry 50 步和完整 AUC / posed+unposed 重建评测，拒绝 3 帧 / 2 步或跳过评测的 smoke 配置。
 训练与评测使用同一场景帧列表；三 seed 指训练随机性，抽帧仍是官方 seed 42。
 Test3R 按用户要求，每场景从有序 N³ 总体无放回抽取最多 **1000 个三元组**，固定顺序跑 **2 epochs**；100 帧时累积 4 个后更新，共 **500 次更新**。这是额外 Test3R 对照的预算变体，Self-Geometry 的 50 步与所有方法的完整评测不变。`--set test3r_max_triplets=null` 可在另一个 root 恢复 Test3R 全遍历。
+本轮 smoke 只用 seed 0、每数据集首场景；全量三 seed 命令留待正式实验。单卡调度支持 `--gpu-workers 2 --eval-workers 2`：Test3R 按显存预算并发，其余未知/大显存训练独占 GPU，CPU 评测同时进行。
 具体对应和实物输出审计见 [train/eval 协议](docs/protocol_alignment_audit.md)。
 
 ```bash

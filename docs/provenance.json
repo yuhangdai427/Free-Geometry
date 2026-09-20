@@ -21,6 +21,7 @@
     "src/self_geometry/comparisons.py": "9e6d547a5c78d6e553ec4c9f6a40b252e3875aaf4fdcfa137e0efbcf64455b18",
     "src/self_geometry/data.py": "608963134796340659bdcfdb1ebd696306e70c424c5ceb8f81e654ae608314f4",
     "src/self_geometry/geometry.py": "db3902d9c13b2d63a2ce258a3bcb10391985b6907f20061ea442fd7a554e3b7f",
+    "src/self_geometry/gpu_queue.py": "696cbb8bdffd2cfb73a1aaa169cdf0411ede46a9769ebd334352709f16c8a805",
     "src/self_geometry/matching.py": "964e25bb20264a3774b1737f697f9ff85052dcbe173e873180dfed99c55a7838",
     "src/self_geometry/model.py": "fb3687f35e11a809cd0e7c7d29882dde8b6e2a068c14166f318283755fecdcfc",
     "src/self_geometry/optimization.py": "5b5964a4478067b975fd42db0f7305cee9a6d6c602d6125f0c96c7c618f0e368",
@@ -46,14 +47,14 @@
     "scripts/pipeline.py": "0775412d4716cc7077a1a74190bb309c11b2af99df6ce583ac274350d93f5050",
     "scripts/preflight.py": "f151ca4ef65188a26f802946348f718663d0367357fbcdbcfc222ecf61de1c14",
     "scripts/queue_comparison.py": "d4585fc51651ed730bdb1fa8d777390b20800fb35685de41dd7085fd89a70f51",
-    "scripts/run.py": "5637a4f591f8f76b95697c6e0bfdb99a21b23aa65058a91c7e417ec60793ea35",
-    "scripts/run_comparison.py": "ffe05ed2f277a00d5a68d0e832dba437959748265b2932abca38154691052e41",
+    "scripts/run.py": "b3d07d918ae7192e1833888922eb435e262923be18d96ba17885c78444ec4083",
+    "scripts/run_comparison.py": "dcb8a7d4be93b08e45b4d30acbb1c9ae91b59c0b60e92c58d9bd06545995c4e9",
     "scripts/run_comparison.sh": "68045f746f6bcfa2a143501a0352f4761bf97c830707857de9d1498a876b63af",
-    "scripts/run_full.py": "0b040584a685a2c437f3d6343bd7de16036a345404590763c240f694ebc51f93",
+    "scripts/run_full.py": "1057b4734703cde6484913380f007efd2c0fffbbe856e0b6d4f695bab4572cc7",
     "scripts/run_full.sh": "94f38a498afffee79ab5caaa75ca0b56f49ba19c6ad92ce54fd3adeec3e6ddea",
     "scripts/run_paper_comparison.sh": "f0285285c97c98f09504dd82d2da16b762c7836abd5e8ed82210ce0bca71a37a",
     "scripts/run_seeds_separately.py": "f484506c3405ce773adf9db66f56406d981952c31a5e5a3729b23624812a0aa4",
-    "scripts/scene_worker.py": "f86c61d3dcd3889274f88041a458914c1ddaf7598602eca7af01deeb3cd5838e",
+    "scripts/scene_worker.py": "d1ed029e6acf23a6fe599ff73c039842c13f07c2f4ebbd613b564862310cc699",
     "scripts/status.py": "5e06cf0e0bb5989543e2cc41c8161fcf13085b4168eea3fb4928306270a6f313",
     "scripts/status_comparison.py": "293a6abe21fd5b0b29ea905585e5b25647ee5db8f7bc84bba166f01ab12a3f43",
     "scripts/summarize_comparison.py": "df895b9bf2c69d98d58e28b613c66f560b0c767c4679ecde530e634270390e83",
@@ -152,6 +153,15 @@
     "gsplat": "1.5.3",
     "formal_entrypoint": "scripts/run_paper_comparison.sh",
     "test3r_max_triplets": 1000,
-    "test3r_schedule": "User-requested per-scene cap; two epochs reuse up to 1000 ordered triplets sampled without replacement, accumulation 4"
+    "test3r_schedule": "User-requested per-scene cap; two epochs reuse up to 1000 ordered triplets sampled without replacement, accumulation 4",
+    "runtime_parallelism": {
+      "gpu_workers": 2,
+      "eval_workers": 2,
+      "gpu_admission_gib": 90,
+      "scope": "local 96 GiB card; Test3R empirical memory reservations; other schedules exclusive",
+      "current_validation_seeds": [
+        0
+      ]
+    }
   }
 }
