@@ -2,24 +2,25 @@
 
 独立实现 [Self-Geometry 正文与附录](https://arxiv.org/abs/2608.10708v2) 的几何测试时适配，使用本地模型和 DA3 benchmark。支持 **2 模型 × 5 数据集 × 3 seed**，每场景 50 步。作者训练代码尚未公开，公式映射和固定假设见 [方法说明](docs/method.md)。单场景退化保留，进程失败记录后继续其余任务。
 
-新增 **双模型 × baseline / Test3R / Self-Geometry / TCO × 五数据集 × 三 seed** 统一入口，2160 个场景结果格。方法来源、移植细节、原版和快速日程区别见 [对比方法说明](docs/comparisons.md)。
+当前默认 **双模型 × baseline / Self-Geometry / TCO × 五数据集 × 三 seed（0、1、2）**，共 1620 个场景结果格。Test3R 已按用户要求停止，保留代码与已完成结果，但不再默认运行。方法来源、移植细节、原版和快速日程区别见 [对比方法说明](docs/comparisons.md)。
 
-**正式对齐原论文的入口**：`bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_50updates`。
+**正式对齐原论文的入口**：`bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_without_test3r`。
 它固定检查最多 100 帧、Self-Geometry 50 步和完整 AUC / posed+unposed 重建评测，拒绝 3 帧 / 2 步或跳过评测的 smoke 配置。
 训练与评测使用同一场景帧列表；三 seed 指训练随机性，抽帧仍是官方 seed 42。
-Test3R 按用户最新要求，与 Self-Geometry 同为 **50 次优化器更新**；每次累积 4 个三元组，共处理 **200 次三元组**，达到预算即停止。仍从有序 N³ 总体无放回抽取最多 1000 个三元组，按固定顺序取前缀训练。该额外对照对齐更新次数，不表示两种方法每步计算量相同。训练/评测帧数、Self-Geometry 50 步与完整评测不变。`--set test3r_max_updates=null --set test3r_max_triplets=null` 可在另一个 root 恢复 Test3R 全遍历。
-本轮 smoke 只用 seed 0、每数据集首场景；全量三 seed 命令留待正式实验。单卡调度支持 `--gpu-workers 2 --eval-workers 2`：Test3R 按显存预算并发，其余未知/大显存训练独占 GPU，CPU 评测同时进行。
+可选 Test3R 代码保留的设置为：与 Self-Geometry 同为 **50 次优化器更新**；每次累积 4 个三元组，共处理 **200 次三元组**，达到预算即停止。仍从有序 N³ 总体无放回抽取最多 1000 个三元组，按固定顺序取前缀训练。该额外对照对齐更新次数，不表示两种方法每步计算量相同。训练/评测帧数、Self-Geometry 50 步与完整评测不变。`--set test3r_max_updates=null --set test3r_max_triplets=null` 可在另一个 root 恢复 Test3R 全遍历。
+本轮 smoke 只用 seed 0、每数据集首场景；全量三 seed 命令留待正式实验。单卡调度默认 `--gpu-workers 2 --eval-workers 1`：Test3R 按显存预算并发，其余未知/大显存训练独占 GPU，CPU 评测同时进行。
+主机 RAM 由 Linux cgroup v2 硬限制：所有 runner 共享 **72 GiB**，64 GiB 开始回收；单个训练/评测子任务默认 **32 GiB**，任务组禁用 swap。超限会终止该子任务、保留失败记录并继续其他场景；不会缩帧或修改指标。需要 systemd user manager 和可写的 delegated cgroup，配置失败直接退出。详见 [RAM 诊断与限制](docs/ram_diagnostic.md)。
 具体对应和实物输出审计见 [train/eval 协议](docs/protocol_alignment_audit.md)。
 
 ```bash
-# Self-Geometry 论文协议 + Test3R 50 次更新；完整 AUC / 三维评测
-bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_50updates
+# 全量 baseline / Self-Geometry / TCO：训练 seed 0、1、2，抽帧 seed 42
+bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_without_test3r --seeds 0 1 2
 
 # 仅检查全量计划，不启动训练
-bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_50updates --dry-run
+bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_without_test3r --dry-run
 ```
 
-默认 Test3R 50-update 设置是用户指定的额外对照，报告明确记录该预算；`comparison_fast.yaml` 保留旧的直接抽取 200 个三元组的采样方式。3 帧 / 2 步 smoke 指标不作为正式效果结论。
+可选 Test3R 50-update 设置是用户指定的额外对照，报告明确记录该预算；`comparison_fast.yaml` 保留旧的直接抽取 200 个三元组的采样方式。3 帧 / 2 步 smoke 指标不作为正式效果结论。
 
 本机环境已安装；新机器先按下方本地环境说明创建 `.venv`，再运行 `bash scripts/bootstrap_comparison.sh` 获取固定提交的作者源码及 gsplat。已有模型和数据直接复用。接口、断点恢复和 smoke 的实测及退化记录见 [对比验证](docs/comparison_validation.md)。下方 `run_full.sh` 继续作为 **仅 Self-Geometry + baseline** 的双模型优化入口。
 

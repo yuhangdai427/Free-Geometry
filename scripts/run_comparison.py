@@ -21,7 +21,7 @@ def main(argv=None):
     p.add_argument('--root', type=Path, default=ROOT/'artifacts/comparison')
     p.add_argument('--config', type=Path, default=ROOT/'configs/comparison.yaml')
     p.add_argument('--models', nargs='+', choices=['da3', 'vggt'], default=['da3', 'vggt'])
-    p.add_argument('--methods', nargs='+', choices=METHODS, default=list(METHODS))
+    p.add_argument('--methods', nargs='+', choices=METHODS, default=['baseline', 'self_geometry', 'tco'])
     p.add_argument('--datasets', nargs='+', choices=DATASETS, default=list(DATASETS))
     p.add_argument('--seeds', type=int, nargs='+', default=list(SEEDS))
     p.add_argument('--set', action='append', default=[])
@@ -29,12 +29,15 @@ def main(argv=None):
     p.add_argument('--skip-evaluation', action='store_true')
     p.add_argument('--dry-run', action='store_true')
     p.add_argument('--protocol', choices=['custom', 'paper'], default='custom')
-    p.add_argument('--eval-workers', type=int, default=2)
+    p.add_argument('--eval-workers', type=int, default=1)
+    p.add_argument('--worker-ram-gib', type=int, default=32)
     p.add_argument('--gpu-workers', type=int, default=2, help='Concurrent scene processes, subject to GPU memory admission')
     p.add_argument('--reuse-model-root', type=Path, help='Reuse compatible frozen baselines from another matrix')
     p.add_argument('--da3-weights', type=Path)
     p.add_argument('--vggt-weights', type=Path)
     a = p.parse_args(argv)
+    if not 0 < a.worker_ram_gib <= 72:
+        p.error('worker-ram-gib must be in 1..72')
     for key in ('models','methods','datasets','seeds'):
         if len(set(getattr(a,key))) != len(getattr(a,key)):
             p.error('Duplicate ' + key)
@@ -95,7 +98,7 @@ def main(argv=None):
         cmd = [sys.executable, str(ROOT/'scripts/run_full.py'), '--root', str(root/method),
                '--config', str(cfg), '--models', *a.models, '--datasets', *a.datasets,
                '--seeds', *map(str,a.seeds), '--eval-workers', str(a.eval_workers),
-               '--gpu-workers', str(a.gpu_workers)]
+               '--gpu-workers', str(a.gpu_workers), '--worker-ram-gib', str(a.worker_ram_gib)]
         if method != 'baseline' and 'baseline' in a.methods:
             cmd += ['--reuse-model-root', str(root/'baseline')]
         elif a.reuse_model_root:
@@ -127,4 +130,6 @@ def main(argv=None):
     return int(failed)
 
 if __name__ == '__main__':
+    from self_geometry.ram_limits import enter_runner_scope
+    enter_runner_scope()
     sys.exit(main())

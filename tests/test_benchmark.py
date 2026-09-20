@@ -314,6 +314,7 @@ def test_dtu_split_fusion_and_scoring_match_combined(tmp_path, monkeypatch):
 
 def test_suite_dtu_fuses_on_gpu_scores_on_cpu_and_shares_baseline(tmp_path, monkeypatch):
     runner = script('run_full')
+    monkeypatch.setattr(runner, 'scope_command', lambda command, limit: command)
     monkeypatch.setattr(runner, 'dataset', lambda *args: SimpleNamespace(SCENES=['scan1']))
     calls = []
     def run(cmd, **kwargs):

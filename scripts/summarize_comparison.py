@@ -104,7 +104,7 @@ def summarize(root):
                 if v['exit_code']:
                     result['failures'].append(dict(method=method,job=job,**v))
     result['full_matrix'] = (result['complete'] and set(plan['models'])=={'da3','vggt'}
-                            and set(plan['methods'])=={'baseline','self_geometry','test3r','tco'}
+                            and {'baseline','self_geometry','tco'}.issubset(plan['methods'])
                             and set(plan['datasets'])==set(DATASETS) and len(plan['seeds'])==3
                             and not plan['first_only'] and plan['config']['max_frames']==100)
     lines += ['',f'Coverage complete: {result["complete"]}; full matrix: {result["full_matrix"]}; failures: {len(result["failures"])}.',

@@ -17,6 +17,7 @@ from self_geometry.benchmark import DATASETS, SEEDS, metrics_for
 from self_geometry.common import config, write_json
 from self_geometry.data import dataset
 from self_geometry.cache import copy_cached
+from self_geometry.ram_limits import scope_command, TOTAL_GIB, WORKER_GIB
 
 MODELS = ('da3', 'vggt')
 
@@ -52,13 +53,16 @@ def main(argv=None):
     p.add_argument('--da3-weights', type=Path)
     p.add_argument('--first-only', action='store_true')
     p.add_argument('--dry-run', action='store_true')
-    p.add_argument('--eval-workers', type=int, default=2)
+    p.add_argument('--eval-workers', type=int, default=1)
+    p.add_argument('--worker-ram-gib', type=int, default=WORKER_GIB)
     p.add_argument('--gpu-workers', type=int, default=2)
     p.add_argument('--skip-evaluation', action='store_true')
     p.add_argument('--no-reuse', action='store_true')
     p.add_argument('--reuse-model-root', type=Path, help='Import frozen baselines from ROOT/MODEL/seed_FIRST')
     p.add_argument('--reuse-from', type=Path, default=ROOT / 'artifacts/main')
     a = p.parse_args(argv)
+    if not 0 < a.worker_ram_gib <= TOTAL_GIB:
+        p.error('worker-ram-gib must be in 1..72')
     for label, values in [('models', a.models), ('datasets', a.datasets), ('seeds', a.seeds)]:
         if len(set(values)) != len(values):
             p.error(f'Duplicate {label}')
@@ -108,7 +112,8 @@ def main(argv=None):
     state_path = root / 'suite.json'
     state = json.loads(state_path.read_text()) if state_path.exists() else {'jobs': {}}
     state.update(pid=os.getpid(), started=time.time(), status='running', active=[],
-                 gpu_workers=a.gpu_workers, eval_workers=a.eval_workers)
+                 gpu_workers=a.gpu_workers, eval_workers=a.eval_workers,
+                 host_ram_shared_gib=TOTAL_GIB, worker_ram_gib=a.worker_ram_gib)
     mutex = threading.Lock()
     failures = []
 
@@ -121,7 +126,8 @@ def main(argv=None):
         print('RUN', key, flush=True)
         try:
             with log.open('a') as f:
-                code = subprocess.run(cmd, cwd=ROOT, env=env, stdout=f, stderr=subprocess.STDOUT).returncode
+                code = subprocess.run(scope_command(cmd, a.worker_ram_gib), cwd=ROOT,
+                                      env=env, stdout=f, stderr=subprocess.STDOUT).returncode
         except OSError as exc:
             log.write_text(str(exc))
             code = 127
@@ -211,4 +217,6 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
+    from self_geometry.ram_limits import enter_runner_scope
+    enter_runner_scope()
     sys.exit(main())

@@ -26,6 +26,7 @@
     "src/self_geometry/model.py": "fb3687f35e11a809cd0e7c7d29882dde8b6e2a068c14166f318283755fecdcfc",
     "src/self_geometry/optimization.py": "5b5964a4478067b975fd42db0f7305cee9a6d6c602d6125f0c96c7c618f0e368",
     "src/self_geometry/protocol.py": "2a802effe432e860972f0a2933c829b0c5d876ec354e120673c4fe978c92fc31",
+    "src/self_geometry/ram_limits.py": "037a95be1892bed49801433e859c99e9395bffe4363900c5258b5ac0683ce54c",
     "src/self_geometry/report.py": "f6ecca1cef8ae8ca80a24ad436f567a48543c118bde1a11a7ac8bd4e4e7919b2",
     "src/self_geometry/training.py": "d32b0392301e8d74ee4ad353d8e8a59ece5cadd3f9da054d244e6bb1042601ed",
     "scripts/audit_paper_run.py": "c92e541b86506005b61fd0c0255b34597b1aa9e6a16abfdc47837a1b15b81421",
@@ -33,6 +34,7 @@
     "scripts/bootstrap.sh": "2cb54f3559360280d044a1e0998d80725096a7e1029a7d7fd3398df891490e15",
     "scripts/bootstrap_comparison.sh": "a4237c31870dd22e2788c489d0353b07ec6f9cf20072a9cf94176874e75bd59d",
     "scripts/campaign.py": "69d5dd51c2d7610f0ba5ca9bcd7cab03c693a4ea56fcbd0549fd48eb5e2679e5",
+    "scripts/cgroup_exec.py": "561f0c3683a11801bd60a37441891e0f230a5f4409c8c8d5940785786d67fb5c",
     "scripts/check_comparison_resume.py": "b1fd07cdc19e196cb31c602aef3f824a6ee8a5400d2b1af5c05b68e1d3a4f2e6",
     "scripts/check_comparison_smoke.py": "3be625d56555ea58e773f38fe8dc004ee5e57a3bd07f592e3cc67472de70f95d",
     "scripts/check_protocol.py": "ad804639355c0c022904a75b91efc0519c1f284a0c43c17e74030a0143dd86a3",
@@ -48,16 +50,16 @@
     "scripts/preflight.py": "f151ca4ef65188a26f802946348f718663d0367357fbcdbcfc222ecf61de1c14",
     "scripts/queue_comparison.py": "d4585fc51651ed730bdb1fa8d777390b20800fb35685de41dd7085fd89a70f51",
     "scripts/run.py": "b3d07d918ae7192e1833888922eb435e262923be18d96ba17885c78444ec4083",
-    "scripts/run_comparison.py": "dcb8a7d4be93b08e45b4d30acbb1c9ae91b59c0b60e92c58d9bd06545995c4e9",
+    "scripts/run_comparison.py": "aa35876804932cf8126b1949dd6e4ebcefeb720c556bbd823af6f3de80416872",
     "scripts/run_comparison.sh": "68045f746f6bcfa2a143501a0352f4761bf97c830707857de9d1498a876b63af",
-    "scripts/run_full.py": "1057b4734703cde6484913380f007efd2c0fffbbe856e0b6d4f695bab4572cc7",
+    "scripts/run_full.py": "5c5bbb580c81cfed9aaa203dde046dccbb12972e09065cf39553bdfce6156a62",
     "scripts/run_full.sh": "94f38a498afffee79ab5caaa75ca0b56f49ba19c6ad92ce54fd3adeec3e6ddea",
-    "scripts/run_paper_comparison.sh": "6cea8700df072d5ec7375e033e7c69b6514793646140db22c3076f74f6d05b60",
+    "scripts/run_paper_comparison.sh": "8169e780819b5dd7da50cf8de7c5c1c31b907a2b28d42da7262717e73bc2ea39",
     "scripts/run_seeds_separately.py": "f484506c3405ce773adf9db66f56406d981952c31a5e5a3729b23624812a0aa4",
     "scripts/scene_worker.py": "d1ed029e6acf23a6fe599ff73c039842c13f07c2f4ebbd613b564862310cc699",
     "scripts/status.py": "5e06cf0e0bb5989543e2cc41c8161fcf13085b4168eea3fb4928306270a6f313",
     "scripts/status_comparison.py": "293a6abe21fd5b0b29ea905585e5b25647ee5db8f7bc84bba166f01ab12a3f43",
-    "scripts/summarize_comparison.py": "43090c38aefcd4dd55ea0ebe87a55612fa4420219dee6243952f690737d8939c",
+    "scripts/summarize_comparison.py": "71de2b66f17ab441b3146cdaaebed8fa359a403d5c5496e7e0aceedd2cca7185",
     "scripts/summarize_experiments.py": "42241b13e7b240246bc393a1d3352b1bf9bf6f6c7796fbee4d252175a9569bb6",
     "scripts/summarize_full.py": "689b63a6c709259757fd25de6a22d70581b3a4546b7eeb1e99521d3ab02d64ca",
     "scripts/summarize_seeds_separately.py": "47ef03e489c078745f34705f7558c46e95885505c87abacb0ec830f33fc5a111",
@@ -156,13 +158,26 @@
     "test3r_schedule": "User-requested 50 optimizer updates matching Self-Geometry update count; accumulation 4; consume 200 triplets from a seed-fixed sampled pool capped at 1000; stop at the update budget",
     "runtime_parallelism": {
       "gpu_workers": 2,
-      "eval_workers": 2,
+      "eval_workers": 1,
       "gpu_admission_gib": 90,
       "scope": "local 96 GiB card; Test3R empirical memory reservations; other schedules exclusive",
       "current_validation_seeds": [
         0
-      ]
+      ],
+      "host_ram_shared_gib": 72,
+      "host_ram_high_gib": 64,
+      "host_ram_worker_gib": 32,
+      "host_swap_gib": 0,
+      "host_ram_enforcement": "systemd user slice and per-worker cgroup v2 MemoryMax, memory.oom.group=1"
     },
-    "test3r_max_updates": 50
+    "test3r_max_updates": 50,
+    "default_methods": [
+      "baseline",
+      "self_geometry",
+      "tco"
+    ],
+    "default_result_cells": 1620,
+    "default_adaptation_runs": 1080,
+    "test3r_status": "Stopped at user request; retained as opt-in code only"
   }
 }

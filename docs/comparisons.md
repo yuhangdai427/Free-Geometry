@@ -1,6 +1,6 @@
 # Baseline / Test3R / Self-Geometry / TCO
 
-正式入口：`bash scripts/run_paper_comparison.sh`，校验论文训练/评测设置；自定义变体入口为 `bash scripts/run_comparison.sh`。默认 DA3-Giant、VGGT，五个数据集，seed 0/1/2，90 场景：共 **2160 个模型/方法/场景/seed 结果格**。其中 baseline 有 540 个结果格，只需推理及评测 180 次；三个适配方法合计 1620 次独立训练。输出结构 `ROOT/METHOD/MODEL/seed_N/DATASET/SCENE/{baseline,adapted}`。
+正式入口：`bash scripts/run_paper_comparison.sh`，校验论文训练/评测设置；自定义变体入口为 `bash scripts/run_comparison.sh`。默认 DA3-Giant、VGGT，五个数据集，seed 0/1/2，90 场景：默认 baseline / Self-Geometry / TCO 共 **1620 个模型/方法/场景/seed 结果格**。其中 baseline 有 540 个结果格，只需推理及评测 180 次；两个适配方法合计 1080 次独立训练；Test3R 已停止并从默认方法列表移除，显式加入后才是 2160 格。输出结构 `ROOT/METHOD/MODEL/seed_N/DATASET/SCENE/{baseline,adapted}`。
 
 ## 来源与移植边界
 
@@ -52,10 +52,10 @@ VGGT：冻结 DINO 和任务 heads，仅 frame/global decoder 上 QKV、attentio
 ## 全量、恢复与错误
 
 ```bash
-# Self-Geometry 论文日程 + Test3R 50 次更新，全部 2160 格
-bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_50updates
+# baseline / Self-Geometry / TCO，全部 1620 格（不运行 Test3R）
+bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_without_test3r
 
-# 全场景、双模型、四方法、三 seed；Test3R 明确采用 50-update 预算
+# 可选旧快速配置；当前默认仍排除 Test3R
 bash scripts/run_comparison.sh --config configs/comparison_fast.yaml --root artifacts/comparison_fast
 
 # 仅生成计划；不占 GPU
@@ -74,18 +74,27 @@ bash scripts/run_comparison.sh --config configs/comparison_fast.yaml --root arti
 
 ## 接续当前验证
 
-本轮仅双模型、五个首场景、seed 0，检查数据加载、训练及完整评测。此前 500-update Test3R 进程已停止，旧目录 `artifacts/paper_protocol_test3r_1000` 标为 `cancelled_budget_change`；从未训练的提示参数重新执行 50 次更新，不复用已超过 50 步的 checkpoint。Test3R 上限验证保存至 `artifacts/paper_protocol_test3r_50updates`，复用 `artifacts/paper_protocol_first/baseline`。原先等待整轮结束的队列已取消，Test3R runner 立即加入共享 GPU 调度；分别查看两个 root 的 `SELECTED_RESULTS.md`。
+当前只做双模型、五个首场景、seed 0。baseline 与 Self-Geometry 的训练和完整 eval
+共 20 格已完成，位于 `artifacts/paper_protocol_first`。Test3R 训练 10 格完成，
+完整 eval 7 格完成后已按用户要求停止；保留原始结果和失败记录，不再继续。
+TCO 验证补跑至 `artifacts/paper_protocol_tco_ram_limited`，复用已有 baseline：
 
 ```bash
-bash scripts/run_paper_comparison.sh --root artifacts/paper_protocol_test3r_50updates \
-  --methods test3r --seeds 0 --first-only \
+bash scripts/run_paper_comparison.sh --root artifacts/paper_protocol_tco_ram_limited \
+  --methods tco --seeds 0 --first-only \
   --reuse-model-root artifacts/paper_protocol_first/baseline \
-  --gpu-workers 2 --eval-workers 2
+  --gpu-workers 1 --eval-workers 1
 ```
+
+所有入口通过 cgroup 强制共享 72 GiB 主机 RAM 上限，单个子任务默认 32 GiB，
+可用 `--worker-ram-gib` 调整单任务限额；全局上限仍为 72 GiB。默认 CPU eval
+并发降为 1。限制针对物理内存，避免 RLIMIT_AS 错误限制 CUDA 虚拟地址空间。
+超限不伪造分数、不修改官方重建设置，记录失败后继续其他场景。
+参见 [RAM 诊断](ram_diagnostic.md)。
 
 ## 单卡并发
 
-`run_full.py` 默认两个场景进程、两个 CPU 评测进程；显存准入文件
+`run_full.py` 默认两个场景进程、一个 CPU 评测进程；显存准入文件
 `artifacts/gpu_admission.json` 由进程锁保护，跨方法 runner 共用，按先到顺序调度。
 本机 96 GiB 卡预留 90 GiB 预算：已知 504 分辨率、至多 100 帧、pair batch 至多 2
 的 Test3R 根据缓存 baseline 的实际图像尺寸申请显存；378×504 时 DA3 42 GiB、
