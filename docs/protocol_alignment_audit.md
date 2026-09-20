@@ -21,7 +21,7 @@ values do not establish performance under the formal paper protocol.
 | Resolution / reference | Model-native DA3 benchmark preprocessing, 504 long side / first view | Retained local benchmark adapter, not an explicit paper hyperparameter |
 | Three seeds | Independent training RNG 0/1/2; same sampled RGB frames | Requested repetition extension |
 | DTU | Official DA3 22 scenes, normally 49 views, distance metrics in mm | Requested extension; paper excludes DTU |
-| Test3R | Shared scene inputs and evaluator; user-requested min(N³, 1000) sampled ordered triplets × 2 epochs | Additional comparison, not a baseline evaluated in this paper |
+| Test3R | Shared scene inputs and evaluator; user-requested 50 optimizer updates; 4 triplets per update; sample pool capped at 1000 | Additional comparison, not a baseline evaluated in this paper |
 
 TCO uses the pinned author loss and documented dataset settings with frozen
 predicted camera priors, following Self-Geometry IV-A. Unpublished choices and
@@ -34,7 +34,7 @@ checkpoint choices do not shorten method training schedules.
 
 ```bash
 # Formal full matrix: two models, four methods, five datasets, three seeds.
-bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_triplets1000
+bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_50updates
 
 # Initial paper-length validation: one fixed scene per dataset, seed 0.
 # This covers baseline + Self-Geometry + TCO; it is not the full matrix.
@@ -49,7 +49,7 @@ bash scripts/run_paper_comparison.sh --root artifacts/paper_protocol_first \
 # Add --require-complete to fail if any evaluation is still pending.
 ```
 
-The formal launcher rejects shortened frames/iterations, capped Test3R updates,
+The formal launcher rejects shortened frames/Self-Geometry iterations, unsupported Test3R update budgets,
 overridden TCO schedules, and `--skip-evaluation`. Baseline and adapted methods
 must evaluate the exact same ordered scene frames. The audit reads actual
 manifests and final exports, not just configuration labels. Results are in
@@ -59,11 +59,15 @@ Formal first scenes: ETH3D courtyard 38 frames, 7Scenes chess 100, ScanNet++
 09c1414f1b 100, HiRoom 20241230/828738/cam_sampled_08 23, DTU scan1 49.
 These are single-scene validations, never whole-dataset averages.
 
-Test3R's exhaustive 100-view schedule has 2,000,000 triplet presentations per scene/seed.
-The user requested a cap of 1000 sampled triplets per scene, reused for two epochs:
-2000 presentations and 500 optimizer updates (accumulation 4). This additional
-Test3R variant is explicitly recorded in the profile, logs, samples and reports;
-it does not change Self-Geometry settings or train/eval frame manifests.
-Set `test3r_max_triplets=null` with a separate root for the exhaustive variant.
-The 50-update fast variant remains available only as a separately labeled
-custom experiment and is rejected by this formal launcher.
+The user changed Test3R from the earlier 1000-triplet/two-epoch variant (500
+updates at 100 views) to a 50-update budget matching Self-Geometry's update
+count. Accumulation remains 4: current validation scenes consume 200 triplets
+from the seed-fixed sample of at most 1000, then stop. The retained epochs=2
+parameter is an upper bound, not a requirement to keep training beyond 50
+updates. Different losses and training views mean equal update counts do not
+imply equal FLOPs. Old checkpoints beyond 50 updates are not migrated.
+
+The profile and reports explicitly label this user-requested extra Test3R
+comparison. SG settings and actual train/eval frames remain unchanged.
+Set both `test3r_max_updates=null` and `test3r_max_triplets=null`, with a separate
+root, for the exhaustive variant. Existing historical profiles remain auditable.

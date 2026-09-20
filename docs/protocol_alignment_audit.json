@@ -38,7 +38,7 @@
       2
     ],
     "dtu": "official DA3 distance metrics; excluded in paper",
-    "test3r": "additional architecture port; user-requested 1000 sampled triplets per scene, two epochs, accumulation 4; not a published paper baseline"
+    "test3r": "additional architecture port; user-requested 50 optimizer updates matching Self-Geometry update count, accumulation 4, 1000-triplet sampled pool cap; not a published paper baseline"
   },
   "formal_runner": "scripts/run_paper_comparison.sh",
   "artifact_audit": "scripts/audit_paper_run.py",

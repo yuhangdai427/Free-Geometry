@@ -54,7 +54,7 @@ def summarize(root):
     plan = json.loads((root/'matrix_plan.json').read_text())
     selected_results(root, plan)
     result = dict(cells=plan['cells'], results={}, missing=[], failures=[], complete=True,
-                  test3r_schedule=('budget_variant' if plan['config'].get('test3r_max_updates') is not None
+                  test3r_schedule=(f"updates_cap_{plan['config']['test3r_max_updates']}" if plan['config'].get('test3r_max_updates') is not None
                                    else f"triplet_cap_{plan['config']['test3r_max_triplets']}_per_epoch"
                                    if plan['config'].get('test3r_max_triplets') is not None else 'exhaustive'))
     lines = ['# DA3 / VGGT method comparison', '',

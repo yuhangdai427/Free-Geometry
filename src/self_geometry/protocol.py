@@ -17,7 +17,8 @@ def paper_protocol(c, methods, skip_evaluation=False):
     if 'test3r' in methods:
         expected.update(test3r_epochs=2, test3r_accum=4,
                         test3r_prompt_size=32, test3r_lr=1e-5,
-                        test3r_max_updates=None, test3r_vggt_points='native')
+                        test3r_max_updates=50 if c.get('test3r_max_updates') is not None else None,
+                        test3r_vggt_points='native')
         cap = c.get('test3r_max_triplets')
         if cap is not None:
             # User-requested additional comparison; not a published SG baseline.
@@ -40,6 +41,8 @@ def paper_protocol(c, methods, skip_evaluation=False):
         evaluation=['auc01', 'auc03', 'auc30', 'recon_unposed', 'recon_posed'],
         seed_meaning='independent adapter initialization/training RNG; fixed RGB sampling',
         extensions=['DTU with official DA3 distance metrics',
+                    'Test3R port with user-requested 50 optimizer updates, matching Self-Geometry update count'
+                    if 'test3r' in methods and c.get('test3r_max_updates') == 50 else
                     'Test3R port with user-requested 1000-triplet cap per epoch, two epochs'
                     if 'test3r' in methods and c.get('test3r_max_triplets') is not None
                     else 'Test3R port with its own exhaustive schedule'],

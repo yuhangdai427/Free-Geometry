@@ -18,17 +18,17 @@
     "src/self_geometry/cache.py": "ca0b6a9934f7a8c8dfd8982dcfcc51c9c889d136beccd4e1f336c14fd6611d1b",
     "src/self_geometry/cli.py": "79ec7cb0bd78b58f2bd85bd01f85af80eee46a97cd08b4a7df37eb28569b8df3",
     "src/self_geometry/common.py": "c08b4f8726b702046168a8ba40365c4dc002334be4301ee003f9d896d803d256",
-    "src/self_geometry/comparisons.py": "9e6d547a5c78d6e553ec4c9f6a40b252e3875aaf4fdcfa137e0efbcf64455b18",
+    "src/self_geometry/comparisons.py": "b53aafb2583f14a1f83ffe814fc51cff97eafb3a93bd9c2fdb01053eb68beea7",
     "src/self_geometry/data.py": "608963134796340659bdcfdb1ebd696306e70c424c5ceb8f81e654ae608314f4",
     "src/self_geometry/geometry.py": "db3902d9c13b2d63a2ce258a3bcb10391985b6907f20061ea442fd7a554e3b7f",
     "src/self_geometry/gpu_queue.py": "696cbb8bdffd2cfb73a1aaa169cdf0411ede46a9769ebd334352709f16c8a805",
     "src/self_geometry/matching.py": "964e25bb20264a3774b1737f697f9ff85052dcbe173e873180dfed99c55a7838",
     "src/self_geometry/model.py": "fb3687f35e11a809cd0e7c7d29882dde8b6e2a068c14166f318283755fecdcfc",
     "src/self_geometry/optimization.py": "5b5964a4478067b975fd42db0f7305cee9a6d6c602d6125f0c96c7c618f0e368",
-    "src/self_geometry/protocol.py": "dc079d45ab5ccb1b196cfeab92951df9959eb909980cd178d5ec6df9c18b2825",
+    "src/self_geometry/protocol.py": "2a802effe432e860972f0a2933c829b0c5d876ec354e120673c4fe978c92fc31",
     "src/self_geometry/report.py": "f6ecca1cef8ae8ca80a24ad436f567a48543c118bde1a11a7ac8bd4e4e7919b2",
     "src/self_geometry/training.py": "d32b0392301e8d74ee4ad353d8e8a59ece5cadd3f9da054d244e6bb1042601ed",
-    "scripts/audit_paper_run.py": "ae02b042d8170ad46e00b4cf703a074db4ef05c6b891007fac0745210e763720",
+    "scripts/audit_paper_run.py": "c92e541b86506005b61fd0c0255b34597b1aa9e6a16abfdc47837a1b15b81421",
     "scripts/benchmark_speed.py": "8185e0126c514cc1381a2c4b24b6667d8a8847f24d8b915305583e69cd23107e",
     "scripts/bootstrap.sh": "2cb54f3559360280d044a1e0998d80725096a7e1029a7d7fd3398df891490e15",
     "scripts/bootstrap_comparison.sh": "a4237c31870dd22e2788c489d0353b07ec6f9cf20072a9cf94176874e75bd59d",
@@ -52,12 +52,12 @@
     "scripts/run_comparison.sh": "68045f746f6bcfa2a143501a0352f4761bf97c830707857de9d1498a876b63af",
     "scripts/run_full.py": "1057b4734703cde6484913380f007efd2c0fffbbe856e0b6d4f695bab4572cc7",
     "scripts/run_full.sh": "94f38a498afffee79ab5caaa75ca0b56f49ba19c6ad92ce54fd3adeec3e6ddea",
-    "scripts/run_paper_comparison.sh": "f0285285c97c98f09504dd82d2da16b762c7836abd5e8ed82210ce0bca71a37a",
+    "scripts/run_paper_comparison.sh": "6cea8700df072d5ec7375e033e7c69b6514793646140db22c3076f74f6d05b60",
     "scripts/run_seeds_separately.py": "f484506c3405ce773adf9db66f56406d981952c31a5e5a3729b23624812a0aa4",
     "scripts/scene_worker.py": "d1ed029e6acf23a6fe599ff73c039842c13f07c2f4ebbd613b564862310cc699",
     "scripts/status.py": "5e06cf0e0bb5989543e2cc41c8161fcf13085b4168eea3fb4928306270a6f313",
     "scripts/status_comparison.py": "293a6abe21fd5b0b29ea905585e5b25647ee5db8f7bc84bba166f01ab12a3f43",
-    "scripts/summarize_comparison.py": "df895b9bf2c69d98d58e28b613c66f560b0c767c4679ecde530e634270390e83",
+    "scripts/summarize_comparison.py": "43090c38aefcd4dd55ea0ebe87a55612fa4420219dee6243952f690737d8939c",
     "scripts/summarize_experiments.py": "42241b13e7b240246bc393a1d3352b1bf9bf6f6c7796fbee4d252175a9569bb6",
     "scripts/summarize_full.py": "689b63a6c709259757fd25de6a22d70581b3a4546b7eeb1e99521d3ab02d64ca",
     "scripts/summarize_seeds_separately.py": "47ef03e489c078745f34705f7558c46e95885505c87abacb0ec830f33fc5a111",
@@ -65,7 +65,7 @@
     "scripts/validate_models.py": "27fa1625e4fbe8c81280e5d2e91838172cd9623e0bf34a0afcca741e5e005c32",
     "scripts/validate_runtime.py": "008fcc64dfe48ae37631f7eb5fd9742e681792b3fcf4c8d680b7633ffa426183",
     "scripts/visualize.py": "576bb3fdfec8e71d9f260e1ba0c3d394bb458e4ef5bfe6219773fc253ca80c00",
-    "configs/comparison.yaml": "e58786af191849e45f5f84737ad60cd5bc0b311ef9678b36f3f5b5e0a1611404",
+    "configs/comparison.yaml": "eb0747d70b869e7d8d638ce204863605528a6d935afb4e628a5a5acb1c9ffe24",
     "configs/comparison_fast.yaml": "479b215ca281b4f35eecee1bcdfccc5423f215716d109f7b533acc23166b8109",
     "configs/da3.yaml": "1b0cd4e9f3d5c3505c1f9598832ba0f56b99ab5bd34ec200a5da9b5edc7db065",
     "configs/fast.yaml": "ab981f53c4206fcfa9f0cfd5a69214b75d7bf57fca99b44685dce9ffd95dfa47",
@@ -153,7 +153,7 @@
     "gsplat": "1.5.3",
     "formal_entrypoint": "scripts/run_paper_comparison.sh",
     "test3r_max_triplets": 1000,
-    "test3r_schedule": "User-requested per-scene cap; two epochs reuse up to 1000 ordered triplets sampled without replacement, accumulation 4",
+    "test3r_schedule": "User-requested 50 optimizer updates matching Self-Geometry update count; accumulation 4; consume 200 triplets from a seed-fixed sampled pool capped at 1000; stop at the update budget",
     "runtime_parallelism": {
       "gpu_workers": 2,
       "eval_workers": 2,
@@ -162,6 +162,7 @@
       "current_validation_seeds": [
         0
       ]
-    }
+    },
+    "test3r_max_updates": 50
   }
 }

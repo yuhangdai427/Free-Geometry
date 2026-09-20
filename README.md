@@ -4,22 +4,22 @@
 
 新增 **双模型 × baseline / Test3R / Self-Geometry / TCO × 五数据集 × 三 seed** 统一入口，2160 个场景结果格。方法来源、移植细节、原版和快速日程区别见 [对比方法说明](docs/comparisons.md)。
 
-**正式对齐原论文的入口**：`bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_triplets1000`。
+**正式对齐原论文的入口**：`bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_50updates`。
 它固定检查最多 100 帧、Self-Geometry 50 步和完整 AUC / posed+unposed 重建评测，拒绝 3 帧 / 2 步或跳过评测的 smoke 配置。
 训练与评测使用同一场景帧列表；三 seed 指训练随机性，抽帧仍是官方 seed 42。
-Test3R 按用户要求，每场景从有序 N³ 总体无放回抽取最多 **1000 个三元组**，固定顺序跑 **2 epochs**；100 帧时累积 4 个后更新，共 **500 次更新**。这是额外 Test3R 对照的预算变体，Self-Geometry 的 50 步与所有方法的完整评测不变。`--set test3r_max_triplets=null` 可在另一个 root 恢复 Test3R 全遍历。
+Test3R 按用户最新要求，与 Self-Geometry 同为 **50 次优化器更新**；每次累积 4 个三元组，共处理 **200 次三元组**，达到预算即停止。仍从有序 N³ 总体无放回抽取最多 1000 个三元组，按固定顺序取前缀训练。该额外对照对齐更新次数，不表示两种方法每步计算量相同。训练/评测帧数、Self-Geometry 50 步与完整评测不变。`--set test3r_max_updates=null --set test3r_max_triplets=null` 可在另一个 root 恢复 Test3R 全遍历。
 本轮 smoke 只用 seed 0、每数据集首场景；全量三 seed 命令留待正式实验。单卡调度支持 `--gpu-workers 2 --eval-workers 2`：Test3R 按显存预算并发，其余未知/大显存训练独占 GPU，CPU 评测同时进行。
 具体对应和实物输出审计见 [train/eval 协议](docs/protocol_alignment_audit.md)。
 
 ```bash
-# Self-Geometry 论文协议 + Test3R 三元组上限 1000；完整 AUC / 三维评测
-bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_triplets1000
+# Self-Geometry 论文协议 + Test3R 50 次更新；完整 AUC / 三维评测
+bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_50updates
 
 # 仅检查全量计划，不启动训练
-bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_triplets1000 --dry-run
+bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_50updates --dry-run
 ```
 
-`comparison_fast.yaml` 的 Test3R 50-update 设置属于额外预算变体，不能替代上面的正式对比；3 帧 / 2 步 smoke 指标也不作为正式效果结论。
+默认 Test3R 50-update 设置是用户指定的额外对照，报告明确记录该预算；`comparison_fast.yaml` 保留旧的直接抽取 200 个三元组的采样方式。3 帧 / 2 步 smoke 指标不作为正式效果结论。
 
 本机环境已安装；新机器先按下方本地环境说明创建 `.venv`，再运行 `bash scripts/bootstrap_comparison.sh` 获取固定提交的作者源码及 gsplat。已有模型和数据直接复用。接口、断点恢复和 smoke 的实测及退化记录见 [对比验证](docs/comparison_validation.md)。下方 `run_full.sh` 继续作为 **仅 Self-Geometry + baseline** 的双模型优化入口。
 

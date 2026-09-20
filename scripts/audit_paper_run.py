@@ -64,6 +64,7 @@ def main():
                     order, settings = triplet_schedule(len(expected), state['config'])
                     sampled = json.loads((directory/stage/'triplets.json').read_text())
                     if (state['config'].get('test3r_max_triplets') != plan['config']['test3r_max_triplets']
+                            or state['config'].get('test3r_max_updates') != plan['config'].get('test3r_max_updates')
                             or sampled['order'] != order or state['settings'] != settings
                             or state['steps'] != settings['microsteps']
                             or state['updates'] != settings['expected_updates']):

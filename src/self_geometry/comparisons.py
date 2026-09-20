@@ -188,8 +188,10 @@ def triplet_schedule(n, c):
     """Deterministic per-epoch sampling; a triplet cap is distinct from updates."""
     accum, epochs = c['test3r_accum'], c['test3r_epochs']
     cap, budget = c.get('test3r_max_triplets'), c.get('test3r_max_updates')
-    limits = [v for v in (cap, None if budget is None else budget * accum) if v is not None]
-    order = triplet_order(n, c['seed'], min(limits) if limits else None)
+    # A shorter update budget consumes a prefix of the same capped sample.
+    # Preserve the legacy uncapped budget sampler when no triplet cap is set.
+    limit = cap if cap is not None else (None if budget is None else budget * accum)
+    order = triplet_order(n, c['seed'], limit)
     total = epochs * len(order)
     if budget is not None:
         total = min(total, budget * accum)

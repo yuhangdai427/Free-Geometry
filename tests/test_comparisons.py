@@ -84,6 +84,19 @@ def test_capped_triplets_reproducible_population_and_two_epoch_updates():
     assert triplet_schedule(3, old)[0] == triplet_order(3, 0)
 
 
+def test_default_matches_self_geometry_updates_and_preserves_capped_sample():
+    from self_geometry import ROOT
+    from self_geometry.common import config
+    from self_geometry.comparisons import triplet_schedule
+    c = config(ROOT/'configs/comparison.yaml')
+    for n in (23, 38, 49, 100):
+        order, settings = triplet_schedule(n, c)
+        assert settings['expected_updates'] == c['iterations'] == 50
+        assert settings['microsteps'] == 200
+        assert len(order) == len(set(order)) == 1000
+        assert order == triplet_schedule(n, dict(c, test3r_max_updates=None))[0]
+
+
 def test_frozen_prefix_cache_survives_inplace_camera_token_replacement():
     class Counter(nn.Module):
         def __init__(self):
