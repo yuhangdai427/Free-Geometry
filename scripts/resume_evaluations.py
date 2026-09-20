@@ -54,8 +54,9 @@ def main():
                 break
     state.update(active=None, status='finished_with_failures' if any(j['exit_code'] for j in state['jobs'].values()) else 'complete')
     write_json(status, state)
+    return int(state['status'] != 'complete')
 
 
 if __name__ == '__main__':
     enter_runner_scope()
-    main()
+    sys.exit(main())

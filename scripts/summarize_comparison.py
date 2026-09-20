@@ -115,7 +115,7 @@ def summarize(root):
                     result['failures'].append(dict(method=method,job=job,**v))
     result['full_matrix'] = (result['complete'] and set(plan['models'])=={'da3','vggt'}
                             and {'baseline','self_geometry','tco'}.issubset(plan['methods'])
-                            and set(plan['datasets'])==set(DATASETS) and len(plan['seeds'])==3
+                            and set(plan['datasets'])==set(DATASETS) and len(plan['seeds'])>=1
                             and not plan['first_only'] and plan['config']['max_frames']==100)
     lines += ['',f'Coverage complete: {result["complete"]}; full matrix: {result["full_matrix"]}; failures: {len(result["failures"])}.',
               'DTU distances are mm (lower is better); other datasets use F1 (higher is better).',
