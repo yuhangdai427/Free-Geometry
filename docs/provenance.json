@@ -28,6 +28,7 @@
     "configs/variants/reverse_gd.yaml": "642eb23dea28a90edbe48808505382eaeb623eaf92aa878ca2ecd33442734bd4",
     "configs/variants/seed1.yaml": "adf0396d435b4047092c20dada268d22d8db7f192fe2a8a9a283c9e9dea6af54",
     "configs/variants/seed2.yaml": "2eacfc8d68e2260b879dc8695ab65091a3dc94c8ea499c967bd73b40b471d086",
+    "scripts/audit_paper_run.py": "b0cc2f718eb808abed6f199a1cada35caa4194be9ced2be1def5c14ead3ec21d",
     "scripts/benchmark_speed.py": "8185e0126c514cc1381a2c4b24b6667d8a8847f24d8b915305583e69cd23107e",
     "scripts/bootstrap.sh": "2cb54f3559360280d044a1e0998d80725096a7e1029a7d7fd3398df891490e15",
     "scripts/bootstrap_comparison.sh": "a4237c31870dd22e2788c489d0353b07ec6f9cf20072a9cf94176874e75bd59d",
@@ -46,15 +47,16 @@
     "scripts/pipeline.py": "0775412d4716cc7077a1a74190bb309c11b2af99df6ce583ac274350d93f5050",
     "scripts/preflight.py": "f151ca4ef65188a26f802946348f718663d0367357fbcdbcfc222ecf61de1c14",
     "scripts/run.py": "5637a4f591f8f76b95697c6e0bfdb99a21b23aa65058a91c7e417ec60793ea35",
-    "scripts/run_comparison.py": "2a1a51c729560e4a1e789751a07889091f277e36bf6abce695d57e32cb3706f6",
+    "scripts/run_comparison.py": "f27990d8aafd4de590265e97c4762dc7f0ae4e571572fbee3d4d3a5be107ad7a",
     "scripts/run_comparison.sh": "68045f746f6bcfa2a143501a0352f4761bf97c830707857de9d1498a876b63af",
-    "scripts/run_full.py": "1093561dd768e8dcc328f1fd547a0dd03a8029887d5d4ac2ccbc9caf9a8fd824",
+    "scripts/run_full.py": "0b040584a685a2c437f3d6343bd7de16036a345404590763c240f694ebc51f93",
     "scripts/run_full.sh": "94f38a498afffee79ab5caaa75ca0b56f49ba19c6ad92ce54fd3adeec3e6ddea",
+    "scripts/run_paper_comparison.sh": "54ba1fdd4d72aebf8fb50ed0b96183d50dedb96e78709ba1616c56dca8cf3821",
     "scripts/run_seeds_separately.py": "f484506c3405ce773adf9db66f56406d981952c31a5e5a3729b23624812a0aa4",
     "scripts/scene_worker.py": "f86c61d3dcd3889274f88041a458914c1ddaf7598602eca7af01deeb3cd5838e",
     "scripts/status.py": "5e06cf0e0bb5989543e2cc41c8161fcf13085b4168eea3fb4928306270a6f313",
     "scripts/status_comparison.py": "293a6abe21fd5b0b29ea905585e5b25647ee5db8f7bc84bba166f01ab12a3f43",
-    "scripts/summarize_comparison.py": "edbbbe58a66d6c6dc51b2aa241e616ce8049789ff2f44bd03ed35440c3a38914",
+    "scripts/summarize_comparison.py": "b439e6ef002bf2e7fec7a799a8babd3a8e58324b5b193729627b0ecd1957fbff",
     "scripts/summarize_experiments.py": "42241b13e7b240246bc393a1d3352b1bf9bf6f6c7796fbee4d252175a9569bb6",
     "scripts/summarize_full.py": "689b63a6c709259757fd25de6a22d70581b3a4546b7eeb1e99521d3ab02d64ca",
     "scripts/summarize_seeds_separately.py": "47ef03e489c078745f34705f7558c46e95885505c87abacb0ec830f33fc5a111",
@@ -74,6 +76,7 @@
     "src/self_geometry/matching.py": "964e25bb20264a3774b1737f697f9ff85052dcbe173e873180dfed99c55a7838",
     "src/self_geometry/model.py": "fb3687f35e11a809cd0e7c7d29882dde8b6e2a068c14166f318283755fecdcfc",
     "src/self_geometry/optimization.py": "5b5964a4478067b975fd42db0f7305cee9a6d6c602d6125f0c96c7c618f0e368",
+    "src/self_geometry/protocol.py": "d5a3f2fa745e18180d50014c9f9d49a75e5aaceb8ba74183041fdf2537294da1",
     "src/self_geometry/report.py": "f6ecca1cef8ae8ca80a24ad436f567a48543c118bde1a11a7ac8bd4e4e7919b2",
     "src/self_geometry/training.py": "d32b0392301e8d74ee4ad353d8e8a59ece5cadd3f9da054d244e6bb1042601ed"
   },
@@ -145,6 +148,7 @@
       "commit": "65387333877723cf99086f7f29089379dd50c59a",
       "integration": "direct pinned official loss imports"
     },
-    "gsplat": "1.5.3"
+    "gsplat": "1.5.3",
+    "formal_entrypoint": "scripts/run_paper_comparison.sh"
   }
 }

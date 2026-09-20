@@ -1,0 +1,68 @@
+{
+  "recorded_at": "2026-09-20T10:56:50.375758+00:00",
+  "reference": "https://arxiv.org/html/2608.10708v2",
+  "tests_passed": 38,
+  "formal_plan_cells": 2160,
+  "formal_plan_scenes": 90,
+  "cli_rejects_shortened_formal_runs": true,
+  "verified_prior_full_length_evaluation": {
+    "source": "artifacts/da3_full_scene/da3/seed_0/eth3d/courtyard",
+    "frames": 38,
+    "iterations": 50,
+    "updates": 50,
+    "selected_updates": 46,
+    "formal_settings_and_manifests_checked": true,
+    "baseline": {
+      "auc30": 0.9426268373636796,
+      "auc15": 0.8852536747273589,
+      "auc05": 0.6785206258890469,
+      "auc03": 0.5225225225225225,
+      "auc01": 0.12944523470839261,
+      "recon_unposed_acc": 0.1999633079292316,
+      "recon_unposed_comp": 0.16434918533288292,
+      "recon_unposed_overall": 0.18215624663105726,
+      "recon_unposed_precision": 0.6874962589411306,
+      "recon_unposed_recall": 0.8184106662830737,
+      "recon_unposed_fscore": 0.7472630106450456,
+      "recon_posed_acc": 0.1670816391657743,
+      "recon_posed_comp": 0.14705170038017887,
+      "recon_posed_overall": 0.15706666977297656,
+      "recon_posed_precision": 0.8007127834775108,
+      "recon_posed_recall": 0.878867022089563,
+      "recon_posed_fscore": 0.8379715655444299
+    },
+    "self_geometry": {
+      "auc30": 0.9434803224276908,
+      "auc15": 0.8869606448553817,
+      "auc05": 0.6842105263157895,
+      "auc03": 0.5282124229492651,
+      "auc01": 0.12944523470839261,
+      "recon_unposed_acc": 0.19553669919316416,
+      "recon_unposed_comp": 0.1631764169762648,
+      "recon_unposed_overall": 0.17935655808471448,
+      "recon_unposed_precision": 0.7054166603685174,
+      "recon_unposed_recall": 0.8308152550144297,
+      "recon_unposed_fscore": 0.7629979779835562,
+      "recon_posed_acc": 0.16332868035936043,
+      "recon_posed_comp": 0.14364074327095208,
+      "recon_posed_overall": 0.15348471181515627,
+      "recon_posed_precision": 0.8227665389175108,
+      "recon_posed_recall": 0.8979110663585935,
+      "recon_posed_fscore": 0.8586979664968049
+    }
+  },
+  "ongoing_validation": {
+    "root": "artifacts/paper_protocol_first",
+    "methods": [
+      "baseline",
+      "self_geometry",
+      "tco"
+    ],
+    "seeds": [
+      0
+    ],
+    "scope": "First scene of every dataset; full train/eval protocol; not whole-dataset averages",
+    "completed": false
+  },
+  "test3r": "Full original schedule available in formal full-matrix plan; not included in the ongoing three-method validation."
+}

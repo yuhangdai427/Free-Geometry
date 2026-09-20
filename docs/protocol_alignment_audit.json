@@ -1,0 +1,46 @@
+{
+  "selected_reference": "Self-Geometry arXiv:2608.10708v2",
+  "user_confirmed": true,
+  "selfevo_local_protocol_selected": false,
+  "published_training": {
+    "iterations": 50,
+    "optimizer": "AdamW",
+    "lr": 5e-05,
+    "final_lr": 1e-08,
+    "warmup_fraction": 0.05,
+    "weight_decay": 0.05,
+    "clip": 5,
+    "rank": 64,
+    "alpha": 64,
+    "dropout": 0.1
+  },
+  "published_evaluation": {
+    "max_frames": 100,
+    "pose": [
+      "auc01",
+      "auc03",
+      "auc30"
+    ],
+    "reconstruction": [
+      "recon_unposed_fscore",
+      "recon_posed_fscore"
+    ]
+  },
+  "retained_da3_details": {
+    "sampling_seed": 42,
+    "image_size": 504,
+    "train_eval_same_manifest": true
+  },
+  "extensions": {
+    "training_seeds": [
+      0,
+      1,
+      2
+    ],
+    "dtu": "official DA3 distance metrics; excluded in paper",
+    "test3r": "additional architecture port; exhaustive original schedule, not a paper baseline"
+  },
+  "formal_runner": "scripts/run_paper_comparison.sh",
+  "artifact_audit": "scripts/audit_paper_run.py",
+  "old_smoke": "3 frames / 2 updates; execution checks only, not formal comparison"
+}

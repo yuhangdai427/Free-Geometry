@@ -149,15 +149,13 @@ def main(argv=None):
             write_json(root / model / f'config_seed_{seed}.json', dict(c, seed=seed))
     with ThreadPoolExecutor(max_workers=a.eval_workers) as pool:
         pending = []
-        previous = None
         for item in commands:
             model, name, scene = (item[k] for k in ('model', 'dataset', 'scene'))
-            if previous is not None and previous != (model, name):
-                for future in pending:
-                    future.result()
-                pending.clear()
-                subprocess.run([sys.executable, str(ROOT / 'scripts/summarize_full.py'), '--root', str(root)], check=False)
-            previous = (model, name)
+            # Bound the CPU queue without idling the GPU at dataset boundaries.
+            # DTU fusion still runs serially on this thread; only scoring joins
+            # the CPU pool. Evaluation math and scene sampling are unchanged.
+            while len(pending) >= 2 * a.eval_workers:
+                pending.pop(0).result()
             c = configs[model]
             env = dict(os.environ, HF_HUB_OFFLINE='1', PYTHONUNBUFFERED='1',
                        TORCH_HOME=str(ROOT / 'weights'), OMP_NUM_THREADS=str(c['threads']),

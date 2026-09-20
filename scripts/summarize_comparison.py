@@ -11,9 +11,45 @@ from self_geometry.benchmark import metrics_for, DATASETS
 from self_geometry.data import dataset
 
 
+def selected_results(root, plan):
+    """Show actual planned-scene metrics without pretending they cover a dataset."""
+    rows = []
+    lines = ['# Selected-scene evaluations', '',
+             'Raw [0,1] AUC/F1; DTU distances in mm. Missing evaluation is pending, not a score of zero.', '',
+             '| Model | Method | Dataset / scene | Seed | Frames | AUC@1 | AUC@3 | AUC@30 | Unposed F1 / DTU distance | Posed F1 / DTU distance | Status |',
+             '|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|']
+    for job in plan['jobs']:
+        directory = root/job['method']/job['model']/f'seed_{job["seed"]}'/job['dataset']/job['scene']
+        stage = 'baseline' if job['method'] == 'baseline' else 'adapted'
+        row = dict(job, status='pending', metrics={})
+        manifest_path = directory/'manifest.json'
+        row['frames'] = len(json.loads(manifest_path.read_text())['image_files']) if manifest_path.exists() else None
+        path = directory/stage/'metrics.json'
+        if path.exists():
+            try:
+                metrics = json.loads(path.read_text())
+                row['metrics'] = {key: float(metrics[key]) for key in metrics_for(job['dataset'])}
+                if not all(np.isfinite(v) for v in row['metrics'].values()):
+                    raise ValueError('Nonfinite metric')
+                row['status'] = 'evaluated'
+            except (ValueError, KeyError, TypeError) as exc:
+                row.update(status='invalid', error=str(exc), metrics={})
+        geom = 'overall' if job['dataset'] == 'dtu' else 'fscore'
+        keys = ['auc01', 'auc03', 'auc30', f'recon_unposed_{geom}', f'recon_posed_{geom}']
+        values = [f'{row["metrics"][k]:.6f}' if k in row['metrics'] else '—' for k in keys]
+        lines.append(f'| {job["model"]} | {job["method"]} | {job["dataset"]}/{job["scene"]} | {job["seed"]} | {row["frames"] or "—"} | '+ ' | '.join(values)+f' | {row["status"]} |')
+        rows.append(row)
+    result = dict(scope='selected scenes only; not dataset averages',
+                  complete=sum(r['status']=='evaluated' for r in rows), total=len(rows), rows=rows)
+    write_json(root/'selected_results.json', result)
+    (root/'SELECTED_RESULTS.md').write_text('\n'.join(lines)+'\n')
+    return result
+
+
 def summarize(root):
     root = Path(root)
     plan = json.loads((root/'matrix_plan.json').read_text())
+    selected_results(root, plan)
     result = dict(cells=plan['cells'], results={}, missing=[], failures=[], complete=True,
                   test3r_schedule='exhaustive' if plan['config'].get('test3r_max_updates') is None else 'budget_variant')
     lines = ['# DA3 / VGGT method comparison', '',

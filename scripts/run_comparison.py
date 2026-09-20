@@ -28,6 +28,7 @@ def main(argv=None):
     p.add_argument('--first-only', action='store_true')
     p.add_argument('--skip-evaluation', action='store_true')
     p.add_argument('--dry-run', action='store_true')
+    p.add_argument('--protocol', choices=['custom', 'paper'], default='custom')
     p.add_argument('--eval-workers', type=int, default=2)
     p.add_argument('--da3-weights', type=Path)
     p.add_argument('--vggt-weights', type=Path)
@@ -42,6 +43,14 @@ def main(argv=None):
     if any(s.split('=')[0] == 'weights' for s in a.set):
         p.error('Use --da3-weights / --vggt-weights')
     c = config(a.config, a.set)
+    if a.protocol == 'paper':
+        from self_geometry.protocol import paper_protocol
+        try:
+            protocol = paper_protocol(c, a.methods, a.skip_evaluation)
+        except ValueError as exc:
+            p.error(str(exc))
+    else:
+        protocol = dict(profile='custom', note='Not certified as the formal paper protocol')
     if c.get('test3r_vggt_points', 'depth') not in ('native', 'depth'):
         p.error('test3r_vggt_points must be native or depth')
     for key in ('test3r_epochs','test3r_accum','test3r_prompt_size','test3r_pair_batch'):
@@ -66,6 +75,10 @@ def main(argv=None):
     if path.exists() and json.loads(path.read_text()) != plan:
         raise ValueError('Different experiment plan: use a new --root')
     write_json(path, plan)
+    protocol_path = root/'protocol.json'
+    if protocol_path.exists() and json.loads(protocol_path.read_text()) != protocol:
+        raise ValueError('Different protocol profile: use a new --root')
+    write_json(protocol_path, protocol)
     print(f'{len(jobs)} model/method/scene/seed cells; baseline predictions are shared across methods/seeds', flush=True)
     state = dict(pid=os.getpid(), started=time.time(), status='running', methods={})
     failed = False
@@ -94,6 +107,12 @@ def main(argv=None):
         state['methods'][method] = dict(exit_code=code)
         failed |= code != 0
     if not a.dry_run:
+        if a.protocol == 'paper':
+            audit_code = subprocess.run([
+                sys.executable, str(ROOT/'scripts/audit_paper_run.py'),
+                '--root', str(root), '--require-complete']).returncode
+            state['protocol_audit_exit_code'] = audit_code
+            failed |= audit_code != 0
         state.update(status='finished_with_failures' if failed else ('training_only' if a.skip_evaluation else 'complete'),
                      finished=time.time(),active_method=None)
         write_json(root/'matrix_state.json',state)

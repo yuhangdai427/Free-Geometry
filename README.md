@@ -4,13 +4,20 @@
 
 新增 **双模型 × baseline / Test3R / Self-Geometry / TCO × 五数据集 × 三 seed** 统一入口，2160 个场景结果格。方法来源、移植细节、原版和快速日程区别见 [对比方法说明](docs/comparisons.md)。
 
-```bash
-# 快速对比：Self-Geometry 50 步，TCO 作者日程，Test3R 50-update 预算变体
-bash scripts/run_comparison.sh --config configs/comparison_fast.yaml --root artifacts/comparison_fast
+**正式对齐原论文的入口**：`bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison`。
+它固定检查最多 100 帧、Self-Geometry 50 步和完整 AUC / posed+unposed 重建评测，拒绝 3 帧 / 2 步或跳过评测的 smoke 配置。
+训练与评测使用同一场景帧列表；三 seed 指训练随机性，抽帧仍是官方 seed 42。
+具体对应和实物输出审计见 [train/eval 协议](docs/protocol_alignment_audit.md)。
 
-# Test3R 也采用作者完整 N³ × 2 epochs 日程
-bash scripts/run_comparison.sh --root artifacts/comparison
+```bash
+# 正式协议：保留完整训练预算，并执行 AUC 与 posed/unposed 三维评测
+bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison
+
+# 仅检查全量计划，不启动训练
+bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison --dry-run
 ```
+
+`comparison_fast.yaml` 的 Test3R 50-update 设置属于额外预算变体，不能替代上面的正式对比；3 帧 / 2 步 smoke 指标也不作为正式效果结论。
 
 本机环境已安装；新机器先按下方本地环境说明创建 `.venv`，再运行 `bash scripts/bootstrap_comparison.sh` 获取固定提交的作者源码及 gsplat。已有模型和数据直接复用。接口、断点恢复和 smoke 的实测及退化记录见 [对比验证](docs/comparison_validation.md)。下方 `run_full.sh` 继续作为 **仅 Self-Geometry + baseline** 的双模型优化入口。
 

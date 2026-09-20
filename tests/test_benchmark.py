@@ -20,6 +20,21 @@ def script(name):
     return module
 
 
+def test_selected_report_distinguishes_true_zero_from_missing_evaluation(tmp_path):
+    report = script('summarize_comparison')
+    jobs = [dict(model='vggt', method='baseline', dataset='eth3d', scene=s, seed=0)
+            for s in ('evaluated', 'pending')]
+    directory = tmp_path/'baseline/vggt/seed_0/eth3d/evaluated'
+    write_json(directory/'manifest.json', {'image_files': ['a', 'b']})
+    write_json(directory/'baseline/metrics.json', {key: 0. for key in metrics_for('eth3d')})
+    result = report.selected_results(tmp_path, {'jobs': jobs})
+    assert result['complete'] == 1 and result['total'] == 2
+    assert result['rows'][0]['status'] == 'evaluated'
+    assert result['rows'][0]['metrics']['recon_unposed_fscore'] == 0.
+    assert result['rows'][1]['status'] == 'pending' and not result['rows'][1]['metrics']
+    assert 'not dataset averages' in result['scope']
+
+
 def test_full_plan_contains_all_270_unique_jobs(monkeypatch):
     runner = script('run_seeds_separately')
     monkeypatch.setattr(runner, 'dataset', lambda name, c: SimpleNamespace(SCENES=[f's{i}' for i in range(SCENE_COUNTS[name])]))

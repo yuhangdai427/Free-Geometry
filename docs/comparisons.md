@@ -1,6 +1,6 @@
 # Baseline / Test3R / Self-Geometry / TCO
 
-统一入口：`bash scripts/run_comparison.sh`。默认 DA3-Giant、VGGT，五个数据集，seed 0/1/2，90 场景：共 **2160 个模型/方法/场景/seed 结果格**。其中 baseline 有 540 个结果格，只需推理及评测 180 次；三个适配方法合计 1620 次独立训练。输出结构 `ROOT/METHOD/MODEL/seed_N/DATASET/SCENE/{baseline,adapted}`。
+正式入口：`bash scripts/run_paper_comparison.sh`，校验论文训练/评测设置；自定义变体入口为 `bash scripts/run_comparison.sh`。默认 DA3-Giant、VGGT，五个数据集，seed 0/1/2，90 场景：共 **2160 个模型/方法/场景/seed 结果格**。其中 baseline 有 540 个结果格，只需推理及评测 180 次；三个适配方法合计 1620 次独立训练。输出结构 `ROOT/METHOD/MODEL/seed_N/DATASET/SCENE/{baseline,adapted}`。
 
 ## 来源与移植边界
 
@@ -53,7 +53,7 @@ VGGT：冻结 DINO 和任务 heads，仅 frame/global decoder 上 QKV、attentio
 
 ```bash
 # 原版训练日程，全部 2160 格；Test3R 可能非常慢
-bash scripts/run_comparison.sh --root artifacts/comparison
+bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison
 
 # 全场景、双模型、四方法、三 seed；Test3R 明确采用 50-update 预算
 bash scripts/run_comparison.sh --config configs/comparison_fast.yaml --root artifacts/comparison_fast
