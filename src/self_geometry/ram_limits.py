@@ -23,6 +23,9 @@ def prepare_slice():
                         '/bin/true'], check=True)
     subprocess.run(['systemctl', '--user', 'set-property', '--runtime', SLICE,
                     f'MemoryMax={TOTAL_GIB}G', f'MemoryHigh={HIGH_GIB}G', 'MemorySwapMax=0'], check=True)
+    # A user stop leaves the unit loaded but removes its cgroup. Restart the
+    # empty slice before checking kernel limits; this starts no experiments.
+    subprocess.run(['systemctl', '--user', 'start', SLICE], check=True)
     group = subprocess.check_output(['systemctl', '--user', 'show', SLICE,
                                      '-p', 'ControlGroup', '--value'], text=True).strip()
     base = Path('/sys/fs/cgroup') / group.lstrip('/')

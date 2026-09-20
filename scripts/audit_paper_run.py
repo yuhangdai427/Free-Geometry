@@ -59,6 +59,13 @@ def main():
                 if state['config']['model'] != job['model'] or state['config']['seed'] != job['seed']:
                     raise ValueError('Prediction model/seed differs from planned job')
                 paper_protocol(state['config'], [job['method']])
+                if job['method'] == 'tco' and state['config'].get('tco_training_sampling') == 'official_sparse_v1':
+                    from self_geometry.data import prepare_tco_training
+                    training = prepare_tco_training(job['dataset'], job['scene'], state['config'], directory/'tco_training')
+                    if state.get('training_manifest') != training['fingerprint']:
+                        raise ValueError('TCO training selection differs from the sparse protocol')
+                    if state.get('training_frames') != len(training['image_files']) or state.get('evaluation_frames') != len(expected):
+                        raise ValueError('TCO train/evaluation frame counts differ from manifests')
                 if job['method'] == 'test3r' and plan['config'].get('test3r_max_triplets') is not None:
                     from self_geometry.comparisons import triplet_schedule
                     order, settings = triplet_schedule(len(expected), state['config'])

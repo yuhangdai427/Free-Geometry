@@ -26,6 +26,9 @@ def paper_protocol(c, methods, skip_evaluation=False):
     if 'tco' in methods:
         expected.update(tco_steps=None, tco_lr=None, tco_photo_weight=None,
                         tco_intrinsics_weight=0.)
+        if c.get('tco_training_sampling') is not None:
+            expected.update(tco_training_sampling='official_sparse_v1',
+                            tco_train_image_size=518, tco_pose_rot_loss='angle')
     differences = {key: {'expected': value, 'actual': c.get(key)}
                    for key, value in expected.items() if c.get(key) != value}
     if skip_evaluation:
@@ -37,7 +40,10 @@ def paper_protocol(c, methods, skip_evaluation=False):
         reference='https://arxiv.org/html/2608.10708v2',
         profile='self_geometry_paper', checked_settings=expected,
         frame_sampling='retained DA3 Evaluator._sample_frames, seed 42',
-        train_eval='same immutable per-scene RGB manifest; FAN subsets during Self-Geometry training',
+        train_eval=('separate sparse TCO training manifest; DA3 max-100 evaluation manifest; '
+                    'FAN subsets for Self-Geometry, image pairs for Test3R'
+                    if 'tco' in methods and c.get('tco_training_sampling') == 'official_sparse_v1' else
+                    'same immutable per-scene RGB manifest; FAN subsets during Self-Geometry training'),
         evaluation=['auc01', 'auc03', 'auc30', 'recon_unposed', 'recon_posed'],
         seed_meaning='independent adapter initialization/training RNG; fixed RGB sampling',
         extensions=['DTU with official DA3 distance metrics',

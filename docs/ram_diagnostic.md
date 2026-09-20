@@ -17,7 +17,7 @@ Self-Geometry 对应中位深度约 7.88 米。官方融合 voxel 为 0.0390625 
 
 此前调度只控制 GPU 显存，CPU eval 没有主机 RAM 上限；两个评测可与训练
 重叠。它放大了个别场景退化的影响。这是资源调度缺陷，不是所有数据加载或
-模型评测接口不可用。用户已要求停测 Test3R，剩余子进程已停止，结果保留。
+模型评测接口不可用。此前按用户要求停止，最新指令已恢复缺失评测；保留原训练与结果。
 
 ## 已实施的限制
 
@@ -30,5 +30,7 @@ Self-Geometry 对应中位深度约 7.88 米。官方融合 voxel 为 0.0390625 
 - 在独立 64 MiB scope 中分配 160 MiB 的实际探针已被内核 SIGKILL；
   日志证明生效上限和 group OOM 标志，见本地 artifacts/ram_limit_probe.json。
 
-全量训练 seed 为 0、1、2；DA3 benchmark 抽帧固定 seed 42。当前仍只补跑 seed 0
-的 TCO 首场景验证，不启动全量三 seed，也不重新启动 Test3R。
+当前训练 RNG 仅 0；完整实验的评测抽帧为 42/43/44，同图片只评一次。
+修正后的 TCO 在 artifacts/paper_protocol_tco_sparse_train 补跑，训练采用独立稀疏清单；
+Test3R 复用既有 checkpoint 补评测，单评测 scope 上限 48 GiB，全局仍为 72 GiB。
+ETH3D 已改为逐帧加载原分辨率 RGBD，减少全场景数组副本，未修改 TSDF 指标参数。

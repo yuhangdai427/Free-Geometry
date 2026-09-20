@@ -2,7 +2,9 @@
 
 PAPER_DATASETS = ('eth3d', '7scenes', 'scannetpp', 'hiroom')
 DATASETS = (*PAPER_DATASETS, 'dtu')
-SEEDS = (0, 1, 2)
+# Legacy runners interpret these as training RNGs. Never default to retraining
+# three adapters; run_train_once.py owns the separate evaluation seeds.
+SEEDS = (0,)
 SCENE_COUNTS = dict(eth3d=11, **{'7scenes': 7}, scannetpp=20, hiroom=30, dtu=22)
 POSE_METRICS = ('auc01', 'auc03', 'auc30')
 F1_METRICS = ('recon_unposed_fscore', 'recon_posed_fscore')

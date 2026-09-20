@@ -13,5 +13,8 @@ tco_lr: null
 tco_photo_weight: null
 tco_intrinsics_weight: 0.0
 tco_checkpointing: true
+tco_training_sampling: official_sparse_v1
+tco_train_image_size: 518
+tco_pose_rot_loss: angle
 checkpoint_every: 25
 fused_optimizer: true

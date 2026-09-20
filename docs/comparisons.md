@@ -1,6 +1,6 @@
 # Baseline / Test3R / Self-Geometry / TCO
 
-正式入口：`bash scripts/run_paper_comparison.sh`，校验论文训练/评测设置；自定义变体入口为 `bash scripts/run_comparison.sh`。默认 DA3-Giant、VGGT，五个数据集，seed 0/1/2，90 场景：默认 baseline / Self-Geometry / TCO 共 **1620 个模型/方法/场景/seed 结果格**。其中 baseline 有 540 个结果格，只需推理及评测 180 次；两个适配方法合计 1080 次独立训练；Test3R 已停止并从默认方法列表移除，显式加入后才是 2160 格。输出结构 `ROOT/METHOD/MODEL/seed_N/DATASET/SCENE/{baseline,adapted}`。
+当前入口为 `bash scripts/run_train_once.sh`：每场景训练 RNG 0 适配一次，评测抽帧 seed 42/43/44；相同图片去重。TCO 稀疏训练和最多 100 帧评测已分离，Test3R 已恢复补评测。以 [当前协议](current_protocol.md) 为准；旧三次独立训练计划不再作为默认。
 
 ## 来源与移植边界
 
@@ -33,7 +33,7 @@
 
 按 Self-Geometry IV-A，将冻结模型的预测相机作为辅助先验，训练不读取 GT。默认仅 pose prior，intrinsics 权重 0；`tco_intrinsics_weight=0.01` 可额外使用冻结预测内参先验，是显式变体。Self-Geometry 未公开其 TCO 移植代码，也未明确是否同时约束预测内参；默认 pose-only 是据 IV-A 固定的解释。原 TCO 使用 GT pose/intrinsics 的设置不混入此基准。
 
-直接调用作者 2D Gaussian Splatting photometric objective：固定半径比例 0.5、cos 权重、confidence opacity、可见性阈值，`num_view_groups=100`（最多 100 帧时每轮随机一个源视图渲染至全部视图）。保留作者 ED visibility pass 和 RGB pass，没有替换为 grid-sample photometric loss。pose 项：cosine rotation + 2× normalized-translation L1，双方在参考相机坐标系对齐（`pose_type=rel`）。
+直接调用作者 2D Gaussian Splatting photometric objective：固定半径比例 0.5、cos 权重、confidence opacity、可见性阈值，`num_view_groups=100`（最多 100 帧时每轮随机一个源视图渲染至全部视图）。保留作者 ED visibility pass 和 RGB pass，没有替换为 grid-sample photometric loss。pose 项：官方默认 angle rotation + 2× normalized-translation L1（旧版本使用 cosine），双方在参考相机坐标系对齐（`pose_type=rel`）。
 
 VGGT：冻结 DINO 和任务 heads，仅 frame/global decoder 上 QKV、attention projection、FFN LoRA。DA3：冻结前 13 个纯图像 block 和 heads，在 block 13–39 的同类投影上加入 LoRA；SwiGLU 对应 w12/w3。rank=4、alpha=16、dropout=0，Adam，无 weight decay，clip=1，使用最终迭代参数。
 
@@ -47,50 +47,18 @@ VGGT：冻结 DINO 和任务 heads，仅 frame/global decoder 上 QKV、attentio
 
 前三项来自作者启动脚本/附录；后两项没有作者对应数据集参数，固定采用 7Scenes 室内设置，未用 GT 调参。`tco_steps/tco_lr/tco_photo_weight` 的显式覆盖写入计划和 complete.json。
 
-优化：冻结编码器输出在全场景及三个 seed 间缓存，仅重复可训练 decoder；TCO 默认保留 activation checkpoint，避免全 100 帧使用 Self-Geometry 的低视图 fast 设置。CUDA renderer 第一次调用需要编译，后续运行使用缓存；本机入口选择已安装的 CUDA 12.8 与 torch 匹配。
+优化：冻结编码器只在固定稀疏训练集合内缓存，仅重复可训练 decoder；最终评测清除缓存、恢复保存的 LoRA，重新对最多 100 帧推理。TCO 保留 activation checkpoint。训练采样与分辨率见 [当前协议](current_protocol.md)。CUDA renderer 第一次调用需要编译，后续运行使用缓存；本机入口选择已安装的 CUDA 12.8 与 torch 匹配。
 
 ## 全量、恢复与错误
 
-```bash
-# baseline / Self-Geometry / TCO，全部 1620 格（不运行 Test3R）
-bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_without_test3r
+新入口、训练和评测种子的区别、相同图片的去重及当前 smoke 命令统一维护于
+[当前协议](current_protocol.md)。旧 `--seeds 0 1 2` 是历史独立训练方案，不再是
+用户要求的全量协议。Test3R 当前单次训练为 50 次更新，不是原版完整双 epoch 遍历。
+适配失败不替换成 baseline，缺失指标不填 0；有限退化如实记录，其他场景继续。
 
-# 可选旧快速配置；当前默认仍排除 Test3R
-bash scripts/run_comparison.sh --config configs/comparison_fast.yaml --root artifacts/comparison_fast
-
-# 仅生成计划；不占 GPU
-bash scripts/run_comparison.sh --config configs/comparison_fast.yaml --root artifacts/comparison_fast --dry-run
-
-# 查看进度和汇总
-.venv/bin/python scripts/status_comparison.py --root artifacts/comparison_fast
-.venv/bin/python scripts/summarize_comparison.py --root artifacts/comparison_fast
-```
-
-模型、RGB、baseline 和评测缓存跨 seed 共用，适配参数和优化器独立重置。CPU 评测与 GPU 训练重叠；DTU GPU 融合独占 GPU，CPU 距离评测并行；已有完整且有限的缓存指标时跳过重复融合。单场景/seed 失败记日志后继续，有限退化照实保留。重跑相同命令恢复 `last.pt` 并跳过完成任务；改变配置需换 root。
-
-每数据集先对全部场景等权平均，再跨 seed 计算均值和样本标准差。缺场景不输出完整跨 seed 均值；缩帧/首场景调试不算全量复现。原始配置、训练状态、完整失败列表均落盘。全量命令已准备，不自动占用 GPU 启动 1620 次训练。
-
-断点恢复保存参数、Adam 状态、随机状态和未更新的累积梯度。GPU BF16/attention/渲染反传不保证逐位确定性；恢复后继续优化可能与不中断运行有数值差异。验证单独检查恢复状态和下一步前向损失，后续参数差异照实报告，见 [comparison_validation.md](comparison_validation.md)。
-
-## 接续当前验证
-
-当前只做双模型、五个首场景、seed 0。baseline 与 Self-Geometry 的训练和完整 eval
-共 20 格已完成，位于 `artifacts/paper_protocol_first`。Test3R 训练 10 格完成，
-完整 eval 7 格完成后已按用户要求停止；保留原始结果和失败记录，不再继续。
-TCO 验证补跑至 `artifacts/paper_protocol_tco_ram_limited`，复用已有 baseline：
-
-```bash
-bash scripts/run_paper_comparison.sh --root artifacts/paper_protocol_tco_ram_limited \
-  --methods tco --seeds 0 --first-only \
-  --reuse-model-root artifacts/paper_protocol_first/baseline \
-  --gpu-workers 1 --eval-workers 1
-```
-
-所有入口通过 cgroup 强制共享 72 GiB 主机 RAM 上限，单个子任务默认 32 GiB，
-可用 `--worker-ram-gib` 调整单任务限额；全局上限仍为 72 GiB。默认 CPU eval
-并发降为 1。限制针对物理内存，避免 RLIMIT_AS 错误限制 CUDA 虚拟地址空间。
-超限不伪造分数、不修改官方重建设置，记录失败后继续其他场景。
-参见 [RAM 诊断](ram_diagnostic.md)。
+全体任务共享 72 GiB RAM 硬限制，每个子任务默认 32 GiB，当前 Test3R 补评测
+为 48 GiB。ETH3D 融合逐帧加载原分辨率 RGBD，保持原官方 TSDF 参数与指标；
+各模式融合成功分别保存身份标记，恢复时复用已完成模式。
 
 ## 单卡并发
 

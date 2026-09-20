@@ -116,6 +116,66 @@ def cache_tco_encoder(model, c, scene_cache):
             net.blocks[i] = CachedEncoderBlock(net.blocks[i], frozen, last=i==net.alt_start-1, clone=True)
 
 
+def uncache_tco_encoder(model):
+    """A training-set encoder cache must never be used on evaluation images."""
+    for name, module in list(model.named_modules()):
+        if isinstance(module, CachedEncoderBlock):
+            parent, _, attr = name.rpartition('.')
+            setattr(model.get_submodule(parent) if parent else model, attr, module.base)
+
+
+def adapt_tco_sparse(c, directory, name, model=None, scene_cache=None, resume=True):
+    from .data import prepare_tco_training
+    from .training import baseline
+    from .cache import copy_cached
+    directory = Path(directory)
+    manifest = json.loads((directory/'manifest.json').read_text())
+    train_dir = directory/'tco_training'
+    train_manifest = prepare_tco_training(name, manifest['scene'], c, train_dir)
+    train_c = dict(c, image_size=c['tco_train_image_size'], max_frames=-1)
+    sig = digest(identity(c, manifest))
+    with stage_lock(directory, 'adapted'):
+        out = directory/'adapted'
+        if (out/'complete.json').exists():
+            done = json.loads((out/'complete.json').read_text())
+            if done['identity'] != sig or done['training_manifest'] != train_manifest['fingerprint']:
+                raise ValueError('Sparse TCO identity mismatch')
+            if prediction_path(directory, 'adapted').exists():
+                return
+        model = load_model(c) if model is None else model
+        remove_adapters(model)
+        images = load_images(train_manifest['image_files'], train_c['image_size'], c['model']).cuda()
+        baseline(train_c, train_dir, model=model, images=images)
+        cache = dict(images=images)
+        print(json.dumps(dict(event='tco_train_eval_split', train_frames=len(images),
+              eval_frames=len(manifest['image_files']), sampling=train_manifest['sampling'],
+              train_image_size=train_c['image_size'], eval_image_size=c['image_size'])), flush=True)
+        adapt_comparison(train_c, train_dir, name, model=model, scene_cache=cache, resume=resume)
+        # Restore saved adapters even when the inner adaptation returned from cache.
+        uncache_tco_encoder(model)
+        remove_adapters(model)
+        install_tco(model, c)
+        load_trainable(model, torch.load(train_dir/'adapted/final.pt', map_location='cpu', weights_only=True))
+        cache.clear()
+        del images
+        model.eval()
+        model._sg_checkpointing = False
+        torch.cuda.empty_cache()
+        eval_images = (scene_cache or {}).get('images')
+        if eval_images is None:
+            eval_images = load_images(manifest['image_files'], c['image_size'], c['model']).cuda()
+        with torch.no_grad():
+            result = predict(model, eval_images, c)
+        export(result, prediction_path(directory, 'adapted'))
+        copy_cached(train_dir/'adapted/final.pt', out/'final.pt')
+        info = json.loads((train_dir/'adapted/complete.json').read_text())
+        info.update(identity=sig, config=c, training_config=train_c,
+                    training_manifest=train_manifest['fingerprint'], training_frames=len(train_manifest['image_files']),
+                    evaluation_frames=len(manifest['image_files']), training_sampling=train_manifest['sampling'],
+                    implementation='tco_sparse_train_full_eval_v1')
+        write_json(out/'complete.json', info)
+
+
 def install_tco(model, c):
     model.requires_grad_(False)
     names = []
@@ -241,7 +301,7 @@ def tco_loss(model, images, base, c, settings):
                    lambda_pose=1., pose_translation_weight=2.,
                    lambda_intrinsics=c['tco_intrinsics_weight'],
                    lambda_mv_consistency=settings['photo'], num_view_groups=100,
-                   pose_rot_loss_type='cosine', pose_trans_loss_type='normed_l1')
+                   pose_rot_loss_type=c.get('tco_pose_rot_loss', 'cosine'), pose_trans_loss_type='normed_l1')
 
 
 def adapt_comparison(c, directory, dataset, model=None, scene_cache=None, resume=True):
@@ -249,6 +309,10 @@ def adapt_comparison(c, directory, dataset, model=None, scene_cache=None, resume
     if method not in ('test3r', 'tco'):
         raise ValueError(method)
     directory = Path(directory)
+    if method == 'tco' and c.get('tco_training_sampling') == 'official_sparse_v1':
+        manifest = json.loads((directory/'manifest.json').read_text())
+        if manifest.get('role') != 'tco_training':
+            return adapt_tco_sparse(c, directory, dataset, model, scene_cache, resume)
     with stage_lock(directory, 'adapted'):
         out = directory / 'adapted'
         manifest = json.loads((directory / 'manifest.json').read_text())

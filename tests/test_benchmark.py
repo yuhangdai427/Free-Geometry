@@ -119,7 +119,7 @@ def test_full_runner_continues_after_failed_seed(tmp_path, monkeypatch):
             return SimpleNamespace(returncode=int(c['seed'] == 0))
         return SimpleNamespace(returncode=0)
     monkeypatch.setattr(runner.subprocess, 'run', run)
-    assert runner.main(['--root', str(tmp_path), '--datasets', 'dtu', '--no-reuse']) == 1
+    assert runner.main(['--root', str(tmp_path), '--datasets', 'dtu', '--no-reuse', '--seeds', '0', '1', '2']) == 1
     assert seen == [0, 1, 2]
     status = json.loads((tmp_path / 'experiments.json').read_text())
     assert status['status'] == 'finished_with_failures'

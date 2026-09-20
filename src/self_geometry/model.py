@@ -56,6 +56,22 @@ def load_trainable(model, state):
         for k, v in state.items(): params[k].copy_(v)
 
 
+def checkpoint_depth_chunks(model, head):
+    """Recompute each independent DPT chunk, retaining full transformer context.
+
+    Forward chunking alone still saves every chunk's activations for backward.
+    Non-reentrant checkpointing handles DA3's nested inputs/dict outputs too.
+    """
+    from torch.utils.checkpoint import checkpoint
+    original = head._forward_impl
+    @wraps(original)
+    def forward(*args, **kwargs):
+        if getattr(model, '_sg_checkpointing', False) and torch.is_grad_enabled():
+            return checkpoint(original, *args, use_reentrant=False, **kwargs)
+        return original(*args, **kwargs)
+    head._forward_impl = forward
+
+
 def load_model(c, device='cuda'):
     from .common import isolated_rng
     # Every parameter is replaced by a strictly checked checkpoint. Avoid filling
@@ -81,6 +97,8 @@ def _load_model(c, device='cuda'):
     model.load_state_dict(state, strict=True)
     model.requires_grad_(False)
     model.aggregator.use_reentrant = False
+    model._sg_checkpointing = False
+    checkpoint_depth_chunks(model, model.depth_head)
     return model.to(device).eval()
 
 
@@ -133,6 +151,7 @@ def predict(model, images, c):
 
 def training_mode(model, c):
     model.eval()
+    model._sg_checkpointing = c['checkpointing']
     if c.get('model', 'vggt') == 'vggt' and c['checkpointing']: model.aggregator.train()
     if c.get('model', 'vggt') == 'da3': model._sg_checkpointing = c['checkpointing']
     for m in model.modules():
@@ -168,6 +187,7 @@ def load_da3(c, device):
     model.load_state_dict(state, strict=True, assign=True)
     model.requires_grad_(False)
     model._sg_checkpointing = False
+    checkpoint_depth_chunks(model, model.head)
     # Wrap forward methods, not modules: preserve exact official state_dict names.
     for block in model.backbone.pretrained.blocks:
         original = block.forward
