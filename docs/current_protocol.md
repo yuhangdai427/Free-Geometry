@@ -5,6 +5,7 @@
 评测对同一个 checkpoint 使用抽帧 seed 42、43、44，最多 100 帧。
 这三次是输入采样变化，不是训练三份模型；也不是三个互不相关的重复实验。
 论文没有明确报告三 seed 平均，三次评测是用户指定扩展。
+当前全量仅运行 baseline、Self-Geometry、TCO；按用户要求排除 Test3R，保留其历史记录。
 
 ## 每种方法的训练输入
 
@@ -54,7 +55,7 @@ ETH3D 保留 DA3 的无效图像过滤，DTU 保留 DA3 的参考帧顺序。
 ## 启动
 
 ```bash
-# 全量：DA3/VGGT × 四方法 × 五数据集；每场景一次适配，三种评测抽帧
+# 全量：DA3/VGGT × baseline / Self-Geometry / TCO × 五数据集；每场景一次适配，三种评测抽帧
 bash scripts/run_train_once.sh --root artifacts/train_once_eval_three
 
 # 相同正式训练预算的首场景 smoke，只评测抽帧 seed 42
@@ -68,15 +69,12 @@ bash scripts/run_paper_comparison.sh --root artifacts/paper_protocol_tco_sparse_
   --methods tco --seeds 0 --first-only --reuse-model-root artifacts/paper_protocol_first/baseline \
   --gpu-workers 1 --eval-workers 1
 
-# 只补已有 Test3R 的缺失评测，不重训
-.venv/bin/python scripts/resume_evaluations.py \
-  --root artifacts/paper_protocol_test3r_50updates/test3r --worker-ram-gib 48
 ```
 
 旧 runner 的 `--seeds` 仍明确表示训练 RNG；默认已改为仅 0。不要传 `--seeds 42 43 44`
 表达三次评测，使用新入口的 `--eval-seeds`。旧 0/1/2 三次训练计划仅作历史记录。
 TCO 独占 GPU；默认单 CPU evaluator。所有实验共享主机 RAM 72 GiB 硬上限，
-子任务默认 32 GiB；当前 Test3R 补评测为 48 GiB。失败场景留记录，其他场景继续。
+子任务默认 32 GiB。失败场景留记录，其他场景继续；不再补跑 Test3R。
 ETH3D 融合按帧加载原分辨率图像及深度；体素、截断、掩码、对齐及指标保持官方设置。
 
 ## 来源

@@ -18,6 +18,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--root', type=Path, default=ROOT/'artifacts/train_once_eval_three')
     p.add_argument('--train-seed', type=int, default=0)
+    p.add_argument('--methods', nargs='+', choices=['baseline', 'self_geometry', 'tco', 'test3r'],
+                   default=['baseline', 'self_geometry', 'tco'])
     p.add_argument('--eval-seeds', type=int, nargs='+', default=[42, 43, 44])
     p.add_argument('--worker-ram-gib', type=int, default=32)
     p.add_argument('--first-only', action='store_true')
@@ -30,7 +32,7 @@ def main():
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     train = ['bash', str(ROOT/'scripts/run_comparison.sh'), '--root', str(root/'training'),
              '--config', str(ROOT/'configs/comparison.yaml'), '--set', 'checkpointing=false',
-             '--methods', 'baseline', 'self_geometry', 'tco', 'test3r', '--seeds', str(a.train_seed),
+             '--methods', *a.methods, '--seeds', str(a.train_seed),
              '--protocol', 'paper', '--worker-ram-gib', str(a.worker_ram_gib), *extra]
     if a.first_only:
         train.append('--first-only')

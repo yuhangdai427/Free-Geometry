@@ -8,7 +8,7 @@
 Self-Geometry 公式映射见 [方法说明](docs/method.md)，对照移植来源见 [对比说明](docs/comparisons.md)。
 
 ```bash
-# 全量：双模型 × baseline / Self-Geometry / TCO / Test3R × 五数据集
+# 全量：双模型 × baseline / Self-Geometry / TCO × 五数据集（不跑 Test3R）
 bash scripts/run_train_once.sh --root artifacts/train_once_eval_three
 
 # 仅生成计划
@@ -21,7 +21,7 @@ bash scripts/run_train_once.sh --root artifacts/train_once_smoke --first-only --
 TCO 使用独立稀疏训练清单：ETH3D/DTU 每 5 帧、7Scenes 每 200 帧。
 ScanNet++/HiRoom 没有官方 TCO 设置，明确标为均匀最多 10 帧训练的扩展。
 适配后重新用已保存参数推理最多 100 个评测帧。Self-Geometry 每步使用 FAN 子集；
-Test3R 使用图像对，累计四个三元组更新一次，最多 50 次更新、候选三元组上限 1000。
+Test3R 已按用户要求移出默认全量队列，保留历史结果和可选实现。
 
 TCO 独占 GPU，纯 CPU 评测可重叠。主机 RAM 总硬上限 72 GiB，子任务默认 32 GiB，
 无 swap；超限记录该场景失败。已有结果、checkpoint 和错误均保留，重跑相同命令可恢复。
