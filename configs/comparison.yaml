@@ -1,4 +1,4 @@
-# Full official iteration schedules; DA3 ports described in docs/comparisons.md.
+# Self-Geometry paper schedule; user-requested Test3R triplet cap (see docs).
 method: self_geometry
 test3r_epochs: 2
 test3r_accum: 4
@@ -6,6 +6,7 @@ test3r_prompt_size: 32
 test3r_vggt_points: native
 test3r_lr: 0.00001
 test3r_max_updates: null
+test3r_max_triplets: 1000
 test3r_pair_batch: 2
 tco_steps: null
 tco_lr: null

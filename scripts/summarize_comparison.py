@@ -18,6 +18,9 @@ def selected_results(root, plan):
              'Raw [0,1] AUC/F1; DTU distances in mm. Missing evaluation is pending, not a score of zero.', '',
              '| Model | Method | Dataset / scene | Seed | Frames | AUC@1 | AUC@3 | AUC@30 | Unposed F1 / DTU distance | Posed F1 / DTU distance | Status |',
              '|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|']
+    schedule = {k: plan.get('config', {}).get(k) for k in
+                ('test3r_max_triplets', 'test3r_epochs', 'test3r_accum', 'test3r_max_updates')}
+    lines[2:2] = [f'Test3R settings: `{json.dumps(schedule)}`', '']
     for job in plan['jobs']:
         directory = root/job['method']/job['model']/f'seed_{job["seed"]}'/job['dataset']/job['scene']
         stage = 'baseline' if job['method'] == 'baseline' else 'adapted'
@@ -39,7 +42,7 @@ def selected_results(root, plan):
         values = [f'{row["metrics"][k]:.6f}' if k in row['metrics'] else '—' for k in keys]
         lines.append(f'| {job["model"]} | {job["method"]} | {job["dataset"]}/{job["scene"]} | {job["seed"]} | {row["frames"] or "—"} | '+ ' | '.join(values)+f' | {row["status"]} |')
         rows.append(row)
-    result = dict(scope='selected scenes only; not dataset averages',
+    result = dict(scope='selected scenes only; not dataset averages', test3r_settings=schedule,
                   complete=sum(r['status']=='evaluated' for r in rows), total=len(rows), rows=rows)
     write_json(root/'selected_results.json', result)
     (root/'SELECTED_RESULTS.md').write_text('\n'.join(lines)+'\n')
@@ -51,7 +54,9 @@ def summarize(root):
     plan = json.loads((root/'matrix_plan.json').read_text())
     selected_results(root, plan)
     result = dict(cells=plan['cells'], results={}, missing=[], failures=[], complete=True,
-                  test3r_schedule='exhaustive' if plan['config'].get('test3r_max_updates') is None else 'budget_variant')
+                  test3r_schedule=('budget_variant' if plan['config'].get('test3r_max_updates') is not None
+                                   else f"triplet_cap_{plan['config']['test3r_max_triplets']}_per_epoch"
+                                   if plan['config'].get('test3r_max_triplets') is not None else 'exhaustive'))
     lines = ['# DA3 / VGGT method comparison', '',
              'Scene macro means, then seed mean ± sample standard deviation. Regressions are retained.', '',
              '| Model | Method | Dataset | Seed coverage | Metric | Mean ± std |',

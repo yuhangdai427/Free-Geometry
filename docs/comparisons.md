@@ -23,11 +23,11 @@
 
 只学习 32 个深层视觉提示，所有原始参数冻结。VGGT 提示放在 DINO 图像编码器的 24 个 block 中，DA3 放在首个跨视图注意力之前的 13 个 block 中。保留原生 CLS/register/position embedding，提示置于前方；末层去掉提示，再进入各自原生多视图网络。按作者代码，首个提示经过 block 0、1；其后逐层替换；不分配作者代码中未参与前向的最后一个提示切片。提示在不同图像间共享、初始化为零。新增零提示仍会改变 attention 的归一化，因此与零初始化 LoRA 不同，插入提示后的输出不保证等于未插入提示的 baseline。
 
-默认 `comparison.yaml`：AdamW，lr=1e-5，betas=(0.9,0.95)，weight_decay=0，累积 4 个三元组后更新，2 epochs；含重复索引的全部 N³ 三元组，固定打乱后两轮复用。seed 控制打乱顺序。保留作者 epoch 边界的梯度累积行为，最后未满一次更新的梯度不额外更新参数。checkpoint 保存累积梯度，支持中途恢复。
+默认 `comparison.yaml`：AdamW，lr=1e-5，betas=(0.9,0.95)，weight_decay=0，累积 4 个三元组后更新，2 epochs；按用户要求，从含重复索引的有序 N³ 总体中无放回抽取最多 1000 个三元组，固定顺序两轮复用；N³ < 1000 时使用全部总体。seed 控制抽样与顺序。100 帧时为 2000 次三元组呈现、500 次 optimizer updates；每场景保存实际抽样索引到 `adapted/triplets.json`，日志及 complete.json 记录总体、上限和实际预算。保留作者 epoch 边界的梯度累积行为，最后未满一次更新的梯度不额外更新参数。checkpoint 保存累积梯度，支持中途恢复。
 
 优化：VGGT 原生 pointmap 训练只运行 aggregator + point head，跳过该损失不需要的 camera/depth heads；最终导出仅运行 depth/pose。整数索引代替 N³ 个图像三元组对象；将独立图像对按 batch 合并前向，`test3r_pair_batch` 是每次合并的三元组数，默认 2；累积批次的 loss 乘以对应样本权重，保持等效目标。可设 1 降低显存。BF16 导致的批次舍入差异不承诺逐位一致。
 
-**快速变体** `comparison_fast.yaml` 明确限制 Test3R 为 50 次 optimizer updates，每次累积 4 个三元组。这是更改训练预算的变体，不能作为原版遍历日程的等价加速。100 帧原版需处理 2,000,000 个三元组；因此入口先完成另外三个方法，再运行 Test3R。需严格原版日程就用默认 `comparison.yaml`；需快速比较就使用 `comparison_fast.yaml`，结果报告会标明 `budget_variant`。
+**快速变体** `comparison_fast.yaml` 明确限制 Test3R 为 50 次 optimizer updates，每次累积 4 个三元组。这是更改训练预算的变体，不能作为原版遍历日程的等价加速。100 帧原版需处理 2,000,000 个三元组；因此入口先完成另外三个方法，再运行 Test3R。当前默认是用户指定的 1000-triplet 上限，不等同于原版全遍历，报告标明 `triplet_cap_1000_per_epoch`。需全遍历使用 `--set test3r_max_triplets=null` 并更换 root；`comparison_fast.yaml` 仍单独标明 `budget_variant`。
 
 ## TCO
 
@@ -52,8 +52,8 @@ VGGT：冻结 DINO 和任务 heads，仅 frame/global decoder 上 QKV、attentio
 ## 全量、恢复与错误
 
 ```bash
-# 原版训练日程，全部 2160 格；Test3R 可能非常慢
-bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison
+# Self-Geometry 论文日程 + Test3R 最多 1000 三元组 × 2 epochs，全部 2160 格
+bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_triplets1000
 
 # 全场景、双模型、四方法、三 seed；Test3R 明确采用 50-update 预算
 bash scripts/run_comparison.sh --config configs/comparison_fast.yaml --root artifacts/comparison_fast
@@ -71,3 +71,15 @@ bash scripts/run_comparison.sh --config configs/comparison_fast.yaml --root arti
 每数据集先对全部场景等权平均，再跨 seed 计算均值和样本标准差。缺场景不输出完整跨 seed 均值；缩帧/首场景调试不算全量复现。原始配置、训练状态、完整失败列表均落盘。全量命令已准备，不自动占用 GPU 启动 1620 次训练。
 
 断点恢复保存参数、Adam 状态、随机状态和未更新的累积梯度。GPU BF16/attention/渲染反传不保证逐位确定性；恢复后继续优化可能与不中断运行有数值差异。验证单独检查恢复状态和下一步前向损失，后续参数差异照实报告，见 [comparison_validation.md](comparison_validation.md)。
+
+## 接续当前验证
+
+`queue_comparison.py` 在前一 matrix 的训练和评测进程结束后启动命令；前一轮个别场景失败仍继续后续方法。当前 Test3R 双模型、五个首场景、seed 0 的上限验证单独保存至 `artifacts/paper_protocol_test3r_1000`，复用 `artifacts/paper_protocol_first/baseline`。分别查看两个 root 的 `SELECTED_RESULTS.md`，不会把旧的未设上限记录改成新协议。
+
+```bash
+.venv/bin/python scripts/queue_comparison.py \
+  --after artifacts/paper_protocol_first --root artifacts/paper_protocol_test3r_1000 -- \
+  bash scripts/run_paper_comparison.sh --root artifacts/paper_protocol_test3r_1000 \
+  --methods test3r --seeds 0 --first-only \
+  --reuse-model-root artifacts/paper_protocol_first/baseline
+```

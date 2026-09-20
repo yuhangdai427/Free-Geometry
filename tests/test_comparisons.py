@@ -59,6 +59,31 @@ def test_tco_dataset_defaults_and_explicit_zero_photo():
     assert tco_settings({'tco_steps':2,'tco_photo_weight':0},'hiroom')['photo']==0
 
 
+def test_capped_triplets_reproducible_population_and_two_epoch_updates():
+    from self_geometry.comparisons import triplet_schedule
+    c = dict(seed=0, test3r_epochs=2, test3r_accum=4, test3r_max_triplets=1000)
+    order, settings = triplet_schedule(100, c)
+    assert len(order) == len(set(order)) == 1000
+    assert all(0 <= q < 100**3 for q in order)
+    assert settings['microsteps'] == 2000
+    assert settings['expected_updates'] == 500
+    assert triplet_schedule(100, c)[0] == order
+    assert triplet_schedule(100, dict(c, seed=1))[0] != order
+    # Walk the actual batching/update boundary rule, including epoch tails.
+    for n, budget in ((100, None), (3, None), (3, 10), (100, 50)):
+        sampled, schedule = triplet_schedule(n, dict(c, test3r_max_updates=budget))
+        cursor = updates = 0
+        while cursor < schedule['microsteps']:
+            local = cursor % len(sampled)
+            chunk = min(2, 4-local % 4, len(sampled)-local, schedule['microsteps']-cursor)
+            updates += (local + chunk) % 4 == 0
+            cursor += chunk
+        assert updates == schedule['expected_updates']
+        assert len(sampled) <= min(n**3, 1000)
+    old = dict(c); old.pop('test3r_max_triplets')
+    assert triplet_schedule(3, old)[0] == triplet_order(3, 0)
+
+
 def test_frozen_prefix_cache_survives_inplace_camera_token_replacement():
     class Counter(nn.Module):
         def __init__(self):

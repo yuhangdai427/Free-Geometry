@@ -59,6 +59,15 @@ def main():
                 if state['config']['model'] != job['model'] or state['config']['seed'] != job['seed']:
                     raise ValueError('Prediction model/seed differs from planned job')
                 paper_protocol(state['config'], [job['method']])
+                if job['method'] == 'test3r' and plan['config'].get('test3r_max_triplets') is not None:
+                    from self_geometry.comparisons import triplet_schedule
+                    order, settings = triplet_schedule(len(expected), state['config'])
+                    sampled = json.loads((directory/stage/'triplets.json').read_text())
+                    if (state['config'].get('test3r_max_triplets') != plan['config']['test3r_max_triplets']
+                            or sampled['order'] != order or state['settings'] != settings
+                            or state['steps'] != settings['microsteps']
+                            or state['updates'] != settings['expected_updates']):
+                        raise ValueError('Actual Test3R sample/schedule differs from the capped plan')
                 if state['identity'] != digest(identity(state['config'], manifest)):
                     raise ValueError('Prediction/checkpoint identity does not match train manifest')
                 with np.load(directory/stage/'exports/mini_npz/results.npz') as data:

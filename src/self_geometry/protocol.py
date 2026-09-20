@@ -18,6 +18,10 @@ def paper_protocol(c, methods, skip_evaluation=False):
         expected.update(test3r_epochs=2, test3r_accum=4,
                         test3r_prompt_size=32, test3r_lr=1e-5,
                         test3r_max_updates=None, test3r_vggt_points='native')
+        cap = c.get('test3r_max_triplets')
+        if cap is not None:
+            # User-requested additional comparison; not a published SG baseline.
+            expected['test3r_max_triplets'] = 1000
     if 'tco' in methods:
         expected.update(tco_steps=None, tco_lr=None, tco_photo_weight=None,
                         tco_intrinsics_weight=0.)
@@ -35,7 +39,10 @@ def paper_protocol(c, methods, skip_evaluation=False):
         train_eval='same immutable per-scene RGB manifest; FAN subsets during Self-Geometry training',
         evaluation=['auc01', 'auc03', 'auc30', 'recon_unposed', 'recon_posed'],
         seed_meaning='independent adapter initialization/training RNG; fixed RGB sampling',
-        extensions=['DTU with official DA3 distance metrics', 'Test3R port with its own exhaustive schedule'],
+        extensions=['DTU with official DA3 distance metrics',
+                    'Test3R port with user-requested 1000-triplet cap per epoch, two epochs'
+                    if 'test3r' in methods and c.get('test3r_max_triplets') is not None
+                    else 'Test3R port with its own exhaustive schedule'],
         limitations='Published settings plus documented implementation assumptions; '
                     'not proof of identical unreleased author code. See docs/method.md and docs/comparisons.md.',
     )

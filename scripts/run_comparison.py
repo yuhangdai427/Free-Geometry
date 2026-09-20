@@ -30,6 +30,7 @@ def main(argv=None):
     p.add_argument('--dry-run', action='store_true')
     p.add_argument('--protocol', choices=['custom', 'paper'], default='custom')
     p.add_argument('--eval-workers', type=int, default=2)
+    p.add_argument('--reuse-model-root', type=Path, help='Reuse compatible frozen baselines from another matrix')
     p.add_argument('--da3-weights', type=Path)
     p.add_argument('--vggt-weights', type=Path)
     a = p.parse_args(argv)
@@ -56,8 +57,8 @@ def main(argv=None):
     for key in ('test3r_epochs','test3r_accum','test3r_prompt_size','test3r_pair_batch'):
         if not isinstance(c[key], int) or c[key] < 1:
             p.error(key + ' must be a positive integer')
-    for key in ('tco_steps','test3r_max_updates'):
-        if c[key] is not None and (not isinstance(c[key], int) or c[key] < 1):
+    for key in ('tco_steps','test3r_max_updates','test3r_max_triplets'):
+        if c.get(key) is not None and (type(c[key]) is not int or c[key] < 1):
             p.error(key + ' must be null or a positive integer')
     root = a.root.resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -72,6 +73,8 @@ def main(argv=None):
                 scenes=scenes, config=c, first_only=a.first_only, jobs=jobs, cells=len(jobs),
                 weights={m:str(getattr(a,m+'_weights').resolve()) if getattr(a,m+'_weights') else None for m in a.models})
     path = root/'matrix_plan.json'
+    if a.reuse_model_root:
+        plan['reuse_model_root'] = str(a.reuse_model_root.resolve())
     if path.exists() and json.loads(path.read_text()) != plan:
         raise ValueError('Different experiment plan: use a new --root')
     write_json(path, plan)
@@ -93,6 +96,8 @@ def main(argv=None):
                '--seeds', *map(str,a.seeds), '--eval-workers', str(a.eval_workers)]
         if method != 'baseline' and 'baseline' in a.methods:
             cmd += ['--reuse-model-root', str(root/'baseline')]
+        elif a.reuse_model_root:
+            cmd += ['--reuse-model-root', str(a.reuse_model_root.resolve())]
         for option in ('first_only','skip_evaluation','dry_run'):
             if getattr(a, option):
                 cmd.append('--'+option.replace('_','-'))

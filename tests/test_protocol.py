@@ -10,6 +10,16 @@ def test_formal_protocol_accepts_runtime_only_optimizations():
     result = paper_protocol(c, ['baseline', 'self_geometry', 'tco', 'test3r'])
     assert result['profile'] == 'self_geometry_paper'
     assert result['checked_settings']['max_frames'] == 100
+    assert result['checked_settings']['test3r_max_triplets'] == 1000
+    assert 'user-requested' in result['extensions'][1]
+
+
+def test_triplet_cap_preserves_existing_non_test3r_profile():
+    c = config(ROOT/'configs/comparison.yaml')
+    prior = dict(c); prior.pop('test3r_max_triplets')
+    methods = ['baseline', 'self_geometry', 'tco']
+    assert paper_protocol(c, methods) == paper_protocol(prior, methods)
+    assert 'exhaustive' in paper_protocol(prior, ['test3r'])['extensions'][1]
 
 
 @pytest.mark.parametrize('overrides,skip', [

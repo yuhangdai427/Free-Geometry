@@ -4,17 +4,18 @@
 
 新增 **双模型 × baseline / Test3R / Self-Geometry / TCO × 五数据集 × 三 seed** 统一入口，2160 个场景结果格。方法来源、移植细节、原版和快速日程区别见 [对比方法说明](docs/comparisons.md)。
 
-**正式对齐原论文的入口**：`bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison`。
+**正式对齐原论文的入口**：`bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_triplets1000`。
 它固定检查最多 100 帧、Self-Geometry 50 步和完整 AUC / posed+unposed 重建评测，拒绝 3 帧 / 2 步或跳过评测的 smoke 配置。
 训练与评测使用同一场景帧列表；三 seed 指训练随机性，抽帧仍是官方 seed 42。
+Test3R 按用户要求，每场景从有序 N³ 总体无放回抽取最多 **1000 个三元组**，固定顺序跑 **2 epochs**；100 帧时累积 4 个后更新，共 **500 次更新**。这是额外 Test3R 对照的预算变体，Self-Geometry 的 50 步与所有方法的完整评测不变。`--set test3r_max_triplets=null` 可在另一个 root 恢复 Test3R 全遍历。
 具体对应和实物输出审计见 [train/eval 协议](docs/protocol_alignment_audit.md)。
 
 ```bash
-# 正式协议：保留完整训练预算，并执行 AUC 与 posed/unposed 三维评测
-bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison
+# Self-Geometry 论文协议 + Test3R 三元组上限 1000；完整 AUC / 三维评测
+bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_triplets1000
 
 # 仅检查全量计划，不启动训练
-bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison --dry-run
+bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_triplets1000 --dry-run
 ```
 
 `comparison_fast.yaml` 的 Test3R 50-update 设置属于额外预算变体，不能替代上面的正式对比；3 帧 / 2 步 smoke 指标也不作为正式效果结论。

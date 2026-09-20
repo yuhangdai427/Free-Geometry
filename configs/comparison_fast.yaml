@@ -9,6 +9,7 @@ test3r_prompt_size: 32
 test3r_vggt_points: native
 test3r_lr: 0.00001
 test3r_max_updates: 50
+test3r_max_triplets: null
 test3r_pair_batch: 2
 tco_steps: null
 tco_lr: null

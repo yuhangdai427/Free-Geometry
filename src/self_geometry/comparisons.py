@@ -184,6 +184,22 @@ def triplet_order(n, seed, limit=None):
     return order
 
 
+def triplet_schedule(n, c):
+    """Deterministic per-epoch sampling; a triplet cap is distinct from updates."""
+    accum, epochs = c['test3r_accum'], c['test3r_epochs']
+    cap, budget = c.get('test3r_max_triplets'), c.get('test3r_max_updates')
+    limits = [v for v in (cap, None if budget is None else budget * accum) if v is not None]
+    order = triplet_order(n, c['seed'], min(limits) if limits else None)
+    total = epochs * len(order)
+    if budget is not None:
+        total = min(total, budget * accum)
+    full_epochs, tail = divmod(total, len(order))
+    settings = dict(population=n**3, triplets_cap=cap, epochs=epochs,
+                    triplets_per_epoch=len(order), microsteps=total, updates_budget=budget,
+                    expected_updates=full_epochs * (len(order) // accum) + tail // accum)
+    return order, settings
+
+
 def test3r_loss(model, images, encoded, c):
     n = len(images)
     triples = [(q // (n*n), q // n % n, q % n) for q in encoded]
@@ -266,16 +282,16 @@ def adapt_comparison(c, directory, dataset, model=None, scene_cache=None, resume
         else:
             modules = install_test3r(model, c)
             accum = c['test3r_accum']
-            limit = c['test3r_max_updates']
-            order = triplet_order(len(images), c['seed'], None if limit is None else limit * accum)
+            order, settings = triplet_schedule(len(images), c)
             # Match upstream's epoch boundary update test, including carried
             # leftover gradients. Checkpoints below save those gradients too.
-            total = c['test3r_epochs'] * len(order)
-            if limit is not None:
-                total = min(total, limit * accum)
+            total = settings['microsteps']
             train_c = c
             optimizer_type, betas, lr = torch.optim.AdamW, (.9, .95), float(c['test3r_lr'])
-            settings = dict(triplets_per_epoch=len(order), microsteps=total, updates_budget=limit)
+            print(json.dumps(dict(event='test3r_schedule', seed=c['seed'], **settings)), flush=True)
+            if c.get('test3r_max_triplets') is not None:
+                write_json(out/'triplets.json', dict(seed=c['seed'], frames=len(images),
+                           encoding='q = i*N*N + j*N + k', order=order, **settings))
         params = [p for p in model.parameters() if p.requires_grad]
         optimizer = optimizer_type(params, lr=lr, betas=betas, weight_decay=0., fused=c['fused_optimizer'])
         start, history, updates = 0, [], 0

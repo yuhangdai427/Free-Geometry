@@ -21,7 +21,7 @@ values do not establish performance under the formal paper protocol.
 | Resolution / reference | Model-native DA3 benchmark preprocessing, 504 long side / first view | Retained local benchmark adapter, not an explicit paper hyperparameter |
 | Three seeds | Independent training RNG 0/1/2; same sampled RGB frames | Requested repetition extension |
 | DTU | Official DA3 22 scenes, normally 49 views, distance metrics in mm | Requested extension; paper excludes DTU |
-| Test3R | Shared scene inputs and evaluator; full ordered N³ × 2 epochs | Additional comparison, not a baseline evaluated in this paper |
+| Test3R | Shared scene inputs and evaluator; user-requested min(N³, 1000) sampled ordered triplets × 2 epochs | Additional comparison, not a baseline evaluated in this paper |
 
 TCO uses the pinned author loss and documented dataset settings with frozen
 predicted camera priors, following Self-Geometry IV-A. Unpublished choices and
@@ -34,7 +34,7 @@ checkpoint choices do not shorten method training schedules.
 
 ```bash
 # Formal full matrix: two models, four methods, five datasets, three seeds.
-bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison
+bash scripts/run_paper_comparison.sh --root artifacts/paper_comparison_triplets1000
 
 # Initial paper-length validation: one fixed scene per dataset, seed 0.
 # This covers baseline + Self-Geometry + TCO; it is not the full matrix.
@@ -59,6 +59,11 @@ Formal first scenes: ETH3D courtyard 38 frames, 7Scenes chess 100, ScanNet++
 09c1414f1b 100, HiRoom 20241230/828738/cam_sampled_08 23, DTU scan1 49.
 These are single-scene validations, never whole-dataset averages.
 
-Test3R's exhaustive 100-view schedule has 2,000,000 triplets per scene/seed.
+Test3R's exhaustive 100-view schedule has 2,000,000 triplet presentations per scene/seed.
+The user requested a cap of 1000 sampled triplets per scene, reused for two epochs:
+2000 presentations and 500 optimizer updates (accumulation 4). This additional
+Test3R variant is explicitly recorded in the profile, logs, samples and reports;
+it does not change Self-Geometry settings or train/eval frame manifests.
+Set `test3r_max_triplets=null` with a separate root for the exhaustive variant.
 The 50-update fast variant remains available only as a separately labeled
 custom experiment and is rejected by this formal launcher.
