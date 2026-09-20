@@ -27,7 +27,7 @@ def build_plan(configs, names, seeds, first_only=False):
     jobs = [dict(model=model, seed=seed, dataset=name, scene=scene)
             for model in configs for name in names for scene in scenes[name] for seed in seeds]
     return dict(configs=configs, models=list(configs), seeds=seeds, datasets=names, scenes=scenes,
-                jobs=jobs, adaptations=len(jobs), first_only=first_only, sampling_seed=42,
+                jobs=jobs, adaptations=sum(configs[j['model']].get('method') != 'baseline' for j in jobs), first_only=first_only, sampling_seed=42,
                 scene_workers=len(jobs) // len(seeds), schema=2)
 
 
@@ -46,6 +46,7 @@ def main(argv=None):
     p.add_argument('--eval-workers', type=int, default=2)
     p.add_argument('--skip-evaluation', action='store_true')
     p.add_argument('--no-reuse', action='store_true')
+    p.add_argument('--reuse-model-root', type=Path, help='Import frozen baselines from ROOT/MODEL/seed_FIRST')
     p.add_argument('--reuse-from', type=Path, default=ROOT / 'artifacts/main')
     a = p.parse_args(argv)
     for label, values in [('models', a.models), ('datasets', a.datasets), ('seeds', a.seeds)]:
@@ -85,7 +86,9 @@ def main(argv=None):
                 cmd = [sys.executable, str(ROOT / 'scripts/scene_worker.py'), '--config', str(cfg),
                        '--root', str(root / model), '--dataset', name, '--scene', scene,
                        '--seeds', *map(str, a.seeds)]
-                if not a.no_reuse and model == 'vggt':
+                if not a.no_reuse and a.reuse_model_root:
+                    cmd += ['--reuse-from', str(a.reuse_model_root.resolve() / model / f'seed_{a.seeds[0]}')]
+                elif not a.no_reuse and model == 'vggt':
                     cmd += ['--reuse-from', str(a.reuse_from.resolve())]
                 commands.append(dict(model=model, dataset=name, scene=scene, command=cmd))
     write_json(root / 'commands.json', commands)
@@ -165,7 +168,7 @@ def main(argv=None):
             if a.skip_evaluation:
                 continue
             available = [s for s in a.seeds if (root / model / f'seed_{s}' / name / scene / 'baseline/protocol.json').exists()]
-            stages = ([(available[0], 'baseline')] if available else []) + [(s, 'adapted') for s in a.seeds]
+            stages = ([(available[0], 'baseline')] if available else []) + ([(s, 'adapted') for s in a.seeds] if c.get('method') != 'baseline' else [])
             for seed, stage in stages:
                 if name == 'dtu':
                     folder = root/model/f'seed_{seed}'

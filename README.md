@@ -1,8 +1,20 @@
-# Self-Geometry：DA3-Giant + VGGT
+# DA3 + VGGT：几何测试时适配复现
 
 独立实现 [Self-Geometry 正文与附录](https://arxiv.org/abs/2608.10708v2) 的几何测试时适配，使用本地模型和 DA3 benchmark。支持 **2 模型 × 5 数据集 × 3 seed**，每场景 50 步。作者训练代码尚未公开，公式映射和固定假设见 [方法说明](docs/method.md)。单场景退化保留，进程失败记录后继续其余任务。
 
-## 直接启动全量
+新增 **双模型 × baseline / Test3R / Self-Geometry / TCO × 五数据集 × 三 seed** 统一入口，2160 个场景结果格。方法来源、移植细节、原版和快速日程区别见 [对比方法说明](docs/comparisons.md)。
+
+```bash
+# 快速对比：Self-Geometry 50 步，TCO 作者日程，Test3R 50-update 预算变体
+bash scripts/run_comparison.sh --config configs/comparison_fast.yaml --root artifacts/comparison_fast
+
+# Test3R 也采用作者完整 N³ × 2 epochs 日程
+bash scripts/run_comparison.sh --root artifacts/comparison
+```
+
+本机环境已安装；新机器先按下方本地环境说明创建 `.venv`，再运行 `bash scripts/bootstrap_comparison.sh` 获取固定提交的作者源码及 gsplat。已有模型和数据直接复用。接口、断点恢复和 smoke 的实测及退化记录见 [对比验证](docs/comparison_validation.md)。下方 `run_full.sh` 继续作为 **仅 Self-Geometry + baseline** 的双模型优化入口。
+
+## 仅 Self-Geometry：直接启动全量
 
 本机 96 GB GPU 的速度配置：
 

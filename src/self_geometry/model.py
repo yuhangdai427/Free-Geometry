@@ -72,10 +72,12 @@ def load_model(c, device='cuda'):
 def _load_model(c, device='cuda'):
     if c.get('model', 'vggt') == 'da3':
         return load_da3(c, device)
-    model = VGGT(enable_point=False, enable_track=False)
+    use_point = c.get('method') == 'test3r' and c.get('test3r_vggt_points', 'depth') == 'native'
+    model = VGGT(enable_point=use_point, enable_track=False)
     state = torch.load(c['weights'], map_location='cpu', weights_only=True, mmap=True)
-    # Point/track heads are unused by the depth+pose benchmark; do not allocate them.
-    state = {k:v for k,v in state.items() if not k.startswith(('point_head.', 'track_head.'))}
+    # Only native Test3R requires the point head; tracking is never used here.
+    excluded = ('track_head.',) if use_point else ('point_head.', 'track_head.')
+    state = {k:v for k,v in state.items() if not k.startswith(excluded)}
     model.load_state_dict(state, strict=True)
     model.requires_grad_(False)
     model.aggregator.use_reentrant = False
@@ -115,8 +117,15 @@ def predict(model, images, c):
             p = model(((images - mean) / std)[None], ref_view_strategy=c['ref_view_strategy'])
         return dict(depth=p['depth'][0].float(), conf=p['depth_conf'][0].float(),
                     extrinsics=p['extrinsics'][0, :, :3].float(), intrinsics=p['intrinsics'][0].float())
-    with ctx:
-        p = model(images)
+    # The DA3 benchmark exports depth + pose. A Test3R point head is used only
+    # by its training loss; avoid computing it during baseline/final export.
+    point_head = model.point_head
+    model.point_head = None
+    try:
+        with ctx:
+            p = model(images)
+    finally:
+        model.point_head = point_head
     ext, intr = pose_encoding_to_extri_intri(p['pose_enc'].float(), image_size_hw=images.shape[-2:])
     return dict(depth=p['depth'][0,...,0].float(), conf=p['depth_conf'][0].float(),
                 extrinsics=ext[0].float(), intrinsics=intr[0].float())

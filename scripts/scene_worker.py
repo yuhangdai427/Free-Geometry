@@ -13,8 +13,9 @@ from self_geometry import ROOT
 from self_geometry.common import config, digest, write_json
 from self_geometry.data import prepare
 from self_geometry.cache import copy_cached
-from self_geometry.model import load_model, load_images, remove_lora
+from self_geometry.model import load_model, load_images
 from self_geometry.training import baseline, adapt, identity
+from self_geometry.comparisons import adapt_comparison, remove_adapters
 
 
 def reuse_baseline(source, target, c):
@@ -76,22 +77,26 @@ def main(argv=None):
             if source is not None:
                 reuse_baseline(source, directory, current)
             baseline_ready = (directory / 'baseline/protocol.json').exists() and (directory / 'baseline/exports/mini_npz/results.npz').exists()
-            adapted_ready = (directory / 'adapted/complete.json').exists() and (directory / 'adapted/exports/mini_npz/results.npz').exists()
+            adapted_ready = c.get('method') == 'baseline' or (directory / 'adapted/complete.json').exists() and (directory / 'adapted/exports/mini_npz/results.npz').exists()
             # Lazy loading avoids loading 5 GB just to skip already complete work.
             if not (baseline_ready and adapted_ready) and model is None:
                 start = time.monotonic()
                 model = load_model(current)
                 model_seconds = time.monotonic() - start
             if model is not None:
-                remove_lora(model)
+                remove_adapters(model)
             if not (baseline_ready and adapted_ready) and 'images' not in cache:
                 manifest = json.loads((directory / 'manifest.json').read_text())
                 cache['images'] = load_images(manifest['image_files'], c['image_size'], c['model']).cuda()
             baseline(current, directory, model=model, images=cache.get('images'))
             record['baseline'] = True
             source = directory
-            adapt(current, directory, resume=True, model=model, scene_cache=cache)
-            record['adapted'] = True
+            method = c.get('method', 'self_geometry')
+            if method == 'self_geometry':
+                adapt(current, directory, resume=True, model=model, scene_cache=cache)
+            elif method != 'baseline':
+                adapt_comparison(current, directory, a.dataset, model=model, scene_cache=cache)
+            record['adapted'] = method != 'baseline'
             record['exit_code'] = 0
         except Exception:
             record.update(exit_code=1, error=traceback.format_exc())

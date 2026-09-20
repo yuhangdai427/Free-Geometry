@@ -29,7 +29,7 @@ def main(argv=None):
         stats = aggregate_seeds(summaries, names, seeds)
         result['models'][model] = stats
         for name in names:
-            for stage in ('baseline', 'adapted'):
+            for stage in (('baseline',) if plan['configs'][model].get('method') == 'baseline' else ('baseline', 'adapted')):
                 row = stats[name][stage]
                 result['complete'] &= row['complete']
                 coverage = ', '.join(f'{s}: {v["completed"]}/{v["expected"]}' for s, v in row['per_seed'].items())

@@ -1,0 +1,16 @@
+# Full official iteration schedules; DA3 ports described in docs/comparisons.md.
+method: self_geometry
+test3r_epochs: 2
+test3r_accum: 4
+test3r_prompt_size: 32
+test3r_vggt_points: native
+test3r_lr: 0.00001
+test3r_max_updates: null
+test3r_pair_batch: 2
+tco_steps: null
+tco_lr: null
+tco_photo_weight: null
+tco_intrinsics_weight: 0.0
+tco_checkpointing: true
+checkpoint_every: 25
+fused_optimizer: true

@@ -218,14 +218,15 @@ def test_json_config_roundtrip_scientific_notation(tmp_path):
     assert config(overrides=['lr=5e-5'])['lr'] == 0.00005
 
 
-def test_shared_worker_continues_and_loads_model_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize('method', ['self_geometry', 'test3r', 'tco'])
+def test_shared_worker_continues_and_loads_model_once(tmp_path, monkeypatch, method):
     import torch
     worker = script('scene_worker')
     cfg = tmp_path / 'config.json'
-    write_json(cfg, config(model='da3'))
+    write_json(cfg, dict(config(model='da3'), method=method))
     loaded, seen = [], []
     monkeypatch.setattr(worker, 'load_model', lambda c: loaded.append(c['model']) or object())
-    monkeypatch.setattr(worker, 'remove_lora', lambda model: None)
+    monkeypatch.setattr(worker, 'remove_adapters', lambda model: None)
     monkeypatch.setattr(worker, 'load_images', lambda *a: torch.zeros(2, 3, 14, 14))
     monkeypatch.setattr(torch.Tensor, 'cuda', lambda self: self)
     monkeypatch.setattr(worker, 'reuse_baseline', lambda *a: False)
@@ -240,6 +241,7 @@ def test_shared_worker_continues_and_loads_model_once(tmp_path, monkeypatch):
     monkeypatch.setattr(worker, 'prepare', prepare)
     monkeypatch.setattr(worker, 'baseline', baseline)
     monkeypatch.setattr(worker, 'adapt', adapt)
+    monkeypatch.setattr(worker, 'adapt_comparison', lambda c, d, name, **kw: adapt(c, d, **kw))
     assert worker.main(['--config', str(cfg), '--root', str(tmp_path / 'runs'), '--dataset', 'dtu',
                         '--scene', 'scan1', '--seeds', '0', '1', '2']) == 1
     assert loaded == ['da3'] and seen == [0, 1, 2]

@@ -37,8 +37,14 @@ def main():
             from .training import baseline
             prepare(args.dataset,scene,c,directory);baseline(c,directory)
         elif args.command=='adapt':
-            from .training import adapt
-            adapt(c,directory,args.resume)
+            if c.get('method', 'self_geometry') == 'self_geometry':
+                from .training import adapt
+                adapt(c,directory,args.resume)
+            elif c.get('method') in ('test3r', 'tco'):
+                from .comparisons import adapt_comparison
+                adapt_comparison(c,directory,args.dataset,resume=args.resume)
+            else:
+                parser.error('baseline has no adaptation stage')
         else:
             print(json.dumps(evaluate(args.dataset,scene,c,directory,args.stage,
                                       fuse_only=args.command=='fuse',score_only=args.command=='score')),flush=True)

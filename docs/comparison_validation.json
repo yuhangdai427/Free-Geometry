@@ -1,0 +1,1629 @@
+{
+  "scope": "Local real-weight validation; not full benchmark reproduction",
+  "tests": {
+    "passed": 31,
+    "log": "artifacts/comparison_native_tests.log"
+  },
+  "port_checks": {
+    "da3": {
+      "golden_baseline_errors": {
+        "depth": 0.0,
+        "conf": 0.0,
+        "extrinsics": 0.0,
+        "intrinsics": 0.0
+      },
+      "cache_max_errors": {
+        "first": {
+          "depth": 0.0,
+          "conf": 0.0,
+          "extrinsics": 0.0,
+          "intrinsics": 0.0
+        },
+        "cached": {
+          "depth": 0.0,
+          "conf": 0.0,
+          "extrinsics": 0.0,
+          "intrinsics": 0.0
+        }
+      },
+      "reset_max_errors": {
+        "depth": 0.0,
+        "conf": 0.0,
+        "extrinsics": 0.0,
+        "intrinsics": 0.0
+      },
+      "prompt_parameters": 589824,
+      "gradient_norm": 0.005920174065977335,
+      "loss": 0.06277599185705185,
+      "point_source": "depth"
+    },
+    "vggt": {
+      "golden_baseline_errors": {
+        "depth": 0.0,
+        "conf": 0.0,
+        "extrinsics": 0.0,
+        "intrinsics": 0.0
+      },
+      "cache_max_errors": {
+        "first": {
+          "depth": 0.0,
+          "conf": 0.0,
+          "extrinsics": 0.0,
+          "intrinsics": 0.0
+        },
+        "cached": {
+          "depth": 0.0,
+          "conf": 0.0,
+          "extrinsics": 0.0,
+          "intrinsics": 0.0
+        }
+      },
+      "reset_max_errors": {
+        "depth": 0.0,
+        "conf": 0.0,
+        "extrinsics": 0.0,
+        "intrinsics": 0.0
+      },
+      "prompt_parameters": 753664,
+      "gradient_norm": 27.595035552978516,
+      "loss": 0.11089800298213959,
+      "point_source": "native"
+    }
+  },
+  "resume": {
+    "da3/test3r": {
+      "source": "artifacts/comparison_resume_v2/da3/test3r/result.json",
+      "passed": true,
+      "model": "da3",
+      "method": "test3r",
+      "restored_parameters_exact": true,
+      "restored_optimizer_exact": true,
+      "rng_after_step_equal": true,
+      "max_parameter_difference": 3.806525910476921e-06,
+      "max_loss_difference": 0.0,
+      "parameter_equivalence": false,
+      "note": "CUDA backward is not bitwise deterministic; restored parameters, optimizer, RNG and next forward loss checked separately from subsequent updates."
+    },
+    "da3/tco": {
+      "source": "artifacts/comparison_resume_v2/da3/tco/result.json",
+      "passed": true,
+      "model": "da3",
+      "method": "tco",
+      "restored_parameters_exact": true,
+      "restored_optimizer_exact": true,
+      "rng_after_step_equal": true,
+      "max_parameter_difference": 0.0007307221530936658,
+      "max_loss_difference": 0.0,
+      "parameter_equivalence": false,
+      "note": "CUDA backward is not bitwise deterministic; restored parameters, optimizer, RNG and next forward loss checked separately from subsequent updates."
+    },
+    "vggt/test3r": {
+      "source": "artifacts/comparison_native_resume/result.json",
+      "passed": true,
+      "model": "vggt",
+      "method": "test3r",
+      "restored_parameters_exact": true,
+      "restored_optimizer_exact": true,
+      "rng_after_step_equal": true,
+      "max_parameter_difference": 4.859865839534905e-06,
+      "max_loss_difference": 0.0,
+      "parameter_equivalence": false,
+      "note": "CUDA backward is not bitwise deterministic; restored parameters, optimizer, RNG and next forward loss checked separately from subsequent updates."
+    },
+    "vggt/tco": {
+      "source": "artifacts/comparison_resume_v2/vggt/tco/result.json",
+      "passed": true,
+      "model": "vggt",
+      "method": "tco",
+      "restored_parameters_exact": true,
+      "restored_optimizer_exact": true,
+      "rng_after_step_equal": true,
+      "max_parameter_difference": 0.0007196528604254127,
+      "max_loss_difference": 0.0,
+      "parameter_equivalence": false,
+      "note": "CUDA backward is not bitwise deterministic; restored parameters, optimizer, RNG and next forward loss checked separately from subsequent updates."
+    }
+  },
+  "full_scene_training": [
+    {
+      "model": "da3",
+      "method": "test3r",
+      "frames": 38,
+      "source": "artifacts/comparison_full_scene/test3r/da3/seed_0/eth3d/courtyard/adapted/complete.json",
+      "updates": 50,
+      "seconds": 53.2549104783684,
+      "peak_gib": 31.440555095672607,
+      "point_source": "depth"
+    },
+    {
+      "model": "da3",
+      "method": "tco",
+      "frames": 38,
+      "source": "artifacts/comparison_full_scene/tco/da3/seed_0/eth3d/courtyard/adapted/complete.json",
+      "updates": 40,
+      "seconds": 163.83930734638125,
+      "peak_gib": 43.346529483795166,
+      "point_source": "depth"
+    },
+    {
+      "model": "vggt",
+      "method": "test3r",
+      "frames": 38,
+      "source": "artifacts/test3r_native_full_scene/test3r/vggt/seed_0/eth3d/courtyard/adapted/complete.json",
+      "updates": 50,
+      "seconds": 43.88734371867031,
+      "peak_gib": 26.99316167831421,
+      "point_source": "native"
+    },
+    {
+      "model": "vggt",
+      "method": "tco",
+      "frames": 38,
+      "source": "artifacts/comparison_full_scene/tco/vggt/seed_0/eth3d/courtyard/adapted/complete.json",
+      "updates": 40,
+      "seconds": 165.06598254758865,
+      "peak_gib": 31.026342391967773,
+      "point_source": "depth"
+    }
+  ],
+  "full_3d_smoke": [
+    {
+      "model": "da3",
+      "method": "baseline",
+      "frames": 3,
+      "seed": 0,
+      "source": "artifacts/comparison_smoke/baseline/da3/seed_0/eth3d/courtyard/baseline/metrics.json",
+      "metrics": {
+        "auc30": 0.9222222222222222,
+        "auc15": 0.8444444444444444,
+        "auc05": 0.5999999999999999,
+        "auc03": 0.5555555555555555,
+        "auc01": 0.3333333333333333,
+        "recon_unposed_acc": 0.28255162898637887,
+        "recon_unposed_comp": 3.5522620878863758,
+        "recon_unposed_overall": 1.9174068584363773,
+        "recon_unposed_precision": 0.5290355666837612,
+        "recon_unposed_recall": 0.04573672333653993,
+        "recon_unposed_fscore": 0.08419457155024013,
+        "recon_posed_acc": 0.20851008953417596,
+        "recon_posed_comp": 3.7154362890741752,
+        "recon_posed_overall": 1.9619731893041756,
+        "recon_posed_precision": 0.6281155257699058,
+        "recon_posed_recall": 0.06399859748806516,
+        "recon_posed_fscore": 0.11616151544640413
+      }
+    },
+    {
+      "model": "da3",
+      "method": "self_geometry",
+      "frames": 3,
+      "seed": 0,
+      "source": "artifacts/comparison_smoke/self_geometry/da3/seed_0/eth3d/courtyard/adapted/metrics.json",
+      "metrics": {
+        "auc30": 0.9222222222222222,
+        "auc15": 0.8444444444444444,
+        "auc05": 0.5999999999999999,
+        "auc03": 0.5555555555555555,
+        "auc01": 0.3333333333333333,
+        "recon_unposed_acc": 0.2652039080953083,
+        "recon_unposed_comp": 3.7473416929525203,
+        "recon_unposed_overall": 2.0062728005239143,
+        "recon_unposed_precision": 0.5708011903730028,
+        "recon_unposed_recall": 0.04740220625915903,
+        "recon_unposed_fscore": 0.08753506016445893,
+        "recon_posed_acc": 0.2056607238821902,
+        "recon_posed_comp": 3.693388341517472,
+        "recon_posed_overall": 1.9495245326998312,
+        "recon_posed_precision": 0.6282401524777637,
+        "recon_posed_recall": 0.064320006473132,
+        "recon_posed_fscore": 0.11669285375948477
+      }
+    },
+    {
+      "model": "da3",
+      "method": "test3r",
+      "frames": 3,
+      "seed": 0,
+      "source": "artifacts/comparison_smoke/test3r/da3/seed_0/eth3d/courtyard/adapted/metrics.json",
+      "metrics": {
+        "auc30": 0.9222222222222222,
+        "auc15": 0.8444444444444444,
+        "auc05": 0.5999999999999999,
+        "auc03": 0.5555555555555555,
+        "auc01": 0.3333333333333333,
+        "recon_unposed_acc": 0.2683820221692254,
+        "recon_unposed_comp": 3.794834704757625,
+        "recon_unposed_overall": 2.031608363463425,
+        "recon_unposed_precision": 0.5693626138189609,
+        "recon_unposed_recall": 0.04853949959093402,
+        "recon_unposed_fscore": 0.08945292712480309,
+        "recon_posed_acc": 0.20689334553376304,
+        "recon_posed_comp": 3.711808005455974,
+        "recon_posed_overall": 1.9593506754948684,
+        "recon_posed_precision": 0.6266953986563569,
+        "recon_posed_recall": 0.06427954939808862,
+        "recon_posed_fscore": 0.116599590039875
+      }
+    },
+    {
+      "model": "da3",
+      "method": "tco",
+      "frames": 3,
+      "seed": 0,
+      "source": "artifacts/comparison_smoke/tco/da3/seed_0/eth3d/courtyard/adapted/metrics.json",
+      "metrics": {
+        "auc30": 0.9222222222222222,
+        "auc15": 0.8444444444444444,
+        "auc05": 0.5999999999999999,
+        "auc03": 0.5555555555555555,
+        "auc01": 0.3333333333333333,
+        "recon_unposed_acc": 0.308700050290565,
+        "recon_unposed_comp": 3.704967748310665,
+        "recon_unposed_overall": 2.0068338993006147,
+        "recon_unposed_precision": 0.46988732394366195,
+        "recon_unposed_recall": 0.04064587472691474,
+        "recon_unposed_fscore": 0.07481974278857025,
+        "recon_posed_acc": 0.20880994337833708,
+        "recon_posed_comp": 3.5791331964654822,
+        "recon_posed_overall": 1.8939715699219097,
+        "recon_posed_precision": 0.6510740531373658,
+        "recon_posed_recall": 0.0644121586996197,
+        "recon_posed_fscore": 0.11722681595279569
+      }
+    },
+    {
+      "model": "vggt",
+      "method": "baseline",
+      "frames": 3,
+      "seed": 0,
+      "source": "artifacts/comparison_smoke/baseline/vggt/seed_0/eth3d/courtyard/baseline/metrics.json",
+      "metrics": {
+        "auc30": 0.9666666666666667,
+        "auc15": 0.9333333333333333,
+        "auc05": 0.8,
+        "auc03": 0.6666666666666666,
+        "auc01": 0.3333333333333333,
+        "recon_unposed_acc": 0.38259297960564953,
+        "recon_unposed_comp": 3.8250045287460073,
+        "recon_unposed_overall": 2.1037987541758283,
+        "recon_unposed_precision": 0.5693972262694944,
+        "recon_unposed_recall": 0.05722203741829918,
+        "recon_unposed_fscore": 0.10399319419488018,
+        "recon_posed_acc": 0.2882934369048557,
+        "recon_posed_comp": 3.6416671832410588,
+        "recon_posed_overall": 1.9649803100729573,
+        "recon_posed_precision": 0.6281351950933055,
+        "recon_posed_recall": 0.06267699970331478,
+        "recon_posed_fscore": 0.11398070194199558
+      }
+    },
+    {
+      "model": "vggt",
+      "method": "self_geometry",
+      "frames": 3,
+      "seed": 0,
+      "source": "artifacts/comparison_smoke/self_geometry/vggt/seed_0/eth3d/courtyard/adapted/metrics.json",
+      "metrics": {
+        "auc30": 0.9666666666666667,
+        "auc15": 0.9333333333333333,
+        "auc05": 0.8,
+        "auc03": 0.6666666666666666,
+        "auc01": 0.3333333333333333,
+        "recon_unposed_acc": 0.3570880127332031,
+        "recon_unposed_comp": 3.928261189053814,
+        "recon_unposed_overall": 2.1426746008935087,
+        "recon_unposed_precision": 0.589903782786345,
+        "recon_unposed_recall": 0.05834809267367323,
+        "recon_unposed_fscore": 0.10619255227651384,
+        "recon_posed_acc": 0.2946559677474271,
+        "recon_posed_comp": 3.6318588764036757,
+        "recon_posed_overall": 1.9632574220755514,
+        "recon_posed_precision": 0.6048358505282564,
+        "recon_posed_recall": 0.06318496075663721,
+        "recon_posed_fscore": 0.11441718232199449
+      }
+    },
+    {
+      "model": "vggt",
+      "method": "test3r",
+      "frames": 3,
+      "seed": 0,
+      "source": "artifacts/test3r_native_smoke/test3r/vggt/seed_0/eth3d/courtyard/adapted/metrics.json",
+      "metrics": {
+        "auc30": 0.32222222222222224,
+        "auc15": 0.31111111111111106,
+        "auc05": 0.26666666666666666,
+        "auc03": 0.2222222222222222,
+        "auc01": 0.0,
+        "recon_unposed_acc": 27.16693480532673,
+        "recon_unposed_comp": 16.885814280356456,
+        "recon_unposed_overall": 22.026374542841594,
+        "recon_unposed_precision": 0.0,
+        "recon_unposed_recall": 0.0,
+        "recon_unposed_fscore": 0.0,
+        "recon_posed_acc": 21.61914229631497,
+        "recon_posed_comp": 12.298171304557716,
+        "recon_posed_overall": 16.958656800436344,
+        "recon_posed_precision": 0.0,
+        "recon_posed_recall": 0.0,
+        "recon_posed_fscore": 0.0
+      }
+    },
+    {
+      "model": "vggt",
+      "method": "tco",
+      "frames": 3,
+      "seed": 0,
+      "source": "artifacts/comparison_smoke/tco/vggt/seed_0/eth3d/courtyard/adapted/metrics.json",
+      "metrics": {
+        "auc30": 0.9333333333333333,
+        "auc15": 0.8666666666666667,
+        "auc05": 0.6,
+        "auc03": 0.3333333333333333,
+        "auc01": 0.0,
+        "recon_unposed_acc": 0.3497443325470748,
+        "recon_unposed_comp": 3.9066360836040395,
+        "recon_unposed_overall": 2.1281902080755573,
+        "recon_unposed_precision": 0.5903781629203562,
+        "recon_unposed_recall": 0.050351077506765325,
+        "recon_unposed_fscore": 0.0927885751544243,
+        "recon_posed_acc": 0.2819515129906548,
+        "recon_posed_comp": 3.454473533774523,
+        "recon_posed_overall": 1.8682125233825888,
+        "recon_posed_precision": 0.6092781568897515,
+        "recon_posed_recall": 0.06339848420825504,
+        "recon_posed_fscore": 0.11484659715538358
+      }
+    }
+  ],
+  "five_dataset_smoke": {
+    "source": "artifacts/all_dataset_smoke/smoke_checks.json",
+    "scope": "export integrity and official pose only; no 3D fusion/evaluation",
+    "passed": 120,
+    "total": 120,
+    "frames": 3,
+    "updates": 2,
+    "rows": [
+      {
+        "model": "da3",
+        "method": "baseline",
+        "dataset": "eth3d",
+        "scene": "courtyard",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.5555555555555555,
+          0.5555555555555555,
+          0.5555555555555555
+        ],
+        "depth_ranges": [
+          [
+            0.27524980902671814,
+            3.100421667098999
+          ],
+          [
+            0.27524980902671814,
+            3.100421667098999
+          ],
+          [
+            0.27524980902671814,
+            3.100421667098999
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "baseline",
+        "dataset": "7scenes",
+        "scene": "chess",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.5555555555555555,
+          0.5555555555555555,
+          0.5555555555555555
+        ],
+        "depth_ranges": [
+          [
+            0.2745818495750427,
+            2.9175586700439453
+          ],
+          [
+            0.2745818495750427,
+            2.9175586700439453
+          ],
+          [
+            0.2745818495750427,
+            2.9175586700439453
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "baseline",
+        "dataset": "scannetpp",
+        "scene": "09c1414f1b",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "depth_ranges": [
+          [
+            0.13895155489444733,
+            0.9488069415092468
+          ],
+          [
+            0.13895155489444733,
+            0.9488069415092468
+          ],
+          [
+            0.13895155489444733,
+            0.9488069415092468
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "baseline",
+        "dataset": "hiroom",
+        "scene": "20241230/828738/cam_sampled_08",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.8888888888888888,
+          0.8888888888888888,
+          0.8888888888888888
+        ],
+        "depth_ranges": [
+          [
+            0.21196132898330688,
+            1.774168610572815
+          ],
+          [
+            0.21196132898330688,
+            1.774168610572815
+          ],
+          [
+            0.21196132898330688,
+            1.774168610572815
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "baseline",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "depth_ranges": [
+          [
+            0.6971806287765503,
+            1.958414912223816
+          ],
+          [
+            0.6971806287765503,
+            1.958414912223816
+          ],
+          [
+            0.6971806287765503,
+            1.958414912223816
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "test3r",
+        "dataset": "eth3d",
+        "scene": "courtyard",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.5555555555555555,
+          0.5555555555555555,
+          0.5555555555555555
+        ],
+        "depth_ranges": [
+          [
+            0.2751414179801941,
+            3.1015987396240234
+          ],
+          [
+            0.2752609848976135,
+            3.10380482673645
+          ],
+          [
+            0.2752093970775604,
+            3.102247953414917
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "test3r",
+        "dataset": "7scenes",
+        "scene": "chess",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.5555555555555555,
+          0.5555555555555555,
+          0.6666666666666666
+        ],
+        "depth_ranges": [
+          [
+            0.2737211585044861,
+            2.929683208465576
+          ],
+          [
+            0.2739335894584656,
+            2.9222872257232666
+          ],
+          [
+            0.27381476759910583,
+            2.920501232147217
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "test3r",
+        "dataset": "scannetpp",
+        "scene": "09c1414f1b",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "depth_ranges": [
+          [
+            0.13916215300559998,
+            0.950529932975769
+          ],
+          [
+            0.1389649361371994,
+            0.9503199458122253
+          ],
+          [
+            0.13925176858901978,
+            0.9506562948226929
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "test3r",
+        "dataset": "hiroom",
+        "scene": "20241230/828738/cam_sampled_08",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.8888888888888888,
+          0.8888888888888888,
+          0.8888888888888888
+        ],
+        "depth_ranges": [
+          [
+            0.21015162765979767,
+            1.7742232084274292
+          ],
+          [
+            0.21135835349559784,
+            1.7736611366271973
+          ],
+          [
+            0.21117912232875824,
+            1.774247646331787
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "test3r",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "depth_ranges": [
+          [
+            0.6967257261276245,
+            1.9799588918685913
+          ],
+          [
+            0.696151852607727,
+            2.012491464614868
+          ],
+          [
+            0.6960816383361816,
+            1.9918936491012573
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "self_geometry",
+        "dataset": "eth3d",
+        "scene": "courtyard",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.5555555555555555,
+          0.5555555555555555,
+          0.5555555555555555
+        ],
+        "depth_ranges": [
+          [
+            0.27532821893692017,
+            3.1026201248168945
+          ],
+          [
+            0.27511897683143616,
+            3.1029882431030273
+          ],
+          [
+            0.2752610445022583,
+            3.0996971130371094
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "self_geometry",
+        "dataset": "7scenes",
+        "scene": "chess",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.5555555555555555,
+          0.6666666666666666,
+          0.6666666666666666
+        ],
+        "depth_ranges": [
+          [
+            0.27372777462005615,
+            2.9250214099884033
+          ],
+          [
+            0.2743966281414032,
+            2.9202589988708496
+          ],
+          [
+            0.27463117241859436,
+            2.9190783500671387
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "self_geometry",
+        "dataset": "scannetpp",
+        "scene": "09c1414f1b",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "depth_ranges": [
+          [
+            0.13908778131008148,
+            0.9496991634368896
+          ],
+          [
+            0.13888046145439148,
+            0.949476957321167
+          ],
+          [
+            0.13864320516586304,
+            0.9491719603538513
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "self_geometry",
+        "dataset": "hiroom",
+        "scene": "20241230/828738/cam_sampled_08",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.8888888888888888,
+          0.8888888888888888,
+          0.8888888888888888
+        ],
+        "depth_ranges": [
+          [
+            0.21141067147254944,
+            1.7738111019134521
+          ],
+          [
+            0.21196132898330688,
+            1.774168610572815
+          ],
+          [
+            0.21213987469673157,
+            1.7737257480621338
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "self_geometry",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "depth_ranges": [
+          [
+            0.6971806287765503,
+            1.958414912223816
+          ],
+          [
+            0.6971806287765503,
+            1.958414912223816
+          ],
+          [
+            0.6971806287765503,
+            1.958414912223816
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "tco",
+        "dataset": "eth3d",
+        "scene": "courtyard",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.5555555555555555,
+          0.5555555555555555,
+          0.4444444444444444
+        ],
+        "depth_ranges": [
+          [
+            0.2744038701057434,
+            3.098135471343994
+          ],
+          [
+            0.2749682664871216,
+            3.111828088760376
+          ],
+          [
+            0.2729160189628601,
+            3.0912699699401855
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "tco",
+        "dataset": "7scenes",
+        "scene": "chess",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.5555555555555555,
+          0.5555555555555555,
+          0.5555555555555555
+        ],
+        "depth_ranges": [
+          [
+            0.27318400144577026,
+            2.9375507831573486
+          ],
+          [
+            0.27372461557388306,
+            2.940119504928589
+          ],
+          [
+            0.2735125422477722,
+            2.9358701705932617
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "tco",
+        "dataset": "scannetpp",
+        "scene": "09c1414f1b",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "depth_ranges": [
+          [
+            0.13665352761745453,
+            0.9400339722633362
+          ],
+          [
+            0.15724721550941467,
+            1.0485174655914307
+          ],
+          [
+            0.13672001659870148,
+            0.9407505393028259
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "tco",
+        "dataset": "hiroom",
+        "scene": "20241230/828738/cam_sampled_08",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.8888888888888888,
+          0.8888888888888888,
+          0.8888888888888888
+        ],
+        "depth_ranges": [
+          [
+            0.20982593297958374,
+            1.7737834453582764
+          ],
+          [
+            0.21382461488246918,
+            1.7743059396743774
+          ],
+          [
+            0.20901401340961456,
+            1.7750648260116577
+          ]
+        ]
+      },
+      {
+        "model": "da3",
+        "method": "tco",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "depth_ranges": [
+          [
+            0.6983116269111633,
+            1.9188404083251953
+          ],
+          [
+            0.6982770562171936,
+            1.9164783954620361
+          ],
+          [
+            0.6986671090126038,
+            1.9148372411727905
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "baseline",
+        "dataset": "eth3d",
+        "scene": "courtyard",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.6666666666666666,
+          0.6666666666666666,
+          0.6666666666666666
+        ],
+        "depth_ranges": [
+          [
+            0.2946118116378784,
+            3.164044141769409
+          ],
+          [
+            0.2946118116378784,
+            3.164044141769409
+          ],
+          [
+            0.2946118116378784,
+            3.164044141769409
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "baseline",
+        "dataset": "7scenes",
+        "scene": "chess",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.2222222222222222,
+          0.2222222222222222,
+          0.2222222222222222
+        ],
+        "depth_ranges": [
+          [
+            0.23033782839775085,
+            2.9073009490966797
+          ],
+          [
+            0.23033782839775085,
+            2.9073009490966797
+          ],
+          [
+            0.23033782839775085,
+            2.9073009490966797
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "baseline",
+        "dataset": "scannetpp",
+        "scene": "09c1414f1b",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "depth_ranges": [
+          [
+            0.12238417565822601,
+            0.8665241003036499
+          ],
+          [
+            0.12238417565822601,
+            0.8665241003036499
+          ],
+          [
+            0.12238417565822601,
+            0.8665241003036499
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "baseline",
+        "dataset": "hiroom",
+        "scene": "20241230/828738/cam_sampled_08",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.4444444444444444,
+          0.4444444444444444,
+          0.4444444444444444
+        ],
+        "depth_ranges": [
+          [
+            0.14768372476100922,
+            1.7757580280303955
+          ],
+          [
+            0.14768372476100922,
+            1.7757580280303955
+          ],
+          [
+            0.14768372476100922,
+            1.7757580280303955
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "baseline",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "depth_ranges": [
+          [
+            0.5745773911476135,
+            1.633834719657898
+          ],
+          [
+            0.5745773911476135,
+            1.633834719657898
+          ],
+          [
+            0.5745773911476135,
+            1.633834719657898
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "test3r",
+        "dataset": "eth3d",
+        "scene": "courtyard",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.2222222222222222,
+          0.2222222222222222,
+          0.2222222222222222
+        ],
+        "depth_ranges": [
+          [
+            0.13411763310432434,
+            1.5181472301483154
+          ],
+          [
+            0.08437801897525787,
+            1.4275283813476562
+          ],
+          [
+            0.0800335556268692,
+            1.3984636068344116
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "test3r",
+        "dataset": "7scenes",
+        "scene": "chess",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.1111111111111111,
+          0.1111111111111111,
+          0.1111111111111111
+        ],
+        "depth_ranges": [
+          [
+            0.15513639152050018,
+            2.537083148956299
+          ],
+          [
+            0.15836584568023682,
+            2.572880744934082
+          ],
+          [
+            0.1687856912612915,
+            2.631180763244629
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "test3r",
+        "dataset": "scannetpp",
+        "scene": "09c1414f1b",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "depth_ranges": [
+          [
+            0.30224573612213135,
+            1.9283279180526733
+          ],
+          [
+            0.215016171336174,
+            1.4858696460723877
+          ],
+          [
+            0.20876315236091614,
+            1.7583476305007935
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "test3r",
+        "dataset": "hiroom",
+        "scene": "20241230/828738/cam_sampled_08",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.3333333333333333,
+          0.3333333333333333,
+          0.3333333333333333
+        ],
+        "depth_ranges": [
+          [
+            0.13413861393928528,
+            1.6040596961975098
+          ],
+          [
+            0.0647217258810997,
+            1.4911081790924072
+          ],
+          [
+            0.07401479035615921,
+            1.5008270740509033
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "test3r",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.8888888888888888,
+          0.7777777777777777,
+          0.8888888888888888
+        ],
+        "depth_ranges": [
+          [
+            0.5281867384910583,
+            1.9491848945617676
+          ],
+          [
+            0.5243965983390808,
+            1.9582077264785767
+          ],
+          [
+            0.5179988145828247,
+            1.8659048080444336
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "self_geometry",
+        "dataset": "eth3d",
+        "scene": "courtyard",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.6666666666666666,
+          0.6666666666666666,
+          0.6666666666666666
+        ],
+        "depth_ranges": [
+          [
+            0.28990769386291504,
+            3.1065120697021484
+          ],
+          [
+            0.29095983505249023,
+            3.11283802986145
+          ],
+          [
+            0.2904093861579895,
+            3.1074938774108887
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "self_geometry",
+        "dataset": "7scenes",
+        "scene": "chess",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.2222222222222222,
+          0.2222222222222222,
+          0.2222222222222222
+        ],
+        "depth_ranges": [
+          [
+            0.23033782839775085,
+            2.9073009490966797
+          ],
+          [
+            0.23309379816055298,
+            2.918781042098999
+          ],
+          [
+            0.23033782839775085,
+            2.9073009490966797
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "self_geometry",
+        "dataset": "scannetpp",
+        "scene": "09c1414f1b",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "depth_ranges": [
+          [
+            0.11863953620195389,
+            0.8537548184394836
+          ],
+          [
+            0.12238417565822601,
+            0.8665241003036499
+          ],
+          [
+            0.1184198185801506,
+            0.8540834188461304
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "self_geometry",
+        "dataset": "hiroom",
+        "scene": "20241230/828738/cam_sampled_08",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.4444444444444444,
+          0.4444444444444444,
+          0.4444444444444444
+        ],
+        "depth_ranges": [
+          [
+            0.15150022506713867,
+            1.7784724235534668
+          ],
+          [
+            0.1509024053812027,
+            1.7784651517868042
+          ],
+          [
+            0.15200330317020416,
+            1.777894139289856
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "self_geometry",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "depth_ranges": [
+          [
+            0.5741838216781616,
+            1.6346629858016968
+          ],
+          [
+            0.5772779583930969,
+            1.639181137084961
+          ],
+          [
+            0.5737046599388123,
+            1.6335724592208862
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "tco",
+        "dataset": "eth3d",
+        "scene": "courtyard",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.3333333333333333,
+          0.7777777777777777,
+          0.5555555555555555
+        ],
+        "depth_ranges": [
+          [
+            0.2952979505062103,
+            3.161489963531494
+          ],
+          [
+            0.2925684452056885,
+            3.169802188873291
+          ],
+          [
+            0.29532551765441895,
+            3.213766098022461
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "tco",
+        "dataset": "7scenes",
+        "scene": "chess",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.3333333333333333,
+          0.2222222222222222,
+          0.1111111111111111
+        ],
+        "depth_ranges": [
+          [
+            0.2702271342277527,
+            3.07277774810791
+          ],
+          [
+            0.26149076223373413,
+            2.9949870109558105
+          ],
+          [
+            0.25489842891693115,
+            2.9141955375671387
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "tco",
+        "dataset": "scannetpp",
+        "scene": "09c1414f1b",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "depth_ranges": [
+          [
+            0.10771861672401428,
+            0.7893582582473755
+          ],
+          [
+            0.1137968897819519,
+            0.7846140265464783
+          ],
+          [
+            0.11504030227661133,
+            0.7937480211257935
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "tco",
+        "dataset": "hiroom",
+        "scene": "20241230/828738/cam_sampled_08",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          0.1111111111111111,
+          0.0,
+          0.0
+        ],
+        "depth_ranges": [
+          [
+            0.18817462027072906,
+            1.8458019495010376
+          ],
+          [
+            0.21394503116607666,
+            1.828803539276123
+          ],
+          [
+            0.2160044014453888,
+            1.8309468030929565
+          ]
+        ]
+      },
+      {
+        "model": "vggt",
+        "method": "tco",
+        "dataset": "dtu",
+        "scene": "scan1",
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "passed": 3,
+        "auc03": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "depth_ranges": [
+          [
+            0.5763027667999268,
+            1.6400128602981567
+          ],
+          [
+            0.5751439332962036,
+            1.6391408443450928
+          ],
+          [
+            0.5742233395576477,
+            1.6450823545455933
+          ]
+        ]
+      }
+    ]
+  }
+}

@@ -72,7 +72,7 @@ def report(root, c=None):
             values = [f'{row["means"][k]:.4f}' if k in row['means'] else '—' for k in METRICS]
             lines.append('| ' + ' | '.join([name, stage, f'{row["completed"]}/{row["expected"]}', *values]) + ' |')
             paper = ['—' if v is None else f'{v:.2f}' for v in PAPER[name][stage]]
-            if c.get('model', 'vggt') == 'vggt':
+            if c.get('model', 'vggt') == 'vggt' and c.get('method', 'self_geometry') == 'self_geometry':
                 lines.append('| ' + ' | '.join([name, '论文 VGGT ' + stage, '—', *paper]) + ' |')
     lines += ['', '## DTU（额外数据集，非论文结果）', '',
               '沿用 DA3 的 DTU 协议；距离单位 mm，越小越好。overall = (acc + comp) / 2。acc/comp 字段名按 DA3 返回值原样保留，详见 docs/method.md。', '',
