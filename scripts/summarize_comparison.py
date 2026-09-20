@@ -37,6 +37,16 @@ def selected_results(root, plan):
                 row['status'] = 'evaluated'
             except (ValueError, KeyError, TypeError) as exc:
                 row.update(status='invalid', error=str(exc), metrics={})
+        elif (directory/stage/'pose_metrics.json').exists():
+            # Preserve completed AUCs without calling an incomplete F1 run done.
+            try:
+                metrics = json.loads((directory/stage/'pose_metrics.json').read_text())
+                row['metrics'] = {k: float(metrics[k]) for k in ('auc01', 'auc03', 'auc30')}
+                if not all(np.isfinite(v) for v in row['metrics'].values()):
+                    raise ValueError('Nonfinite pose metric')
+                row['status'] = 'pose_only; reconstruction incomplete'
+            except (ValueError, KeyError, TypeError) as exc:
+                row.update(status='invalid', error=str(exc), metrics={})
         geom = 'overall' if job['dataset'] == 'dtu' else 'fscore'
         keys = ['auc01', 'auc03', 'auc30', f'recon_unposed_{geom}', f'recon_posed_{geom}']
         values = [f'{row["metrics"][k]:.6f}' if k in row['metrics'] else '—' for k in keys]

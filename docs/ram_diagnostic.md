@@ -34,3 +34,10 @@ Self-Geometry 对应中位深度约 7.88 米。官方融合 voxel 为 0.0390625 
 修正后的 TCO 在 artifacts/paper_protocol_tco_sparse_train 补跑，训练采用独立稀疏清单；
 Test3R 复用既有 checkpoint 补评测，单评测 scope 上限 48 GiB，全局仍为 72 GiB。
 ETH3D 已改为逐帧加载原分辨率 RGBD，减少全场景数组副本，未修改 TSDF 指标参数。
+
+最新补评测：Test3R 的 DTU、HiRoom 已成功，完整评测达到 9/10。
+VGGT/ETH3D 在 48 GiB scope 内再次运行，融合前三帧后约 58 秒被 SIGKILL。
+systemd 日志明确记录 “killed by the OOM killer”，本次可确认主机 RAM OOM，
+证据为 artifacts/test3r_eth3d_oom_journal.log；不再只是早先 SIGTERM 的推测。
+逐帧加载仍不足以容纳该退化预测生成的 TSDF 体积。AUC 单独保存在 pose_metrics.json；
+缺失的重建 F1 不填 0，也不算完整评测。不会无上限重试该场景或解除 RAM 限制。

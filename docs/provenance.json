@@ -64,7 +64,7 @@
     "scripts/scene_worker.py": "d1ed029e6acf23a6fe599ff73c039842c13f07c2f4ebbd613b564862310cc699",
     "scripts/status.py": "5e06cf0e0bb5989543e2cc41c8161fcf13085b4168eea3fb4928306270a6f313",
     "scripts/status_comparison.py": "293a6abe21fd5b0b29ea905585e5b25647ee5db8f7bc84bba166f01ab12a3f43",
-    "scripts/summarize_comparison.py": "71de2b66f17ab441b3146cdaaebed8fa359a403d5c5496e7e0aceedd2cca7185",
+    "scripts/summarize_comparison.py": "ff99ee348683e58582ccdd62dc43787d9d36847a67d59c4369f89d87ccd45cf9",
     "scripts/summarize_eval_seeds.py": "0d5b904bc9759852eb81192dc990e68d8bfc7313860cb119d98893dd234eb4f4",
     "scripts/summarize_experiments.py": "42241b13e7b240246bc393a1d3352b1bf9bf6f6c7796fbee4d252175a9569bb6",
     "scripts/summarize_full.py": "689b63a6c709259757fd25de6a22d70581b3a4546b7eeb1e99521d3ab02d64ca",

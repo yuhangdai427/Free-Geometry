@@ -45,6 +45,20 @@ def test_full_plan_contains_all_270_unique_jobs(monkeypatch):
     assert plan['sampling_seed'] == 42
 
 
+def test_selected_report_keeps_pose_after_reconstruction_failure(tmp_path):
+    report = script('summarize_comparison')
+    job = dict(model='vggt', method='test3r', dataset='eth3d', scene='courtyard', seed=0)
+    directory = tmp_path/'test3r/vggt/seed_0/eth3d/courtyard'
+    write_json(directory/'manifest.json', dict(image_files=['a', 'b']))
+    write_json(directory/'adapted/pose_metrics.json', dict(auc01=0., auc03=0., auc30=.0088))
+    result = report.selected_results(tmp_path, dict(jobs=[job]))
+    assert result['complete'] == 0
+    row = result['rows'][0]
+    assert row['status'].startswith('pose_only')
+    assert row['metrics']['auc03'] == 0.
+    assert 'recon_unposed_fscore' not in row['metrics']
+
+
 def test_dtu_selection_preserves_mask_camera_and_rgb_order():
     data = Dict(image_files=['ref33', 'frame0', 'frame1'], extrinsics=np.arange(48).reshape(3, 4, 4),
                 intrinsics=np.arange(27).reshape(3, 3, 3), aux=Dict(mask_files=['mask33', 'mask0', 'mask1']))

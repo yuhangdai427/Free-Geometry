@@ -1,6 +1,7 @@
 # TCO 显存诊断与调度约束
 
-2026-09-20：实验已按用户要求停止；此记录不授权自动恢复。
+2026-09-20：历史 100 帧训练已停止。后续用户已授权改为稀疏训练、最多 100 帧评测，
+新实验位于 artifacts/paper_protocol_tco_sparse_train，见 current_protocol.md。
 
 ## 协议来源更正
 
