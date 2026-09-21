@@ -55,11 +55,15 @@ def cv2_resize(d, wh):
 
 @torch.no_grad()
 def evaluate_scene(student, scene_data, eval_frames, max_frames: int = 0,
-                   scene: str = "", dataset_obj=None, export_dir: str = None) -> dict:
+                   scene: str = "", dataset_obj=None, export_dir: str = None,
+                   use_ray_pose: bool = False) -> dict:
     """ONE inference on the protocol eval frames with the in-memory student (LoRA
     active), producing ALL metrics together: pose AUC (compute_pose, w2c),
     scale-fitted AbsRel / δ1.25, AND recon_unposed F1/CD (mini_npz export ->
-    gt_meta -> fuse3d TSDF -> eval3d) when dataset_obj+export_dir are given."""
+    gt_meta -> fuse3d TSDF -> eval3d) when dataset_obj+export_dir are given.
+    use_ray_pose=True (2026-09-21): camera from the RAY map (origin-weighted T
+    + optimal-rotation R + ray-solved intrinsics) instead of CameraDec —
+    extrinsics AND intrinsics in the npz export are ray-solved too."""
     from depth_anything_3.bench.utils import compute_pose
     from depth_anything_3.utils.geometry import as_homogeneous
 
@@ -78,6 +82,7 @@ def evaluate_scene(student, scene_data, eval_frames, max_frames: int = 0,
         ref_view_strategy="first",
         export_dir=export_dir,
         export_format="mini_npz" if export_dir else "mini_npz",
+        use_ray_pose=use_ray_pose,
     )
     depth = np.asarray(pred.depth, dtype=np.float32)  # [N,H,W]
     ext = np.asarray(pred.extrinsics, dtype=np.float32)  # [N,4,4] w2c
@@ -210,17 +215,25 @@ def main() -> None:
     ap.add_argument("--model_name", default="model_weights/DA3-GIANT-1.1")
     ap.add_argument("--output_root", default="workspace/da3_protocol_smoke")
     ap.add_argument("--steps", type=int, default=100)
+    ap.add_argument("--freeze_camera_token", action="store_true",
+                    help="freeze the camera token (LoRA-only adaptation; raymap-path "
+                         "A/B: stop ray/focal drift via the dedicated camera channel)")
     ap.add_argument("--epochs", type=int, default=P.EPOCHS)
     ap.add_argument("--lr", type=float, default=P.LR)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--pose_weight", type=float, default=1.0,
                     help="1.0 = C2M (default); 0.0 = pure maskdistill (protocol fine "
                          "variant for tau<=0.55 datasets)")
-    ap.add_argument("--arm", default="c2m", choices=["c2m", "pw0", "rkdc1h", "rkdc1hc", "rkdc1hr"],
-                    help="c2m = maskdistill+rel (maskrel); pw0 = pure maskdistill; "
-                         "rkdc1h = maskdistill + 1.5*rkd_huber + 1.0*couple (no rel); "
-                         "rkdc1hc = rkdc1h + ctk_weight*camera-token KD; "
-                         "rkdc1hr = rkdc1h + rel_weight*corrected rel pose")
+    ap.add_argument("--arm", default="c2m", choices=["c2m", "pw0", "rkdc1h", "rkdc1hc", "rkdc1hr", "adaptive", "adaptive_a", "adaptive_b", "adaptive_s", "aligned", "aligned_rkd"],
+                    help="c2m = maskdistill+rel; pw0 = pure maskdistill; "
+                         "rkdc1h = maskdistill + 1.5*rkd_huber + 1.0*couple; "
+                         "rkdc1hc = rkdc1h + ctk; rkdc1hr = rkdc1h + corrected rel; "
+                         "adaptive = gap-weighted rel + 1.5*rkd + couple; "
+                         "adaptive_a = gap-weighted rel + (1-w_rel)*rkd + couple; "
+                         "adaptive_b = gap-weighted rel + w_rkd*rkd + couple; "
+                         "adaptive_s = gap-gated sim3(Umeyama-aligned pose) + couple; "
+                         "aligned = md + sim3(Umeyama-aligned pose) + couple; "
+                         "aligned_rkd = aligned + 1.5*rkd shape anchor")
     ap.add_argument("--ratio_mix", default=None,
                     help="comma-separated teacher:student ratios mixed within ONE run, "
                          "e.g. '8:4,16:4,24:8' (SelfEvo-style mixed asymmetry per pair)")
@@ -239,6 +252,9 @@ def main() -> None:
                          "SIFT match fraction vs the shared frames >= 0.1 (best of "
                          "40 tries). Fixes wide-baseline windows that mix "
                          "mutually-invisible frames (e.g. eth3d facade)")
+    ap.add_argument("--force_dense", action="store_true",
+                    help="A/B probe: force the dense_equidistant_sift branch "
+                         "regardless of tau (single-scene sampling ablation)")
     ap.add_argument("--rel_weight", type=float, default=1.0,
                     help="weight of the corrected rel-pose term (rkdc1hr arm)")
     ap.add_argument("--ctk_weight", type=float, default=1.0,
@@ -264,6 +280,9 @@ def main() -> None:
                     help="ablation: keep the masked student input but compute the "
                          "distill loss on ALL patch positions (default: MGD-style, "
                          "masked positions only)")
+    ap.add_argument("--abs_pose_w", type=float, default=0.0,
+                    help="weight of absolute pose distillation (R chordal + t Huber) "
+                         "added to adaptive arms; 0 = off")
     ap.add_argument("--n_shared", type=int, default=4,
                     help="shared (student) frames per pair: 4 = 16:4 protocol, 8 = 16:8 "
                          "(unsaturates the student's local targets on strong backbones)")
@@ -365,7 +384,8 @@ def main() -> None:
 
     print(f"Loading teacher + student: {args.model_name}")
     teacher = P.create_teacher(args.model_name)  # CPU; moved to GPU per phase
-    student = P.create_student(args.model_name)
+    student = P.create_student(args.model_name,
+                               train_camera_token=not args.freeze_camera_token)
 
     trace_rows: list = []
     summary = {"model": args.model_name, "args": vars(args), "scenes": {}}
@@ -395,7 +415,8 @@ def main() -> None:
                                            selfevo=args.selfevo,
                                            combo=args.combo,
                                            combo_se_frac=args.combo_se_frac,
-                                           sparse_overlap=args.sparse_overlap)
+                                           sparse_overlap=args.sparse_overlap,
+                                           force_dense=args.force_dense)
         _tau = proto.get("tau")
         tau_s = f"{_tau:.3f}" if isinstance(_tau, (int, float)) else str(_tau)
         print(f"[{scene}] N={proto['N']} tau={tau_s} "
@@ -529,6 +550,7 @@ def main() -> None:
             two_stage=args.two_stage,
             early_stop=args.early_stop,
             mask_loss_positions=not args.loss_all_pos,
+            abs_pose_w=args.abs_pose_w,
             on_step=_on_step, on_probe=_on_probe if args.swanlab else None, v2=v2)
 
         if run is not None and v2 is not None and v2.probe:

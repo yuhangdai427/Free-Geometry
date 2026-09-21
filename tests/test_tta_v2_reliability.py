@@ -293,3 +293,36 @@ def test_sample_ab_tasks_dedup_probe_disjoint_reproducible():
                                             dataset="synth", scene="s1",
                                             n_train=10, n_probe=2)
     assert train == train2 and probe == probe2
+
+
+def test_small_pool_random_branch_yields_distinct_shared_groups():
+    """N <= shared + 2*extras: the window is the whole pool; a sorted stride
+    pick would be deterministic. The shared group must still be drawn at
+    random so dedup has something to discriminate."""
+    frac = lambda f, s: 0.2               # noqa: E731
+    for n, tN in ((13, 8), (26, 16)):     # hiroom-tiny and eth3d-office regimes
+        train, probe, meta = bab.sample_ab_tasks(n, dense=False, frac=frac,
+                                                 dataset="synth", scene=f"small{n}",
+                                                 n_train=10, n_probe=2, teacher_N=tN)
+        shared_keys = {tuple(p["student_frames"]) for p in train}
+        assert len(shared_keys) > 2, f"N={n}: only {len(shared_keys)} distinct tasks"
+        assert all(p["ab_overlap"] == max(0, 2 * (tN - 4) - (n - 4)) for p in train)
+        assert all(len(p["teacher_frames"]) == tN == len(p["teacher_frames_B"])
+                   for p in train)
+
+
+def test_full_pool_union_dedup_relaxed_for_16frame_small_scenes():
+    """N=26, teacher_N=16: every A-union-B spans all 26 frames, so union-key
+    dedup is structurally impossible; shared-group dedup must still give
+    10 distinct tasks and the scene must NOT be marked dedup-exhausted."""
+    frac = lambda f, s: 0.2               # noqa: E731
+    train, probe, meta = bab.sample_ab_tasks(26, dense=False, frac=frac,
+                                             dataset="synth", scene="office26",
+                                             n_train=10, n_probe=2, teacher_N=16)
+    assert meta["train_dedup_short"] is False and meta["probe_dedup_short"] is False
+    assert len({tuple(p["student_frames"]) for p in train}) == 10
+    assert all(p["ab_overlap"] == 2 for p in train)        # 24 needed, 22 pool
+    probe_teachers = {tuple(sorted(p["teacher_frames"])) for p in probe}
+    train_ctx = {tuple(sorted(p["teacher_frames"])) for p in train} \
+        | {tuple(sorted(p["teacher_frames_B"])) for p in train}
+    assert probe_teachers.isdisjoint(train_ctx)            # probe vs A/B lists

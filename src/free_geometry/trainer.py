@@ -101,6 +101,22 @@ def train_scene(adapter, proto: Dict, scene: str, device: str = "cuda",
 
     step, losses = 0, []
     torch.cuda.reset_peak_memory_stats()
+
+    # Adaptive arm: step-0 rel gap → w_rel (fixed for entire run)
+    scene_w_rel = 0.0
+    if arm == "adaptive":
+        from .losses import loss_rel_pose
+        adapter_gaps = []
+        with torch.no_grad():
+            for ci, cache in enumerate(caches):
+                imgs4 = pair_imgs[ci].unsqueeze(0).to(device)
+                out = adapter.forward_student(imgs4)
+                gap = float(loss_rel_pose(out["ext_w2c"], cache["ext_w2c"]))
+                adapter_gaps.append(gap)
+        scene_gap = float(np.median(adapter_gaps))
+        scene_w_rel = scene_gap / (scene_gap + 0.1)
+        log_fn(f"[{scene}] adaptive: gap={scene_gap:.6f} → w_rel={scene_w_rel:.4f}")
+
     for epoch in range(epochs):
         if step >= n_steps:
             break
@@ -111,7 +127,8 @@ def train_scene(adapter, proto: Dict, scene: str, device: str = "cuda",
             cache = caches[pi]
             prep = {**cache,
                     "conf_patch": _conf_patch(cache["conf"], patch_hw),
-                    "valid": valid_mask_from_conf(cache["conf"])}
+                    "valid": valid_mask_from_conf(cache["conf"]),
+                    "w_rel": scene_w_rel}
             images4 = pair_imgs[pi].unsqueeze(0).to(device)
             images4_in, _pmask = mask_image_blocks(
                 images4, mask_ratio, patch_hw,

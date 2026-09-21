@@ -86,6 +86,7 @@ _loss_couple_orig = _apl.loss_couple
 # ones in the training loop, so mask_ratio reports 1.0 and every other pmask
 # consumer is affected).
 _V2_ALLPOS = False
+_V2_QFEAT_OFF = False
 
 # Protocol v2 A/B (--v2_ab): dual teacher context (A/B) with FROZEN reliability
 # weights. _V2_AB gates the w/edge_w application in loss_b5_maskdistill and
@@ -1355,7 +1356,7 @@ def loss_b5_maskdistill(depth_head, teacher_cache, feats24_s, patch_hw, patch_ma
     w_all = teacher_patch_conf(teacher_cache, patch_hw)
     mask_ratio = float(patch_mask.mean()) if patch_mask is not None else -1.0
     w = w_all if (_V2_ALLPOS or patch_mask is None) else w_all * patch_mask
-    qf = teacher_cache.get("q_feat") if _V2_AB else None
+    qf = None if _V2_QFEAT_OFF else (teacher_cache.get("q_feat") if _V2_AB else None)
     if qf is not None:
         w = w * qf
     else:
@@ -1389,6 +1390,67 @@ def teacher_patch_conf(teacher_cache, patch_hw) -> torch.Tensor:
     confp = confp.reshape(B, S, ph * pw)
     w = confp / confp.mean().clamp_min(1e-8)
     return w.detach()
+
+
+def _b5_components(base, teacher_cache, feats24_s, patch_hw, patch_mask):
+    """Split the deployed B5 patch loss into its two components:
+    (SmoothL1-part, 2*(1-cos)-part). Same math/weights as loss_b5_maskdistill
+    (incl. the allpos/masked weight branch); for --grad_components only."""
+    w_all = teacher_patch_conf(teacher_cache, patch_hw)
+    if _V2_ALLPOS or patch_mask is None:
+        w = w_all
+    else:
+        w = w_all * patch_mask
+        w = w / w.mean().clamp_min(1e-8)
+    tot_h, tot_c = 0.0, 0.0
+    for layer in TAP_LAYERS:
+        hs = M.to_norm(base.depth_head, M.to_patch(feats24_s[layer].float()))
+        ht = M.to_norm(base.depth_head,
+                       M.to_patch(teacher_cache["feats"][layer][:, STUDENT_INDICES].float()))
+        huber_t = torch.nn.functional.smooth_l1_loss(
+            hs, ht, beta=1.0, reduction="none").mean(dim=-1)
+        cos_t = torch.nn.functional.cosine_similarity(hs, ht, dim=-1)
+        tot_h = tot_h + (huber_t * w).mean()
+        tot_c = tot_c + 2.0 * (1.0 - (cos_t * w).mean())
+    n = len(TAP_LAYERS)
+    return tot_h / n, tot_c / n
+
+
+def _raw_components(teacher_cache, feats24_s):
+    """Split the RAW-space patch loss (C2M_rawrel's feature term: to_patch,
+    no LN, no conf) into (SmoothL1-part, 2*(1-cos)-part)."""
+    tot_h, tot_c = 0.0, 0.0
+    for layer in TAP_LAYERS:
+        hs = M.to_patch(feats24_s[layer].float())
+        ht = M.to_patch(teacher_cache["feats"][layer][:, STUDENT_INDICES].float())
+        tot_h = tot_h + torch.nn.functional.smooth_l1_loss(hs, ht, beta=1.0)
+        cosv = torch.nn.functional.cosine_similarity(hs, ht, dim=-1).mean()
+        tot_c = tot_c + 2.0 * (1.0 - cosv)
+    n = len(TAP_LAYERS)
+    return tot_h / n, tot_c / n
+
+
+def _pose_rel_components(pose_s, pose_t):
+    """loss_pose_rel split into (rot, tdir) tensors — for --grad_components."""
+    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+    ext_s, _ = pose_encoding_to_extri_intri(pose_s.float(), (378, 504))
+    ext_t, _ = pose_encoding_to_extri_intri(pose_t.float(), (378, 504))
+    R_s, t_s = ext_s[..., :3, :3], ext_s[..., :3, 3]
+    R_t, t_t = ext_t[..., :3, :3], ext_t[..., :3, 3]
+    S = R_s.shape[1]
+    rot_loss, tdir_loss, npairs = 0.0, 0.0, 0
+    for i in range(S):
+        for j in range(i + 1, S):
+            Rr_s = R_s[:, i] @ R_s[:, j].transpose(-1, -2)
+            Rr_t = R_t[:, i] @ R_t[:, j].transpose(-1, -2)
+            tr_s = t_s[:, i].unsqueeze(-1) - Rr_s @ t_s[:, j].unsqueeze(-1)
+            tr_t = t_t[:, i].unsqueeze(-1) - Rr_t @ t_t[:, j].unsqueeze(-1)
+            rot_loss = rot_loss + ((Rr_s - Rr_t) ** 2).sum(dim=(-2, -1)).mean()
+            tn_s = torch.nn.functional.normalize(tr_s.squeeze(-1), dim=-1, eps=1e-8)
+            tn_t = torch.nn.functional.normalize(tr_t.squeeze(-1), dim=-1, eps=1e-8)
+            tdir_loss = tdir_loss + (1.0 - (tn_s * tn_t).sum(-1)).mean()
+            npairs += 1
+    return rot_loss / npairs, tdir_loss / npairs
 
 
 def loss_b5_confperm(depth_head, teacher_cache, feats24_s, patch_hw,
@@ -2280,6 +2342,14 @@ def compute_loss(arm, a1, base, teacher_cache, feats24_s, preds, patch_hw, step=
         pt = teacher_cache["pose_enc8"][:, STUDENT_INDICES].float()
         rel, rel_extra = loss_pose_rel(preds["pose_enc"], pt)
         return feat + rel, {**extra, **rel_extra}
+    if arm == "C2M_rawrel":
+        # raw-space patch distill (no LN, no conf; identical form to the DA3
+        # --half_mode vggt port) + the SAME deployed rel-pose term
+        feat, extra = loss_b_patchform(base.depth_head, teacher_cache, feats24_s,
+                                       patch_hw, space="raw", cam_token=False)
+        pt = teacher_cache["pose_enc8"][:, STUDENT_INDICES].float()
+        rel, rel_extra = loss_pose_rel(preds["pose_enc"], pt)
+        return feat + rel, {**extra, **rel_extra}
     if arm == "C2M_ABS":
         feat, extra = loss_b5_maskdistill(base.depth_head, teacher_cache, feats24_s, patch_hw, patch_mask)
         abs_l, abs_extra = loss_abs_pose_norm(preds["pose_enc"], teacher_cache)
@@ -2413,6 +2483,25 @@ def compute_loss(arm, a1, base, teacher_cache, feats24_s, preds, patch_hw, step=
         cp, cp_extra = loss_couple(preds["pose_enc"], preds["depth"], pt,
                                    teacher_cache["depth4"], teacher_cache.get("conf4"))
         return feat + 1.5 * rkd + 1.0 * cp, {**extra, **rkd_extra, **cp_extra}
+    if arm == "C2M_ADAPTIVE":
+        # adaptive_a (2026-09-20, DA3 parity): md + w_rel*rel + (1-w_rel)*rkd
+        # + couple — rkd complementary to the step-0 gap weight (bad teacher ->
+        # high w_rel -> rkd down-weighted instead of distilling garbage).
+        feat, extra = loss_b5_maskdistill(base.depth_head, teacher_cache, feats24_s, patch_hw, patch_mask)
+        pt = teacher_cache["pose_enc8"][:, STUDENT_INDICES].float()
+        rkd, rkd_extra = loss_rkd_shared_pose_huber(preds["pose_enc"], pt)
+        cp, cp_extra = loss_couple(preds["pose_enc"], preds["depth"], pt,
+                                   teacher_cache["depth4"], teacher_cache.get("conf4"))
+        w_rel = teacher_cache.get("w_rel", 0.0)
+        rkd_w = max(0.0, 1.0 - w_rel)
+        total = feat + rkd_w * rkd + 1.0 * cp
+        if w_rel > 0:
+            rel, rel_extra = loss_pose_rel(preds["pose_enc"], pt)
+            total = total + w_rel * rel
+            extra = {**extra, **rel_extra, "w_rel": w_rel, "rkd_w": rkd_w}
+        else:
+            extra = {**extra, "w_rel": 0.0, "rkd_w": rkd_w}
+        return total, {**extra, **rkd_extra, **cp_extra}
     if arm == "C2M_RKDCR1H":
         # rkdc1h + corrected rel pose (E_i @ inv(E_j) construction, 2026-09-18)
         feat, extra = loss_b5_maskdistill(base.depth_head, teacher_cache, feats24_s, patch_hw, patch_mask)
@@ -2753,6 +2842,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run_root", default="artifacts/diagnostics/bakeoff_v1")
     ap.add_argument("--scenes", nargs="*", default=None)
+    ap.add_argument("--grad_components", action="store_true",
+                    help="record per-update per-pair GRADIENT NORMS of the two "
+                         "deployed B5 loss components (SmoothL1 vs cos) via "
+                         "autograd.grad; training math unchanged")
     ap.add_argument("--arms", nargs="*", default=ARMS)
     ap.add_argument("--epochs", type=int, default=EPOCHS)
     ap.add_argument("--lr", type=float, default=LR)
@@ -2840,6 +2933,10 @@ def main():
                          "allpos=1.0 while mask_ratio still reports the input "
                          "mask. Distinct from --loss_all_pos (loop-level pmask "
                          "replacement, mask_ratio becomes 1.0)")
+    ap.add_argument("--v2_qfeat_off", action="store_true",
+                    help="protocol v2: do NOT apply q_feat to the feature loss "
+                         "(final config — geometry-side reliability kept; "
+                         "feature downweighting cost VGGT F1)")
     ap.add_argument("--v2_ab", action="store_true",
                     help="protocol v2 A/B: dual teacher context per train pair "
                          "(manifest train_pairs must carry teacher_frames_B, "
@@ -2855,6 +2952,11 @@ def main():
                          "relative-rotation angle exceeds this, the v2 rel "
                          "branch is switched off for the scene (weights forced "
                          "to 0). Active only when --v2_rel_weight > 0.")
+    ap.add_argument("--v2_rel_tau_gate", type=float, default=0.55,
+                    help="dense-video rel gate (0 = off): scenes with SIFT tau "
+                         "> this threshold skip the v2 rel branch (dense-video "
+                         "near-zero-baseline targets are toxic — evidence: "
+                         "7scenes chess rel-on -9%%/-21%% vs off +8.8%%/+1.5%%)")
     ap.add_argument("--v2_rot_weight", type=float, default=None,
                     help="rotation-branch weight (None -> fall back to "
                          "--v2_rel_weight); ramped by min(1, step/20)")
@@ -2891,9 +2993,10 @@ def main():
     if args.ema_teacher and args.teacher_consensus:
         raise ValueError("--ema_teacher and --teacher_consensus are mutually exclusive "
                          "(EMA refresh rebuilds single-context caches)")
-    global _V2_COUPLE_FIX, _V2_ALLPOS, _V2_AB, _V2_GEO_W
+    global _V2_COUPLE_FIX, _V2_ALLPOS, _V2_AB, _V2_GEO_W, _V2_QFEAT_OFF
     _V2_COUPLE_FIX = bool(args.v2_couple_fix)
     _V2_ALLPOS = bool(args.v2_allpos)
+    _V2_QFEAT_OFF = bool(args.v2_qfeat_off)
     _V2_AB = bool(args.v2_ab)
     _V2_GEO_W = None
     if args.v2_grad_cap and args.v2_rel_weight <= 0:
@@ -3030,13 +3133,20 @@ def main():
                 l: 0.5 * (M.to_patch(cache["feats"][l][:, STUDENT_INDICES].float())
                           + M.to_patch(cache["student_feats"][l]))
                 for l in TAP_LAYERS}
-            gt4 = M.load_probe_gt(scene_data, pair["student_frames"],
-                                  (images4.shape[-2], images4.shape[-1]))
-            pp_t = perpatch_logres2(
-                cache["depth4"].squeeze(0).squeeze(-1).cpu().numpy(), gt4, (ph, pw))
-            pp_s = perpatch_logres2(sdepth.cpu().numpy(), gt4, (ph, pw))
-            w = torch.from_numpy(np.where(pp_t < pp_s, 1.0, 0.1)).float()
-            cache["oracle_w"] = (w / w.mean().clamp_min(1e-8))[None].to(device)  # [1,4,P]
+            if common._CURRENT_DATASET in ("dtu", "dtu64"):
+                # DTU has no GT depth -> perpatch log-res oracle weights are
+                # unavailable. oracle_w feeds only loss_g1_oracle (GT oracle
+                # diagnostic arm), so uniform ones are a safe stand-in.
+                cache["oracle_w"] = torch.ones(
+                    1, len(STUDENT_INDICES), ph * pw, device=device)
+            else:
+                gt4 = M.load_probe_gt(scene_data, pair["student_frames"],
+                                      (images4.shape[-2], images4.shape[-1]))
+                pp_t = perpatch_logres2(
+                    cache["depth4"].squeeze(0).squeeze(-1).cpu().numpy(), gt4, (ph, pw))
+                pp_s = perpatch_logres2(sdepth.cpu().numpy(), gt4, (ph, pw))
+                w = torch.from_numpy(np.where(pp_t < pp_s, 1.0, 0.1)).float()
+                cache["oracle_w"] = (w / w.mean().clamp_min(1e-8))[None].to(device)  # [1,4,P]
             if pi_all >= n_train:
                 cache["pose_disagree_deg"] = rel_rot_deg(
                     preds["pose_enc"], cache["pose_enc8"][:, STUDENT_INDICES].float())
@@ -3047,6 +3157,24 @@ def main():
         train_caches, probe_caches = caches[:n_train], caches[n_train:]
         train_images = pair_images[:n_train]
         train_images8 = pair_images8[:n_train]
+
+        # ---- C2M_ADAPTIVE: step-0 rel gap → per-scene w_rel ----
+        if "C2M_ADAPTIVE" in args.arms:
+            _gaps = []
+            with torch.no_grad():
+                for ci in range(n_train):
+                    _imgs4 = train_images[ci].to(device)
+                    _f24, _psi, _preds0 = M.student_preds(student, _imgs4)
+                    _gap, _ = loss_pose_rel(
+                        _preds0["pose_enc"],
+                        train_caches[ci]["pose_enc8"][:, STUDENT_INDICES].float())
+                    _gaps.append(float(_gap))
+            _sg = float(np.median(_gaps))
+            _wr = _sg / (_sg + 0.1)
+            for c in train_caches:
+                c["w_rel"] = _wr
+            print(f"[{scene}] C2M_ADAPTIVE: gap={_sg:.6f} → w_rel={_wr:.4f}", flush=True)
+
         # ---- protocol v2 A/B: scene-level tau -> frozen per-pair q_* weights
         if args.v2_ab:
             # tau = 80th percentile (NOT median): tau=median gives ~50% of
@@ -3109,6 +3237,16 @@ def main():
                   flush=True)
         scene_rot_w = 0.0 if rel_gate_off else base_rot_w
         scene_tdir_w = 0.0 if rel_gate_off else base_tdir_w
+        # dense-video rel gate (unified rule, evidence: 7scenes chess rel-on
+        # -9%/-21% vs rel-off +8.8%/+1.5%): near-zero baselines make the
+        # relative-pose target toxic on dense scenes (tau > 0.55).
+        scene_tau = float(sc.get("tau", float("nan")))
+        if args.v2_rel_tau_gate > 0 and scene_tau == scene_tau \
+                and scene_tau > args.v2_rel_tau_gate:
+            if scene_rot_w > 0 or scene_tdir_w > 0:
+                print(f"[{scene}] rel TAU-GATED off (tau={scene_tau:.3f} > "
+                      f"{args.v2_rel_tau_gate})", flush=True)
+            scene_rot_w = scene_tdir_w = 0.0
         if any("pose_disagree_deg" in c for c in probe_caches):
             dg = float(np.median([c["pose_disagree_deg"] for c in probe_caches
                                   if "pose_disagree_deg" in c]))
@@ -3254,11 +3392,11 @@ def main():
                     torch.manual_seed(stable_seed("cf_rng", scene, epoch, pi, args.seed))
                     pmask = None
                     images4_in = images4
-                    if arm in ("B5_maskdistill", "C2M_maskrel", "MD25", "MD75", "CONFD",
-                               "C2M_CamRel", "CONFD_REL", "B5_CTK", "C2M_CTK", "C2M_REL10", "C2M_REL2", "C2M_TRIP", "C2M_TRIF", "C2M_TRIF2", "C2M_TRIF3", "C2M_HARD", "C2M_SCL", "C2M_CYC", "C2M_CONFP", "C2M_GATE", "C2M_ABS", "C2M_ABS_REL", "C2M_ABSR", "C2M_ABSW1", "C2M_ABSR5", "C2M_RELAT", "C2M_RABS1", "C2M_RABS5", "C2M_RABS3", "C2M_XSH", "C2M_XSHA", "C2M_XAC", "C2M_XAC2", "C2M_XSH1", "C2M_XSHS", "C2M_XSH1S", "C2M_NREL", "C2M_RKD15", "C2M_RKDC", "C2M_RKDS", "C2M_XEXT", "C2M_RKDC1", "C2M_RKDC1R", "C2M_RKDC1A", "C2M_RKDC1H", "C2M_RKDCR1H", "C2M_RKDC1HC", "C2M_maskrel_CTK", "C2M_RKDC2", "C2M_RKDC3", "C2M_RELC", "C2M_RKLH", "C2M_RELCH", "C2M_RKCX", "C2M_RKDCX", "C2M_RKDT16", "C2M_RKDCX3", "C2M_XAP", "C2M_RKDCL", "C2M_TGM"):
-                        ratio = {"B5_maskdistill": 0.5, "C2M_maskrel": 0.5, "CONFD": 0.5,
+                    if arm in ("B5_maskdistill", "C2M_maskrel", "C2M_rawrel", "MD25", "MD75", "CONFD",
+                               "C2M_CamRel", "CONFD_REL", "B5_CTK", "C2M_CTK", "C2M_REL10", "C2M_REL2", "C2M_TRIP", "C2M_TRIF", "C2M_TRIF2", "C2M_TRIF3", "C2M_HARD", "C2M_SCL", "C2M_CYC", "C2M_CONFP", "C2M_GATE", "C2M_ABS", "C2M_ABS_REL", "C2M_ABSR", "C2M_ABSW1", "C2M_ABSR5", "C2M_RELAT", "C2M_RABS1", "C2M_RABS5", "C2M_RABS3", "C2M_XSH", "C2M_XSHA", "C2M_XAC", "C2M_XAC2", "C2M_XSH1", "C2M_XSHS", "C2M_XSH1S", "C2M_NREL", "C2M_RKD15", "C2M_RKDC", "C2M_RKDS", "C2M_XEXT", "C2M_RKDC1", "C2M_RKDC1R", "C2M_RKDC1A", "C2M_RKDC1H", "C2M_RKDCR1H", "C2M_RKDC1HC", "C2M_ADAPTIVE", "C2M_maskrel_CTK", "C2M_RKDC2", "C2M_RKDC3", "C2M_RELC", "C2M_RKLH", "C2M_RELCH", "C2M_RKCX", "C2M_RKDCX", "C2M_RKDT16", "C2M_RKDCX3", "C2M_XAP", "C2M_RKDCL", "C2M_TGM"):
+                        ratio = {"B5_maskdistill": 0.5, "C2M_maskrel": 0.5, "C2M_rawrel": 0.5, "CONFD": 0.5,
                                  "C2M_CamRel": 0.5, "CONFD_REL": 0.5, "B5_CTK": 0.5,
-                                 "C2M_CTK": 0.5, "C2M_REL10": 0.5, "C2M_REL2": 0.5, "C2M_TRIP": 0.5, "C2M_TRIF": 0.5, "C2M_TRIF2": 0.5, "C2M_TRIF3": 0.5, "C2M_HARD": 0.5, "C2M_SCL": 0.5, "C2M_CYC": 0.5, "C2M_CONFP": 0.5, "C2M_GATE": 0.5, "C2M_MC": 0.5, "C2M_ABS": 0.5, "C2M_ABS_REL": 0.5, "C2M_ABSR": 0.5, "C2M_ABSW1": 0.5, "C2M_ABSR5": 0.5, "C2M_RELAT": 0.5, "C2M_RABS1": 0.5, "C2M_RABS5": 0.5, "C2M_RABS3": 0.5, "C2M_XSH": 0.5, "C2M_XSHA": 0.5, "C2M_XAC": 0.5, "C2M_XAC2": 0.5, "C2M_XSH1": 0.5, "C2M_XSHS": 0.5, "C2M_XSH1S": 0.5, "C2M_NREL": 0.5, "C2M_RKD15": 0.5, "C2M_RKDC": 0.5, "C2M_RKDS": 0.5, "C2M_XEXT": 0.5, "C2M_RKDC1": 0.5, "C2M_RKDC1R": 0.5, "C2M_RKDC1A": 0.5, "C2M_RKDC1H": 0.5, "C2M_RKDCR1H": 0.5, "C2M_RKDC1HC": 0.5, "C2M_maskrel_CTK": 0.5, "C2M_RKDC2": 0.5, "C2M_RKDC3": 0.5, "C2M_RELC": 0.5, "C2M_RKLH": 0.5, "C2M_RELCH": 0.5, "C2M_RKCX": 0.5, "C2M_RKDCX": 0.5, "C2M_RKDT16": 0.5, "C2M_RKDCX3": 0.5, "C2M_XAP": 0.5, "C2M_RKDCL": 0.5, "C2M_TGM": 0.5,
+                                 "C2M_CTK": 0.5, "C2M_REL10": 0.5, "C2M_REL2": 0.5, "C2M_TRIP": 0.5, "C2M_TRIF": 0.5, "C2M_TRIF2": 0.5, "C2M_TRIF3": 0.5, "C2M_HARD": 0.5, "C2M_SCL": 0.5, "C2M_CYC": 0.5, "C2M_CONFP": 0.5, "C2M_GATE": 0.5, "C2M_MC": 0.5, "C2M_ABS": 0.5, "C2M_ABS_REL": 0.5, "C2M_ABSR": 0.5, "C2M_ABSW1": 0.5, "C2M_ABSR5": 0.5, "C2M_RELAT": 0.5, "C2M_RABS1": 0.5, "C2M_RABS5": 0.5, "C2M_RABS3": 0.5, "C2M_XSH": 0.5, "C2M_XSHA": 0.5, "C2M_XAC": 0.5, "C2M_XAC2": 0.5, "C2M_XSH1": 0.5, "C2M_XSHS": 0.5, "C2M_XSH1S": 0.5, "C2M_NREL": 0.5, "C2M_RKD15": 0.5, "C2M_RKDC": 0.5, "C2M_RKDS": 0.5, "C2M_XEXT": 0.5, "C2M_RKDC1": 0.5, "C2M_RKDC1R": 0.5, "C2M_RKDC1A": 0.5, "C2M_RKDC1H": 0.5, "C2M_RKDCR1H": 0.5, "C2M_RKDC1HC": 0.5, "C2M_ADAPTIVE": 0.5, "C2M_maskrel_CTK": 0.5, "C2M_RKDC2": 0.5, "C2M_RKDC3": 0.5, "C2M_RELC": 0.5, "C2M_RKLH": 0.5, "C2M_RELCH": 0.5, "C2M_RKCX": 0.5, "C2M_RKDCX": 0.5, "C2M_RKDT16": 0.5, "C2M_RKDCX3": 0.5, "C2M_XAP": 0.5, "C2M_RKDCL": 0.5, "C2M_TGM": 0.5,
                                  "MD25": 0.25, "MD75": 0.75}[arm]
                         images4_in, pmask = mask_image_blocks(
                             images4, ratio, patch_hw,
@@ -3502,6 +3640,42 @@ def main():
                     #      original single scaler.scale(loss).backward()
                     #      (regression-locked).
                     loss_base = loss
+                    comp_g = None
+                    comp_rel = None
+                    if args.grad_components and arm in ("B5_maskdistill", "C2M_maskrel", "C2M_RKDC1H", "C2M_rawrel"):
+                        try:
+                            if arm == "C2M_rawrel":
+                                l_h, l_c = _raw_components(cache, feats24_s)
+                            else:
+                                l_h, l_c = _b5_components(base, cache, feats24_s, patch_hw, pmask)
+                            if torch.is_tensor(l_h) and l_h.requires_grad:
+                                gh = torch.autograd.grad(l_h, params, retain_graph=True, allow_unused=True)
+                                gc = torch.autograd.grad(l_c, params, retain_graph=True, allow_unused=True)
+                                ghf = torch.cat([t.reshape(-1).float() for t in gh if t is not None])
+                                gcf = torch.cat([t.reshape(-1).float() for t in gc if t is not None])
+                                comp_g = (float(l_h), float(l_c), float(ghf.norm()), float(gcf.norm()),
+                                          float(torch.dot(ghf, gcf) /
+                                                (ghf.norm() * gcf.norm()).clamp_min(1e-12)))
+                                del gh, gc, ghf, gcf
+                        except Exception as _e:
+                            comp_g = None
+                            print(f"[{scene}] grad_components failed: {_e}", flush=True)
+                        if arm in ("C2M_maskrel", "C2M_rawrel") and preds is not None \
+                                and "pose_enc" in preds and cache.get("pose_enc8") is not None:
+                            try:
+                                pt = cache["pose_enc8"][:, STUDENT_INDICES].float()
+                                l_r, l_td = _pose_rel_components(preds["pose_enc"], pt)
+                                if l_r.requires_grad:
+                                    gr = torch.autograd.grad(l_r, params, retain_graph=True, allow_unused=True)
+                                    gtd = torch.autograd.grad(l_td, params, retain_graph=True, allow_unused=True)
+                                    grf = torch.cat([t.reshape(-1).float() for t in gr if t is not None])
+                                    gtf = torch.cat([t.reshape(-1).float() for t in gtd if t is not None])
+                                    comp_rel = (float(l_r), float(l_td),
+                                                float(grf.norm()), float(gtf.norm()))
+                                    del gr, gtd, grf, gtf
+                            except Exception as _e:
+                                comp_rel = None
+                                print(f"[{scene}] grad_rel failed: {_e}", flush=True)
                     loss_rel = None
                     loss_rel_b = None
                     if scene_rot_w > 0 or scene_tdir_w > 0:
@@ -3558,6 +3732,20 @@ def main():
                                 p.sub_(e)
                     scaler.unscale_(optimizer)
                     gn = torch.nn.utils.clip_grad_norm_(params, CLIP)
+                    if comp_g is not None:
+                        _lh, _lc, _gh, _gc, _gd = comp_g
+                        _sh = _gc / (_gh + _gc) if (_gh + _gc) > 0 else float("nan")
+                        _rtxt = ""
+                        if comp_rel is not None:
+                            _lr, _lt, _gr, _gt = comp_rel
+                            _rtxt = (f" | rot: L={_lr:.4f} g={_gr:.4f}"
+                                     f" | tdir: L={_lt:.4f} g={_gt:.4f}")
+                        print(f"[{scene}] gcomp step {step + 1} pair={pi} "
+                              f"L_huber={_lh:.4f} L_cos={_lc:.4f} "
+                              f"g_huber={_gh:.4f} g_cos={_gc:.4f} "
+                              f"cos_share={_sh:.3f} dir={_gd:.3f} "
+                              f"gn={float(gn):.3f} lr={scheduler.get_last_lr()[0]:.2e}{_rtxt}",
+                              flush=True)
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)

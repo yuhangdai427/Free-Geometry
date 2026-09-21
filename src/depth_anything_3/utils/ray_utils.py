@@ -425,8 +425,11 @@ def get_params_for_ransac(N, device):
     sample_ratio=0.3
     num_sample_for_ransac=8
     n_sample = max(num_sample_for_ransac, int(N * sample_ratio))
+    # deterministic solver (2026-09-21): fixed seed -> identical sampling across
+    # eval runs; the unseeded global RNG made ray-pose F1 jitter +-1.5pp per run
+    _gen = torch.Generator(device=device).manual_seed(0)
     rand_sample_iters_idx = torch.stack(
-            [torch.randperm(n_sample, device=device)[:num_sample_for_ransac] for _ in range(n_iter)],
+            [torch.randperm(n_sample, generator=_gen, device=device)[:num_sample_for_ransac] for _ in range(n_iter)],
             dim=0,
         )  # (n_iter, num_sample_for_ransac)
     return n_iter, num_sample_for_ransac, n_sample, rand_sample_iters_idx

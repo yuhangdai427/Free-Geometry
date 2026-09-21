@@ -27,7 +27,7 @@ def main():
                     help="scene tags (defaults to all protocol JSONs)")
     ap.add_argument("--arm", default="rkdc_allpos",
                     choices=["a0", "m_allpos", "rkdc_allpos", "maskrel_allpos",
-                             "rkdcr_allpos"])
+                             "rkdcr_allpos", "adaptive"])
     ap.add_argument("--lora_variant", default="shared",
                     choices=["shared", "two_stage"],
                     help="LoRA variant for DVLT: shared (single LoRA across all "

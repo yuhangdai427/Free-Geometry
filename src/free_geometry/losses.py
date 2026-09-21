@@ -128,8 +128,8 @@ def loss_rel_pose(ext_s: torch.Tensor, ext_t: torch.Tensor) -> torch.Tensor:
 
 
 def compute_arm_loss(arm: str, student_out: Dict, teacher_cache: Dict) -> torch.Tensor:
-    """arm: 'm_allpos' | 'rkdc_allpos' | 'maskrel_allpos' | 'rkdcr_allpos'.
-    All-position maskdistill base."""
+    """arm: 'm_allpos' | 'rkdc_allpos' | 'maskrel_allpos' | 'rkdcr_allpos' | 'adaptive'.
+    All-position maskdistill base. Adaptive uses w_rel from teacher_cache."""
     feat = loss_maskdistill(student_out["readouts"], teacher_cache["readouts"],
                             teacher_cache["conf_patch"])
     if arm == "m_allpos":
@@ -144,4 +144,10 @@ def compute_arm_loss(arm: str, student_out: Dict, teacher_cache: Dict) -> torch.
     if arm == "rkdcr_allpos":
         # rkdc + corrected rel (2026-09-18: E_i @ inv(E_j) construction)
         return base + 1.0 * loss_rel_pose(student_out["ext_w2c"], teacher_cache["ext_w2c"])
+    if arm == "adaptive":
+        w_rel = teacher_cache.get("w_rel", 0.0)
+        if w_rel > 0:
+            return base + w_rel * loss_rel_pose(student_out["ext_w2c"],
+                                                teacher_cache["ext_w2c"])
+        return base
     return base

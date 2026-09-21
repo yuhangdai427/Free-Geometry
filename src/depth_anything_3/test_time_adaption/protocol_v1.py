@@ -218,6 +218,7 @@ def build_scene_protocol(
     combo: bool = False,
     combo_se_frac: float = 0.5,
     sparse_overlap: bool = False,
+    force_dense: bool = False,
 ) -> Dict:
     """Full GT-free per-scene protocol: tau, teacher_N, 10+2 pairs, eval frames.
     teacher_N override enables ratio variants: 16:4 (default), 16:8, 8:4, 8:2, 32:8.
@@ -234,12 +235,17 @@ def build_scene_protocol(
     if N < 8:
         raise ValueError(f"{scene}: N={N} < 8, scene dropped by protocol")
     if teacher_N is None:
-        teacher_N = 16 if N >= 16 else 8
+        # N-dispatch v2 (2026-09-20): pair-diversity rule. A 16-frame window
+        # needs N >= 64 (coverage <= 25%) for the 10 train pairs to stay
+        # distinct — measured on eth3d@16:4, pipes N=14 degenerates to ONE
+        # unique pair, relief N=19 reaches Jaccard 0.74; hiroom (N=10-23)
+        # collapses the same way. Below 64 frames, dispatch to 8:4.
+        teacher_N = 16 if N >= 64 else 8
     teacher_N = min(teacher_N, N)
     if teacher_N <= n_shared:
         raise ValueError(f"{scene}: teacher_N={teacher_N} <= n_shared={n_shared}")
     tau = compute_tau(image_files)
-    dense = tau > TAU_THRESHOLD
+    dense = force_dense or (tau > TAU_THRESHOLD)  # force_dense: single-scene A/B of the tau dispatch
     sc = SiftCache(image_files) if (dense or sparse_overlap) else None
 
     def sample(tag: str, n: int, forb_t: set, forb_s: set):
@@ -526,10 +532,14 @@ def create_student(
     lora_rank: int = LORA_RANK,
     lora_alpha: float = LORA_ALPHA,
     lora_dropout: float = LORA_DROPOUT,
+    train_camera_token: bool = True,
 ):
     """StudentModel with protocol LoRA: r=32/a=32/dropout=0 on the multi-view
     blocks 13..39 ONLY (attn qkv/proj + SwiGLU w12/w3); heads frozen, camera
-    token trainable. Layers 0..12 — the per-view "DINO" local-attention blocks
+    token trainable (train_camera_token=False to freeze — raymap-path A/B:
+    the token is the dedicated camera channel shaping cross-view attention;
+    freezing it may stop ray/focal drift while keeping LoRA's local feature
+    refinement). Layers 0..12 — the per-view "DINO" local-attention blocks
     before alt_start (camera-token injection / first cross-view attention) —
     are STRICTLY FROZEN: no LoRA there, by explicit decision (2026-09-18)."""
     from depth_anything_3.test_time_adaption.models import StudentModel
@@ -541,8 +551,7 @@ def create_student(
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
-        train_camera_token=True,  # v2: camera token trainable (was frozen in v1);
-                                  # cam_dec + heads stay frozen
+        train_camera_token=train_camera_token,
         lora_layers=list(range(13, 40)),  # multi-view scope ONLY (>= alt_start)
         ref_view_strategy="first",
         patch_swiglu_mlp_for_lora=True,
@@ -700,8 +709,11 @@ def loss_couple_w2c(ext_s: torch.Tensor, depth_s: torch.Tensor,
                     ext_t: torch.Tensor, depth_t: torch.Tensor,
                     conf_t: torch.Tensor = None) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Cross-head gauge coupling scalar (DA3 port of VGGT loss_couple):
-    log(RMS_centers / mean_depth) aligned student vs teacher (teacher side
-    detached, conf-gated at the 5% quantile). One scalar per forward."""
+    log(RMS_centers / mean_depth) aligned student vs teacher.
+    FIX 2026-09-20: teacher's conf-derived valid mask applied to BOTH sides
+    (same pixel set = apples-to-apples comparison). Previous version computed
+    student md on ALL pixels vs teacher md on top-95% conf pixels, creating
+    a systematic bias that compressed student depth."""
     with torch.autocast(device_type="cuda", enabled=False):
         def centers(ext):
             if ext.dim() == 4:
@@ -709,22 +721,104 @@ def loss_couple_w2c(ext_s: torch.Tensor, depth_s: torch.Tensor,
             R, t = ext[..., :3, :3].float(), ext[..., :3, 3].float()
             return -(R.transpose(-1, -2) @ t.unsqueeze(-1)).squeeze(-1)
 
-        def couple_stat(ext, depth, conf=None):
+        def couple_stat(ext, depth, m):
             c = centers(ext)
             spr = (c - c.mean(0, keepdim=True)).norm(dim=-1).pow(2).mean().sqrt()
             d = depth.squeeze(0).squeeze(-1).float() if depth.dim() >= 4 else depth.float()
-            m = torch.isfinite(d) & (d > 0)
-            if conf is not None:
-                cf = conf.squeeze(0).squeeze(-1).float() if conf.dim() >= 4 else conf.float()
-                q = torch.quantile(cf[m].flatten(), 0.05)
-                m = m & (cf >= q)
+            m = m & torch.isfinite(d) & (d > 0)
             md = d[m].mean().clamp_min(1e-6)
             return torch.log(spr.clamp_min(1e-6)) - torch.log(md)
 
-        cs = couple_stat(ext_s, depth_s)
-        ct = couple_stat(ext_t, depth_t, conf_t).detach()
+        # Shared valid mask from teacher's confidence (5% quantile cut)
+        if conf_t is not None:
+            d_t = depth_t.squeeze(0).squeeze(-1).float() if depth_t.dim() >= 4 else depth_t.float()
+            base = torch.isfinite(d_t) & (d_t > 0)
+            cf = conf_t.squeeze(0).squeeze(-1).float() if conf_t.dim() >= 4 else conf_t.float()
+            q = torch.quantile(cf[base].flatten(), 0.05)
+            shared_mask = base & (cf >= q)
+        else:
+            d_t = depth_t.squeeze(0).squeeze(-1).float() if depth_t.dim() >= 4 else depth_t.float()
+            shared_mask = torch.isfinite(d_t) & (d_t > 0)
+
+        cs = couple_stat(ext_s, depth_s, shared_mask)     # student on SAME mask
+        ct = couple_stat(ext_t, depth_t, shared_mask).detach()  # teacher on SAME mask
         loss = (cs - ct) ** 2
     return loss.squeeze(), {"couple": float(loss)}
+
+
+def loss_pose_sim3(ext_s: torch.Tensor, ext_t: torch.Tensor,
+                   delta_rel: float = 0.2, rot_w: float = 1.0
+                   ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Umeyama(Sim3)-aligned pose distillation (2026-09-20).
+
+    Aligns the teacher into the student's gauge (solve fully detached — gauge
+    bookkeeping, not signal), then penalizes:
+      center:  Huber((c_s - c_t_aligned)/rms_t_aligned, delta=delta_rel)
+               — dimensionless, scale-free across scenes (unified protocol)
+      rotation: chordal(R_s, R_t @ R_a^T), the Sim(3) action on w2c poses
+    R_a is solved from ORIENTATION Procrustes (sum R_t^T R_s), s/t from
+    centers given R_a. Center-only Umeyama was rejected: on forward-motion
+    scenes (near-collinear centers, e.g. delivery_area) its rotation is
+    180°-ambiguous about the motion axis and flips on ~40% of pairs,
+    injecting garbage rotation gradients while raw orientations agree <2°.
+    The residual is the eval-side Procrustes quantity diagnosed on
+    delivery_area (teacher shape 7.2m vs student 8.6m after alignment):
+    one well-conditioned term replacing rel(tdir)+rkd(angles), whose
+    separate Huber gradients can fight and which ignore baseline magnitude
+    (rel) or per-pair scale (rkd) individually.
+    ext_*: [S,3,4] or [1,S,3,4] w2c (student grad, teacher detached)."""
+    with torch.autocast(device_type="cuda", enabled=False):
+        def centers(ext):
+            if ext.dim() == 4:
+                ext = ext[0]
+            R, t = ext[..., :3, :3].float(), ext[..., :3, 3].float()
+            return -(R.transpose(-1, -2) @ t.unsqueeze(-1)).squeeze(-1)
+
+        cs = centers(ext_s)                       # [S,3] student, GRAD
+        ct = centers(ext_t).detach()              # [S,3] teacher, no grad
+        R_t = (ext_t[0] if ext_t.dim() == 4 else ext_t)[..., :3, :3].float().detach()
+        R_s = ext_s[..., :3, :3].float() if ext_s.dim() == 3 else ext_s[0][..., :3, :3].float()
+        S_n = cs.shape[0]
+        if S_n < 3:
+            zero = (cs - ct).sum() * 0.0
+            return zero, {"sim3_c": 0.0, "sim3_r": 0.0, "sim3_s": 0.0}
+
+        # ---- R_a from ORIENTATION Procrustes; centers compared in
+        # normalized shape space (no fitted s/t at all) ----
+        # FIX 2026-09-20b: center-based Umeyama R_a is ill-conditioned on
+        # forward-motion scenes (near-collinear centers -> 180°-ambiguous
+        # rotation about the motion axis; measured on delivery_area pairs
+        # 0/3: chordal=8.0, per-cam angle ~177°, while raw orientations agree
+        # to <2°). Orientations carry 4x9 measurements and stay non-degenerate,
+        # so they solve the rotation.
+        # FIX 2026-09-20c: a free LS scale s given fixed R_a collapses toward
+        # 0 on noisy pairs (better predict-the-mean than a mis-rotated cloud),
+        # and the residual/rms explodes (observed sim3c=2.6e6 mid-training).
+        # Gauge (translation+scale) carries zero gradient anyway — eval aligns
+        # Sim(3) and couple already ties the depth/pose scale ratio — so both
+        # clouds are mean-centered and RMS-normalized instead; nothing fittable
+        # can degenerate.
+        with torch.no_grad():
+            M = torch.einsum("sij,sik->jk", R_t, R_s.detach())  # sum R_t^T R_s
+            U, Sv, Vt = torch.linalg.svd(M)
+            Scorr = torch.ones(3, device=M.device)
+            if torch.det(U @ Vt) < 0:
+                Scorr[-1] = -1.0
+            R_a = (Vt.T * Scorr) @ U.T             # rotation: teacher->student
+            at = (R_a @ ct.T).T                    # rotated teacher centers
+            at_n = at - at.mean(0)
+            rms_t = at_n.norm(dim=-1).pow(2).mean().sqrt().clamp_min(1e-8)
+            at_n = at_n / rms_t                    # unit-RMS teacher shape
+
+        cs_c = cs - cs.mean(0)
+        rms_s = cs_c.detach().norm(dim=-1).pow(2).mean().sqrt().clamp_min(1e-6)
+        c_loss = F.huber_loss((cs_c / rms_s) - at_n,
+                              torch.zeros_like(cs), delta=delta_rel)
+        R_t_al = R_t @ R_a.T                       # Sim(3) action on w2c orientation
+        r_loss = (((R_s - R_t_al) ** 2).sum(dim=(-2, -1))).mean()
+        loss = c_loss + rot_w * r_loss
+    return loss, {"sim3_c": float(c_loss), "sim3_r": float(r_loss),
+                  "sim3_s": float(rms_s / rms_t)}
 
 
 # ---------------------------------------------------------------------------
@@ -1239,6 +1333,136 @@ def compute_c2m_loss(student, teacher_cache: Dict, images4_in: torch.Tensor, pat
 
 
 # ---------------------------------------------------------------------------
+# Adaptive arm: gap-proportional rel weighting (2026-09-20)
+# ---------------------------------------------------------------------------
+ADAPTIVE_ALPHA = 0.1  # half-activation point for w_rel
+
+
+def compute_scene_rel_gap(student, train_caches, train_images, device):
+    """Step-0 rel gap: forward each pair's student frames through the
+    zero-LoRA student (= frozen baseline) and measure rel/rkd/sim3 loss vs
+    teacher. Returns (median_gap, w_rel, median_rkd_gap, w_rkd, median_sim3_gap)."""
+    reset_lora_(student)
+    student.eval()
+    gaps, rkd_gaps, sim3_gaps = [], [], []
+    with torch.no_grad():
+        for pi, cache in enumerate(train_caches):
+            images4 = train_images[pi].unsqueeze(0).to(device)
+            _, ext_s, _ = student_forward_c2m(student, images4)
+            ext_t = cache["ext4"].to(device)
+            gap_val, _ = loss_pose_rel(ext_s, ext_t)
+            gaps.append(float(gap_val))
+            rkd_val, _ = loss_rkd_shared_pose_huber_w2c(ext_s, ext_t)
+            rkd_gaps.append(float(rkd_val))
+            sim3_val, _ = loss_pose_sim3(ext_s, ext_t)
+            sim3_gaps.append(float(sim3_val))
+    scene_gap = float(np.median(gaps))
+    w_rel = scene_gap / (scene_gap + ADAPTIVE_ALPHA)
+    scene_rkd_gap = float(np.median(rkd_gaps))
+    w_rkd = scene_rkd_gap / (scene_rkd_gap + ADAPTIVE_ALPHA)
+    return scene_gap, w_rel, scene_rkd_gap, w_rkd, float(np.median(sim3_gaps))
+
+
+def compute_adaptive_loss(student, teacher_cache, images4_in, patch_mask,
+                          w_rel: float, w_rkd: float = -1.0,
+                          variant: str = "v1", w_abs: float = 0.0):
+    """Adaptive arm variants:
+    v1:  md + w_rel*rel + 1.5*rkd + couple  (rkd fixed weight)
+    va:  md + w_rel*rel + (1-w_rel)*rkd + couple  (rkd complementary)
+    vb:  md + w_rel*rel + w_rkd*rkd + couple  (rkd independent gap-driven)
+    w_abs > 0: adds absolute pose distillation (R chordal + t Huber)."""
+    tap_feats_s, ext_s, depth_s = student_forward_c2m(student, images4_in, with_depth=True)
+    device = images4_in.device
+    head_norm = student.da3.model.head.norm
+
+    cache = {
+        "feats": {l: t.to(device) for l, t in teacher_cache["feats"].items()},
+        "conf4": teacher_cache["conf4"].to(device),
+        "patch_hw": teacher_cache["patch_hw"],
+    }
+    feat_loss, feat_extra = loss_maskdistill(head_norm, cache, tap_feats_s, patch_mask)
+
+    ext_t = teacher_cache["ext4"].to(device)
+    rel_loss, rel_extra = loss_pose_rel(ext_s, ext_t)
+    rkd_loss, rkd_extra = loss_rkd_shared_pose_huber_w2c(ext_s, ext_t)
+    cp_loss, cp_extra = loss_couple_w2c(ext_s, depth_s, ext_t,
+                                        teacher_cache["depth4"].to(device),
+                                        teacher_cache["conf4"].to(device))
+    if variant == "va":
+        rkd_w = (1.0 - w_rel) * 1.0
+    elif variant == "vb":
+        rkd_w = max(0.0, w_rkd) * 1.0
+    else:
+        rkd_w = 1.5
+    total = feat_loss + w_rel * rel_loss + rkd_w * rkd_loss + 1.0 * cp_loss
+    extra = {**feat_extra, **rel_extra, **rkd_extra, **cp_extra,
+             "w_rel": w_rel, "w_rkd": rkd_w}
+    if w_abs > 0:
+        abs_r = ((ext_s[..., :3, :3] - ext_t[..., :3, :3]) ** 2).sum(dim=(-2, -1)).mean().sqrt()
+        abs_t = torch.nn.functional.huber_loss(ext_s[..., :3, 3], ext_t[..., :3, 3], delta=0.1)
+        total = total + w_abs * (abs_r + abs_t)
+        extra["abs_pose"] = float(abs_r + abs_t)
+    return total, extra
+
+
+def compute_aligned_loss(student, teacher_cache, images4_in, patch_mask,
+                         rkd_weight: float = 0.0):
+    """Umeyama-aligned arm (2026-09-20): md + 1.0*sim3 + [rkd_weight*rkd] + couple.
+    "aligned"     -> rkd_weight 0   (sim3 fully replaces rel+rkd)
+    "aligned_rkd" -> rkd_weight 1.5 (sim3 replaces rel; rkd kept as shape anchor)"""
+    tap_feats_s, ext_s, depth_s = student_forward_c2m(student, images4_in, with_depth=True)
+    device = images4_in.device
+    head_norm = student.da3.model.head.norm
+
+    cache = {
+        "feats": {l: t.to(device) for l, t in teacher_cache["feats"].items()},
+        "conf4": teacher_cache["conf4"].to(device),
+        "patch_hw": teacher_cache["patch_hw"],
+    }
+    feat_loss, feat_extra = loss_maskdistill(head_norm, cache, tap_feats_s, patch_mask)
+
+    ext_t = teacher_cache["ext4"].to(device)
+    sim_loss, sim_extra = loss_pose_sim3(ext_s, ext_t)
+    cp_loss, cp_extra = loss_couple_w2c(ext_s, depth_s, ext_t,
+                                        teacher_cache["depth4"].to(device),
+                                        teacher_cache["conf4"].to(device))
+    total = feat_loss + 1.0 * sim_loss + 1.0 * cp_loss
+    extra = {**feat_extra, **sim_extra, **cp_extra, "rkd_w": rkd_weight}
+    if rkd_weight > 0:
+        rkd_loss, rkd_extra = loss_rkd_shared_pose_huber_w2c(ext_s, ext_t)
+        total = total + rkd_weight * rkd_loss
+        extra = {**extra, **rkd_extra}
+    return total, extra
+
+
+def compute_adaptive_s_loss(student, teacher_cache, images4_in, patch_mask,
+                            w_sim: float):
+    """adaptive_s (2026-09-20): md + w_sim*sim3 + couple.
+    w_sim from the step-0 sim3 gap (median over train pairs): teacher
+    reliability gating — scenes where teacher and baseline student already
+    disagree strongly (bad teacher, e.g. delivery_area) down-weight the
+    aligned distillation instead of faithfully distilling garbage."""
+    tap_feats_s, ext_s, depth_s = student_forward_c2m(student, images4_in, with_depth=True)
+    device = images4_in.device
+    head_norm = student.da3.model.head.norm
+
+    cache = {
+        "feats": {l: t.to(device) for l, t in teacher_cache["feats"].items()},
+        "conf4": teacher_cache["conf4"].to(device),
+        "patch_hw": teacher_cache["patch_hw"],
+    }
+    feat_loss, feat_extra = loss_maskdistill(head_norm, cache, tap_feats_s, patch_mask)
+
+    ext_t = teacher_cache["ext4"].to(device)
+    sim_loss, sim_extra = loss_pose_sim3(ext_s, ext_t)
+    cp_loss, cp_extra = loss_couple_w2c(ext_s, depth_s, ext_t,
+                                        teacher_cache["depth4"].to(device),
+                                        teacher_cache["conf4"].to(device))
+    total = feat_loss + w_sim * sim_loss + 1.0 * cp_loss
+    return total, {**feat_extra, **sim_extra, **cp_extra, "w_sim": w_sim}
+
+
+# ---------------------------------------------------------------------------
 # Per-scene training (protocol section 3)
 # ---------------------------------------------------------------------------
 def draw_patch_mask(S: int, patch_hw, ratio: float, gen, device=None):
@@ -1315,6 +1539,7 @@ def train_scene_c2m(
     mask_mode: str = "image",  # image | none | token_shallow | token_feat
     mask_layer: int = 12,
     mask_loss_positions: bool = True,
+    abs_pose_w: float = 0.0,
     ctk_weight: float = 1.0,
     rel_weight: float = 1.0,
     two_stage: float = 0.0,
@@ -1381,6 +1606,23 @@ def train_scene_c2m(
     student.to(device)
     torch.manual_seed(stable_seed("lora_init", scene, seed))
     reset_lora_(student)
+
+    # ---- adaptive arm: step-0 rel gap → w_rel (fixed for entire run) ----
+    scene_w_rel, scene_w_rkd, scene_w_sim = 1.0, -1.0, 1.0
+    if arm in ("adaptive", "adaptive_a", "adaptive_b", "adaptive_s"):
+        variant = {"adaptive": "v1", "adaptive_a": "va", "adaptive_b": "vb",
+                   "adaptive_s": "vs"}[arm]
+        scene_gap, scene_w_rel, scene_rkd_gap, scene_w_rkd, scene_sim3_gap = compute_scene_rel_gap(
+            student, train_caches, train_images, device)
+        if arm == "adaptive_s":
+            scene_w_sim = scene_sim3_gap / (scene_sim3_gap + ADAPTIVE_ALPHA)
+        log_fn(f"[{scene}] {arm}: rel_gap={scene_gap:.6f} w_rel={scene_w_rel:.4f} | "
+               f"rkd_gap={scene_rkd_gap:.6f} w_rkd={scene_w_rkd:.4f} | "
+               f"sim3_gap={scene_sim3_gap:.6f} w_sim={scene_w_sim:.4f}")
+        # Re-reset LoRA (compute_scene_rel_gap already reset it, but be safe)
+        torch.manual_seed(stable_seed("lora_init", scene, seed))
+        reset_lora_(student)
+
     params = student.get_trainable_params()
     optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=WD)
     n_steps = min(steps, n_train * epochs)
@@ -1579,7 +1821,19 @@ def train_scene_c2m(
             ramp = min(1.0, step / 20.0)
             w_rot_eff, w_tdir_eff = w_rot_base * ramp, w_tdir_base * ramp
             base_loss, rel = None, None
-            if arm == "rkdc1hc":
+            if arm in ("adaptive", "adaptive_a", "adaptive_b"):
+                _variant = {"adaptive": "v1", "adaptive_a": "va", "adaptive_b": "vb"}[arm]
+                loss, extra = compute_adaptive_loss(student, cache, images4_in, pmask,
+                                                    w_rel=scene_w_rel, w_rkd=scene_w_rkd,
+                                                    variant=_variant, w_abs=abs_pose_w)
+            elif arm == "adaptive_s":
+                loss, extra = compute_adaptive_s_loss(student, cache, images4_in, pmask,
+                                                      w_sim=scene_w_sim)
+            elif arm in ("aligned", "aligned_rkd"):
+                loss, extra = compute_aligned_loss(
+                    student, cache, images4_in, pmask,
+                    rkd_weight=1.5 if arm == "aligned_rkd" else 0.0)
+            elif arm == "rkdc1hc":
                 if use_v2_gc:
                     base_loss, extra, rel = compute_rkdc1hc_loss(
                         student, cache, images4_in, pmask, ctk_weight=ctk_weight,
@@ -1716,11 +1970,14 @@ def train_scene_c2m(
             if on_step is not None:
                 on_step(row)
             if step % 10 == 0 or step == 1:
+                sim3_txt = (f" sim3c={extra['sim3_c']:.4f} sim3r={extra['sim3_r']:.4f} "
+                            f"sim3s={extra['sim3_s']:.3f}"
+                            if "sim3_c" in extra else "")
                 log_fn(
                     f"[{scene}] step {step}/{n_train * epochs} loss={float(loss):.4f} "
                     f"(md={extra['maskdistill']:.4f} rot={extra.get('rel_rot', extra.get('v2_rel_rot', 0.0)):.4f} "
                     f"tdir={extra.get('rel_tdir', extra.get('v2_rel_tdir', 0.0)):.4f} rkd={extra.get('rkd_sh_d', 0.0) + extra.get('rkd_sh_a', 0.0):.4f} "
-                    f"cp={extra.get('couple', 0.0):.4f} ctk={extra.get('ctk', 0.0):.4f}) lr={row['lr']:.2e} "
+                    f"cp={extra.get('couple', 0.0):.4f} ctk={extra.get('ctk', 0.0):.4f}{sim3_txt}) lr={row['lr']:.2e} "
                     f"gn={row['grad_norm']:.3f} peak={row['peak_mem_mib']:.0f}MiB")
             if early_stop and stage_cut is None and step >= es_min and len(losses) >= 20:
                 recent = float(np.mean(losses[-10:]))
