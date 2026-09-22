@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>raw+rel 梯度看板</title>
+<style>
+:root{
+  --bg:#f6f7f9; --card:#ffffff; --ink:#1a1f2e; --sub:#6b7280; --line:#e5e7eb;
+  --blue:#3b82f6; --green:#059669; --red:#dc2626; --purple:#7c3aed; --amber:#d97706;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;padding:18px}
+header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:14px}
+h1{font-size:18px;font-weight:700;margin-right:8px}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--card)}
+.seg button{border:0;background:transparent;padding:6px 14px;cursor:pointer;font-size:13px;color:var(--sub)}
+.seg button.on{background:var(--ink);color:#fff}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{border:1px solid var(--line);background:var(--card);border-radius:999px;padding:4px 12px;font-size:13px;cursor:pointer;color:var(--sub)}
+.chip.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+select,input[type=text]{border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:13px;background:var(--card);color:var(--ink)}
+.summary{display:flex;gap:14px;flex-wrap:wrap;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:13px;color:var(--sub)}
+.summary b{color:var(--ink)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(255px,1fr));gap:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;cursor:pointer;transition:box-shadow .15s}
+.card:hover{box-shadow:0 3px 12px rgba(0,0,0,.08)}
+.badge{display:inline-block;font-size:11px;padding:1px 8px;border-radius:999px;color:#fff;margin-right:6px}
+.scenename{font-size:13px;font-weight:600;word-break:break-all}
+.pillrow{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+.pill{font-size:12px;padding:2px 8px;border-radius:6px;font-weight:600}
+.pill.up{background:#ecfdf5;color:var(--green)} .pill.down{background:#fef2f2;color:var(--red)} .pill.flat{background:#f3f4f6;color:var(--sub)}
+.meta{font-size:12px;color:var(--sub);margin-top:6px}
+.warn{font-size:11px;color:var(--amber);font-weight:600}
+.spark{margin-top:8px}
+.detail{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px}
+.dhead{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px}
+.back{border:1px solid var(--line);background:var(--bg);border-radius:8px;padding:5px 12px;cursor:pointer;font-size:13px}
+.metrics{display:flex;gap:12px;flex-wrap:wrap;margin:10px 0 14px}
+.metric{background:var(--bg);border-radius:8px;padding:8px 14px;font-size:13px}
+.metric b{display:block;font-size:16px}
+.pairchips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.chartbox{border:1px solid var(--line);border-radius:10px;padding:10px;margin-top:10px;background:#fff}
+.charttitle{font-size:13px;font-weight:600;margin-bottom:4px}
+.legend{display:flex;gap:12px;font-size:12px;color:var(--sub);flex-wrap:wrap;margin:4px 0}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+.tip{position:fixed;background:#111827;color:#fff;font-size:12px;padding:6px 9px;border-radius:6px;pointer-events:none;display:none;z-index:9;white-space:nowrap}
+.foot{margin-top:18px;font-size:12px;color:var(--sub)}
+svg text{font-size:10px;fill:#6b7280}
+</style>
+</head>
+<body>
+<header>
+  <h1>raw + rel-pose 梯度看板</h1>
+  <div class="seg" id="segModel"></div>
+  <div class="seg" id="segU"></div>
+  <select id="sortSel">
+    <option value="ds">按数据集</option><option value="aucD">按 ΔAUC 降序</option>
+    <option value="aucA">按 ΔAUC 升序</option><option value="f1D">按 ΔF1 降序</option><option value="name">按名称</option>
+  </select>
+  <input type="text" id="search" placeholder="搜索场景…" style="width:160px">
+</header>
+<div class="chips" id="dsChips"></div>
+<div class="summary" id="summary"></div>
+<div id="listView"><div class="grid" id="grid"></div></div>
+<div id="detailView" style="display:none"></div>
+<div class="tip" id="tip"></div>
+<div class="foot">数据：overnight raw+rel campaign（2 模型 × 4 数据集 × {100,50} 步 × 68 场景）；基线 = 冻结 zero-shot（baselines.json）；NOT LEARNING = L_rot 末 10 步 ≥ 首 10 步。</div>
+<script>
+const DATA = __DATA__;
+const DS_COLOR = {eth3d:"#3b82f6", "7scenes":"#10b981", scannetpp:"#f59e0b", hiroom:"#8b5cf6"};
+const COMP = [
+  {k:2, name:"SmoothL1 (patch)", color:"#3b82f6"},
+  {k:3, name:"cos (patch)",      color:"#8b5cf6"},
+  {k:4, name:"rotation (rel)",   color:"#ef4444"},
+  {k:5, name:"translation (rel)",color:"#f97316"},
+];
+const S = {model:"da3", u:100, ds:"all", sort:"ds", q:"", view:"list", scene:null, dsOf:null, pair:"all", logY:true};
+
+const $ = id => document.getElementById(id);
+function fmt(v,d=4){return v==null?"–":v.toFixed(d)}
+function pct(v){return v==null?"–":(v>=0?"+":"")+ (100*v).toFixed(1)+"%"}
+
+function metricOf(ds, scene){
+  const m = DATA.scenes[ds][scene].metrics[S.model+"_u"+S.u];
+  if(!m) return null;
+  // relative delta is undefined when the baseline is 0 (e.g. a hiroom scene
+  // whose zero-shot AUC@3 is exactly 0 -> 0/0=NaN, x/0=Infinity)
+  if(m.base_auc==null || m.base_f1==null || !(m.base_auc>0) || !(m.base_f1>0))
+    return {...m, dA:null, dF:null, zeroBase:(m.base_auc===0)};
+  return {...m, dA:(m.auc-m.base_auc)/m.base_auc, dF:(m.f1-m.base_f1)/m.base_f1};
+}
+function gradsOf(ds, scene){
+  return DATA.scenes[ds][scene].grads[S.model+"_u"+S.u] || null;
+}
+function notLearning(rows){
+  if(!rows || rows.length<20) return false;
+  const lr = rows.map(r=>r[6]);
+  const a = lr.slice(0,10).reduce((x,y)=>x+y,0)/10, b = lr.slice(-10).reduce((x,y)=>x+y,0)/10;
+  return b >= a;
+}
+
+/* ---------- header controls ---------- */
+function renderSeg(el, items, key, cb){
+  el.innerHTML = "";
+  items.forEach(([v,label])=>{
+    const b = document.createElement("button");
+    b.textContent = label; b.className = S[key]===v?"on":"";
+    b.onclick = ()=>{S[key]=v; cb();};
+    el.appendChild(b);
+  });
+}
+function renderDsChips(){
+  const el = $("dsChips"); el.innerHTML="";
+  const mk = (v,label)=>{
+    const c = document.createElement("div");
+    c.className = "chip"+(S.ds===v?" on":""); c.textContent = label;
+    c.onclick = ()=>{S.ds=v; renderAll();};
+    el.appendChild(c);
+  };
+  mk("all","全部 "+totalScenes());
+  DATA.datasets.forEach(ds=>mk(ds, ds+" "+Object.keys(DATA.scenes[ds]).length));
+}
+function totalScenes(){return DATA.datasets.reduce((a,d)=>a+Object.keys(DATA.scenes[d]).length,0)}
+
+/* ---------- list view ---------- */
+function sceneList(){
+  let out = [];
+  DATA.datasets.forEach(ds=>{
+    if(S.ds!=="all" && S.ds!==ds) return;
+    Object.keys(DATA.scenes[ds]).forEach(sc=>{
+      if(S.q && !sc.toLowerCase().includes(S.q.toLowerCase())) return;
+      out.push([ds,sc]);
+    });
+  });
+  if(S.sort==="aucD") out.sort((a,b)=>(metricOf(...b)?.dA??-9)-(metricOf(...a)?.dA??-9));
+  else if(S.sort==="aucA") out.sort((a,b)=>(metricOf(...a)?.dA??9)-(metricOf(...b)?.dA??9));
+  else if(S.sort==="f1D") out.sort((a,b)=>(metricOf(...b)?.dF??-9)-(metricOf(...a)?.dF??-9));
+  else if(S.sort==="name") out.sort((a,b)=>a[1]<b[1]?-1:1);
+  return out;
+}
+function sparkline(rows, w=210, h=34){
+  if(!rows || !rows.length) return "";
+  const lr = rows.map(r=>Math.log10(Math.max(r[6],1e-6)));
+  const mn = Math.min(...lr), mx = Math.max(...lr), sp = Math.max(mx-mn,1e-6);
+  const pts = lr.map((v,i)=>`${(i/(lr.length-1)*w).toFixed(1)},${(h-3-(v-mn)/sp*(h-6)).toFixed(1)}`).join(" ");
+  const up = notLearning(rows);
+  return `<svg class="spark" width="${w}" height="${h}"><polyline points="${pts}" fill="none" stroke="${up?'#d97706':'#059669'}" stroke-width="1.5" opacity=".85"/></svg>`;
+}
+function renderGrid(){
+  const g = $("grid"); g.innerHTML="";
+  const list = sceneList();
+  const nImp = list.filter(([d,s])=>(metricOf(d,s)?.dA??0)>0.005).length;
+  const nHurt = list.filter(([d,s])=>(metricOf(d,s)?.dA??0)<-0.005).length;
+  // 口径（用户规定）：先对场景取宏平均，再相对基线均值 —— 不是逐场景相对值的平均
+  const pairsA = list.map(([d,s])=>metricOf(d,s)).filter(m=>m&&m.dA!=null);
+  const mA = pairsA.length? pairsA.reduce((a,m)=>a+m.auc,0)/pairsA.length : null;
+  const mB = pairsA.length? pairsA.reduce((a,m)=>a+m.base_auc,0)/pairsA.length : null;
+  const pairsF = list.map(([d,s])=>metricOf(d,s)).filter(m=>m&&m.dF!=null);
+  const mFA = pairsF.length? pairsF.reduce((a,m)=>a+m.f1,0)/pairsF.length : null;
+  const mFB = pairsF.length? pairsF.reduce((a,m)=>a+m.base_f1,0)/pairsF.length : null;
+  const rel = (x,y)=> (x==null||!y)? null : (x-y)/y;
+  const dAm = rel(mA,mB), dFm = rel(mFA,mFB);
+  $("summary").innerHTML =
+    `<span>场景 <b>${pairsA.length}</b>（另有 ${list.length-pairsA.length} 格无基线/无指标）</span>
+     <span>ΔAUC（宏平均口径）<b style="color:${(dAm??0)>=0?'var(--green)':'var(--red)'}">${pct(dAm)}</b></span>
+     <span>ΔF1（宏平均口径）<b style="color:${(dFm??0)>=0?'var(--green)':'var(--red)'}">${pct(dFm)}</b></span>
+     <span>AUC 改善 <b>${nImp}</b> / 受损 <b>${nHurt}</b>（逐场景计）</span>
+     <span>当前视图：${S.model==="da3"?"DA3":"VGGT"} · ${S.u} 步</span>`;
+  list.forEach(([ds,sc])=>{
+    const m = metricOf(ds,sc), rows = gradsOf(ds,sc);
+    const card = document.createElement("div");
+    card.className = "card";
+    const pill = (v,txt)=>{
+      if(v==null) return `<span class="pill flat">${txt} –</span>`;
+      const cls = v>0.005?"up":v<-0.005?"down":"flat";
+      return `<span class="pill ${cls}">${txt} ${pct(v)}</span>`;
+    };
+    card.innerHTML = `
+      <span class="badge" style="background:${DS_COLOR[ds]}">${ds}</span>
+      ${notLearning(rows)?'<span class="warn">⚠ NOT LEARNING</span>':""}
+      <div class="scenename">${sc}</div>
+      <div class="pillrow">${pill(m?.dA,"ΔAUC")}${pill(m?.dF,"ΔF1")}</div>
+      <div class="meta">${m? (m.zeroBase? "⚠ zero-shot 基线 AUC=0，相对值未定义（TTA AUC="+fmt(m.auc,3)+"）" : `AUC ${fmt(m.base_auc,3)}→${fmt(m.auc,3)} · F1 ${fmt(m.base_f1,3)}→${fmt(m.f1,3)} · abs_rel ${fmt(m.abs_rel)}`) : "该格无指标"}</div>
+      ${sparkline(rows)}<div class="meta" style="margin-top:2px">L_rot 轨迹（log 刻度）</div>`;
+    card.onclick = ()=>{S.view="scene"; S.scene=sc; S.dsOf=ds; S.pair="all"; renderAll();};
+    g.appendChild(card);
+  });
+}
+
+/* ---------- SVG line chart ---------- */
+function lineChart(box, title, series, opts={}){
+  const W = 920, H = opts.h||300, L=56, R=14, T=10, B=30;
+  const allPts = series.flatMap(s=>s.pts);
+  if(!allPts.length){box.innerHTML=`<div class="charttitle">${title}</div><div class="meta">无数据</div>`;return}
+  const xs = allPts.map(p=>p[0]), ys = allPts.map(p=>p[1]).filter(v=>isFinite(v));
+  const x0=Math.min(...xs), x1=Math.max(...xs);
+  let y0=Math.min(...ys), y1=Math.max(...ys);
+  const tf = v => opts.log ? Math.log10(Math.max(v,1e-6)) : v;
+  let a=tf(y0), b=tf(y1); if(b-a<1e-9) b=a+1;
+  const pad=(b-a)*.06; a-=pad; b+=pad;
+  const X=v=>L+(v-x0)/Math.max(x1-x0,1)*(W-L-R);
+  const Y=v=>T+(1-(tf(v)-a)/(b-a))*(H-T-B);
+  let svg=`<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`;
+  for(let i=0;i<=4;i++){
+    const yv=a+(b-a)*i/4, yy=T+(1-i/4)*(H-T-B);
+    const disp=opts.log?Math.pow(10,yv):yv;
+    svg+=`<line x1="${L}" y1="${yy}" x2="${W-R}" y2="${yy}" stroke="#e5e7eb" stroke-dasharray="3 3"/>
+          <text x="${L-6}" y="${yy+3}" text-anchor="end">${disp>=100?disp.toFixed(0):disp>=1?disp.toFixed(2):disp.toExponential(1)}</text>`;
+  }
+  const xt = opts.xTicks || 5;
+  for(let i=0;i<=xt;i++){
+    const xv=x0+(x1-x0)*i/xt, xx=X(xv);
+    svg+=`<line x1="${xx}" y1="${T}" x2="${xx}" y2="${H-B}" stroke="#f3f4f6"/>
+          <text x="${xx}" y="${H-8}" text-anchor="middle">${Math.round(xv)}</text>`;
+  }
+  series.forEach(s=>{
+    const d=s.pts.filter(p=>isFinite(p[1])).map(p=>`${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join(" ");
+    svg+=`<polyline points="${d}" fill="none" stroke="${s.color}" stroke-width="1.8" opacity=".9"/>`;
+    s.pts.forEach(p=>{ if(isFinite(p[1])) svg+=`<circle cx="${X(p[0])}" cy="${Y(p[1])}" r="2.2" fill="${s.color}" opacity=".75" data-tip="${s.name} · step ${p[0]} · ${p[1]>=100?p[1].toFixed(1):p[1].toFixed(4)}"/>` });
+  });
+  svg+=`<text x="${(L+W-R)/2}" y="${H-2}" text-anchor="middle" font-size="10">update step</text></svg>`;
+  box.innerHTML=`<div class="charttitle">${title}</div>
+    <div class="legend">${series.map(s=>`<span><i style="background:${s.color}"></i>${s.name}</span>`).join("")}</div>${svg}`;
+  box.querySelectorAll("circle[data-tip]").forEach(c=>{
+    c.onmousemove=e=>{const t=$("tip");t.style.display="block";t.textContent=c.dataset.tip;
+      t.style.left=(e.clientX+12)+"px";t.style.top=(e.clientY-28)+"px";};
+    c.onmouseleave=()=>$("tip").style.display="none";
+  });
+}
+
+/* ---------- detail view ---------- */
+function renderDetail(){
+  const dv = $("detailView"), ds=S.dsOf, sc=S.scene;
+  const m = metricOf(ds,sc), rows = gradsOf(ds,sc);
+  const pairs = rows? [...new Set(rows.map(r=>r[1]))].sort((a,b)=>a-b) : [];
+  let html = `<div class="detail">
+    <div class="dhead">
+      <button class="back" id="backBtn">← 返回列表</button>
+      <span class="badge" style="background:${DS_COLOR[ds]}">${ds}</span>
+      <span class="scenename" style="font-size:15px">${sc}</span>
+      <div class="seg" id="dModel"></div><div class="seg" id="dU"></div>
+    </div>
+    <div class="metrics">
+      <div class="metric">AUC@3<b>${m?`${fmt(m.base_auc,3)} → ${fmt(m.auc,3)}`:"–"}</b>${m?.dA!=null?`<span style="color:${m.dA>=0?'var(--green)':'var(--red)'}">${pct(m.dA)}</span>`:""}</div>
+      <div class="metric">F1<b>${m?`${fmt(m.base_f1,3)} → ${fmt(m.f1,3)}`:"–"}</b>${m?.dF!=null?`<span style="color:${m.dF>=0?'var(--green)':'var(--red)'}">${pct(m.dF)}</span>`:""}</div>
+      <div class="metric">abs_rel<b>${m?fmt(m.abs_rel):"–"}</b></div>
+      <div class="metric">NOT LEARNING<b style="color:${notLearning(rows)?'var(--amber)':'var(--green)'}">${notLearning(rows)?"是":"否"}</b></div>
+    </div>
+    <div class="pairchips" id="pairChips"></div>
+    <div class="chartbox" id="ch1"></div>
+    <div class="chartbox" id="ch2"></div>
+    <label style="font-size:12px;color:var(--sub)"><input type="checkbox" id="logY" ${S.logY?"checked":""}> log 纵轴（梯度跨 5 个量级，建议开启）</label>
+  </div>`;
+  dv.innerHTML = html;
+  $("backBtn").onclick = ()=>{S.view="list"; renderAll();};
+  renderSeg($("dModel"), [["da3","DA3"],["vggt","VGGT"]], "model", renderAll);
+  renderSeg($("dU"), [[100,"100 步"],[50,"50 步"]], "u", renderAll);
+  const pc = $("pairChips"); pc.innerHTML="";
+  const mkChip=(v,label)=>{const c=document.createElement("div");c.className="chip"+(S.pair===v?" on":"");
+    c.textContent=label;c.onclick=()=>{S.pair=v;renderAll();};pc.appendChild(c);};
+  mkChip("all","全部 pair（均值）");
+  pairs.forEach(p=>mkChip(p,"P"+p));
+  if(!rows) return;
+  const sel = rows.filter(r=>S.pair==="all"||r[1]===S.pair);
+  const byStep = {};
+  sel.forEach(r=>{(byStep[r[0]]=byStep[r[0]]||[]).push(r)});
+  const meanSeries = COMP.map(c=>({
+    name:c.name, color:c.color,
+    pts:Object.keys(byStep).map(k=>{const rs=byStep[k];return [+k, rs.reduce((a,r)=>a+r[c.k],0)/rs.length]})
+      .sort((a,b)=>a[0]-b[0])
+  }));
+  lineChart($("ch1"), `四分项梯度范数 · ${S.model==="da3"?"DA3":"VGGT"} u${S.u} · ${S.pair==="all"?"全部 pair 均值":"P"+S.pair}`, meanSeries, {log:S.logY});
+  const first10 = sel.slice(0,10).reduce((a,r)=>a+r[6],0)/Math.min(10,sel.length);
+  lineChart($("ch2"), "L_rot（rel 旋转残差）—— 下降=在学", [
+    {name:"L_rot", color:"#059669", pts:sel.map(r=>[r[0],r[6]])},
+    {name:"起点水平(前10均值)", color:"#9ca3af", pts:[[sel[0][0],first10],[sel[sel.length-1][0],first10]]},
+  ], {log:true, h:220, xTicks:10});
+  $("logY").onchange = e=>{S.logY=e.target.checked; renderAll();};
+}
+
+/* ---------- root render ---------- */
+function renderAll(){
+  $("listView").style.display = S.view==="list"?"":"none";
+  $("detailView").style.display = S.view==="scene"?"":"none";
+  renderSeg($("segModel"), [["da3","DA3"],["vggt","VGGT"]], "model", renderAll);
+  renderSeg($("segU"), [[100,"100 步"],[50,"50 步"]], "u", renderAll);
+  renderDsChips();
+  if(S.view==="list") renderGrid(); else renderDetail();
+}
+$("sortSel").onchange = e=>{S.sort=e.target.value; renderAll();};
+$("search").oninput = e=>{S.q=e.target.value; if(S.view!=="list"){S.view="list";} renderAll();};
+renderAll();
+</script>
+</body>
+</html>

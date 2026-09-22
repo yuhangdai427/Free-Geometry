@@ -399,14 +399,16 @@ def main():
                     half_loss = None
             rel_rot = rel_tdir = None
             if args.vggt_sync:
-                # deployed C2M_maskrel rel-pose term, same math AND same
-                # CONVENTION as train_arms.loss_pose_rel: rel quantities on
-                # c2w poses (VGGT consumes the decoder output directly; DA3's
-                # model path inverts to w2c, so invert back here)
-                from depth_anything_3.utils.geometry import affine_inverse
-                ext_t = affine_inverse(caches[pi]["ext4"].to(device))  # w2c->c2w
-                ext_s_c2w = affine_inverse(ext_s)                      # w2c->c2w
-                R_s, t_s = ext_s_c2w[..., :3, :3], ext_s_c2w[..., :3, 3]
+                # deployed rel-pose term, w2c CONVENTION throughout — identical
+                # to train_arms.loss_pose_rel. Both the DA3 model outputs and
+                # the VGGT pose decoder return w2c ([R|t], world->camera), and
+                # the w2c relative transform is Rr = R_i R_j^T,
+                # tr = t_i - Rr t_j. NO affine_inverse anywhere: inverting to
+                # c2w while keeping this formula makes the translation term
+                # gauge-dependent (it penalizes world-origin placement, not
+                # geometry — verified by an origin-shift test 2026-09-22).
+                ext_t = caches[pi]["ext4"].to(device)   # [4,3,4] w2c
+                R_s, t_s = ext_s[..., :3, :3], ext_s[..., :3, 3]
                 R_t, t_t = ext_t[..., :3, :3], ext_t[..., :3, 3]
                 S_ = R_s.shape[0]
                 rot_acc, tdir_acc, np_ = 0.0, 0.0, 0

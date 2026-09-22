@@ -24,7 +24,7 @@ run_retry() {  # $1 log, rest = command
   return $rc
 }
 
-for DS in eth3d 7scenes scannetpp hiroom; do
+for DS in ${DATASETS:-eth3d 7scenes scannetpp hiroom}; do
   MAN=artifacts/diagnostics/final_protocol/$DS/scene_manifest.json
   [ -f "$MAN" ] || { pat "MISSING manifest $DS — skip"; continue; }
   SCENES=$($PY -c "import json;print(' '.join(sorted(json.load(open('$MAN'))['scenes'])))")
@@ -35,13 +35,14 @@ for DS in eth3d 7scenes scannetpp hiroom; do
 
     # ---------- DA3 ----------
     for SC in $SCENES; do
+      SC_LOG=$(echo "$SC" | tr '/' '_')   # hiroom scene names contain slashes
       OUT=$ROOT/da3_${DS}_u${STEPS}/$SC
       pat "DA3 $DS/$SC u$STEPS start"
-      if run_retry logs/ov_da3_${DS}_${SC}_u${STEPS}.log \
+      if run_retry logs/ov_da3_${DS}_${SC_LOG}_u${STEPS}.log \
           $PY scripts/train_pw0_accum.py --dataset $DS --scene $SC --vggt_sync \
               --half_mode vggt --manifest $MAN --updates $STEPS --accum 1 \
               --out $OUT; then
-        grep "cam_dec" logs/ov_da3_${DS}_${SC}_u${STEPS}.log >> $SUM
+        grep "cam_dec" logs/ov_da3_${DS}_${SC_LOG}_u${STEPS}.log >> $SUM
       else
         pat "DA3 $DS/$SC u$STEPS FAILED rc!=0 (see log)"
       fi
@@ -61,7 +62,8 @@ PYEOF
       fi
     done
 
-    # ---------- VGGT ----------
+    # ---------- VGGT (skippable for repair reruns) ----------
+    [ "${SKIP_VGGT:-0}" = "1" ] && continue
     VR=$ROOT/vggt_${DS}_u${STEPS}
     mkdir -p $VR
     cp $MAN $VR/scene_manifest.json
