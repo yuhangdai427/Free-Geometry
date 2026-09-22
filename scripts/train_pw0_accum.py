@@ -354,73 +354,66 @@ def main():
                             t = torch.nn.functional.smooth_l1_loss(a, b, beta=1.0, reduction="none").mean(dim=-1)
                         return (t * w).mean()
 
+                    def _cwd_patch(hs_t, ht_t, tau):
+                        """Spatial CWD (ICCV'21): per channel, softmax over
+                        PATCH positions. hs/ht: [B,S,P,C] -> transpose(-1,-2)
+                        -> [B,S,C,P], softmax(dim=-1) over P. log_softmax for
+                        numerical stability (review fix: was transpose(1,2)
+                        which softmaxed over channels, and log(p+eps) which
+                        killed gradients on hard mismatches)."""
+                        log_ps = torch.nn.functional.log_softmax(
+                            hs_t.transpose(-1, -2) / tau, dim=-1)
+                        log_pt = torch.nn.functional.log_softmax(
+                            ht_t.detach().transpose(-1, -2) / tau, dim=-1)
+                        return (log_pt.exp() * (log_pt - log_ps)).sum(dim=-1)
+
+                    def _cwd_camtok(cs, ct, tau):
+                        """Camera-token CWD: per channel, softmax over the 4
+                        FRAMES (cross-frame distribution). Uses log_softmax."""
+                        log_pcs = torch.nn.functional.log_softmax(cs / tau, dim=0)
+                        log_pct = torch.nn.functional.log_softmax(
+                            ct.detach() / tau, dim=0)
+                        return (log_pct.exp() * (log_pct - log_pcs)).sum(dim=0)
+
                     if args.half_mode == "vggt_cwd_ln":
-                        # CWD + cos on LAYER-NORMED tokens (head_norm space,
-                        # same LN the deployed loss uses) — vs vggt_cwd which
-                        # works on raw encoder tokens
                         cosv = (torch.nn.functional.normalize(hs, dim=-1)
                                 * torch.nn.functional.normalize(ht, dim=-1)).sum(dim=-1).mean()
-                        ps = torch.softmax(hs.transpose(1, 2) / args.cwd_tau, dim=-1)
-                        pt = torch.softmax(ht.transpose(1, 2).detach() / args.cwd_tau, dim=-1)
-                        kl = (pt * (torch.log(pt + 1e-8) - torch.log(ps + 1e-8))).sum(dim=-1)
+                        kl = _cwd_patch(hs, ht, args.cwd_tau)
                         acc_d = acc_d + (args.cwd_tau ** 2) * kl.mean()
                         acc_c = acc_c + 2.0 * (1.0 - cosv)
                         continue
                     if args.half_mode == "cwd":
-                        # Channel-wise Distribution distillation (ICCV'21):
-                        # per channel, softmax over PATCH positions -> spatial
-                        # response distribution; tau^2 * KL(t||s), averaged
-                        # over frames+channels. Shift-invariant per channel.
-                        # hs/ht: [S, P, C] -> [S, C, P]
-                        ps = torch.softmax(hs.transpose(1, 2) / args.cwd_tau, dim=-1)
-                        pt = torch.softmax(ht.transpose(1, 2).detach() / args.cwd_tau, dim=-1)
-                        kl = (pt * (torch.log(pt + 1e-8) - torch.log(ps + 1e-8))).sum(dim=-1)
+                        kl = _cwd_patch(hs, ht, args.cwd_tau)
                         acc_d = acc_d + (args.cwd_tau ** 2) * kl.mean()
                         continue
                     if args.half_mode == "cwd_camtok":
-                        # CWD on patch tokens + CWD+cos on camera tokens at
-                        # ALL 4 tapped layers (not just the last one)
                         cosv = (torch.nn.functional.normalize(hs, dim=-1)
                                 * torch.nn.functional.normalize(ht, dim=-1)).sum(dim=-1).mean()
-                        ps = torch.softmax(hs.transpose(1, 2) / args.cwd_tau, dim=-1)
-                        pt = torch.softmax(ht.transpose(1, 2).detach() / args.cwd_tau, dim=-1)
-                        kl = (pt * (torch.log(pt + 1e-8) - torch.log(ps + 1e-8))).sum(dim=-1)
+                        kl = _cwd_patch(hs, ht, args.cwd_tau)
                         acc_d = acc_d + (args.cwd_tau ** 2) * kl.mean()
                         acc_c = acc_c + 2.0 * (1.0 - cosv)
-                        # camera token: same CWD + cos, averaged over 4 layers
-                        # (computed ONCE, not per patch layer — review fix)
                         if layer == P.TAP_LAYERS[0]:
                             for _cl in P.TAP_LAYERS:
                                 cs_tok = tap_cam[_cl][0].float()
                                 ct_tok = caches[pi]["cam"][_cl][0].to(device).float()
-                                pcs = torch.softmax(cs_tok / args.cwd_tau, dim=0)
-                                pct = torch.softmax(ct_tok.detach() / args.cwd_tau, dim=0)
-                                kl_c = (pct * (torch.log(pct + 1e-8)
-                                               - torch.log(pcs + 1e-8))).sum(dim=0)
+                                kl_c = _cwd_camtok(cs_tok, ct_tok, args.cwd_tau)
                                 cc = (torch.nn.functional.normalize(cs_tok, dim=-1)
                                       * torch.nn.functional.normalize(ct_tok, dim=-1)).sum(dim=-1).mean()
                                 acc_c = acc_c + (args.cwd_tau ** 2) * kl_c.mean() \
                                         + 2.0 * (1.0 - cc)
                         continue
                     if args.half_mode == "vggt_all3":
-                        # ALL THREE: SmoothL1 + 2*(1-cos) + CWD (raw space)
                         dist = torch.nn.functional.smooth_l1_loss(hs, ht, beta=1.0)
                         cosv = (torch.nn.functional.normalize(hs, dim=-1)
                                 * torch.nn.functional.normalize(ht, dim=-1)).sum(dim=-1).mean()
-                        ps = torch.softmax(hs.transpose(1, 2) / args.cwd_tau, dim=-1)
-                        pt = torch.softmax(ht.transpose(1, 2).detach() / args.cwd_tau, dim=-1)
-                        kl = (pt * (torch.log(pt + 1e-8) - torch.log(ps + 1e-8))).sum(dim=-1)
+                        kl = _cwd_patch(hs, ht, args.cwd_tau)
                         acc_d = acc_d + dist + (args.cwd_tau ** 2) * kl.mean()
                         acc_c = acc_c + 2.0 * (1.0 - cosv)
                         continue
                     if args.half_mode == "vggt_cwd":
-                        # REPLACE SmoothL1 with CWD: patch loss = tau^2 * KL
-                        # (patch-softmax spatial distributions) + 2*(1-cos)
                         cosv = (torch.nn.functional.normalize(hs, dim=-1)
                                 * torch.nn.functional.normalize(ht, dim=-1)).sum(dim=-1).mean()
-                        ps = torch.softmax(hs.transpose(1, 2) / args.cwd_tau, dim=-1)
-                        pt = torch.softmax(ht.transpose(1, 2).detach() / args.cwd_tau, dim=-1)
-                        kl = (pt * (torch.log(pt + 1e-8) - torch.log(ps + 1e-8))).sum(dim=-1)
+                        kl = _cwd_patch(hs, ht, args.cwd_tau)
                         acc_d = acc_d + (args.cwd_tau ** 2) * kl.mean()
                         acc_c = acc_c + 2.0 * (1.0 - cosv)
                         continue
