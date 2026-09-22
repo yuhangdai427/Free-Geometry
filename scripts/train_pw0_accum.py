@@ -462,7 +462,9 @@ def main():
                 m_t = float(_edges(ct).mean())
                 cr_degen = m_t <= 1e-6
                 if cr_degen:
-                    L_T = torch.zeros((), device=Es.device)
+                    # graph-connected zero so autograd.grad on the weighted
+                    # term stays valid (review fix #3)
+                    L_T = cs.sum() * 0.0
                 else:
                     chat_s = cs / max(m_s, 1e-6)   # max() keeps grad path
                     chat_t = ct / max(m_t, 1e-6)
@@ -472,20 +474,28 @@ def main():
                 # --- L_F: raw-radian FoV L1 over 4 frames x 2 angles ---
                 L_F = (enc_s[..., 7:9] - enc_t[..., 7:9]).abs().mean()  # /8
 
-                # diagnostics (no grad)
+                # diagnostics (no grad) — per-camera and per-frame values kept
                 with torch.no_grad():
-                    rot_err = torch.stack([
-                        torch.acos(((Qs[i].T @ Qt[i]).diagonal().sum() - 1).clamp(-1, 1) / 2)
-                        for i in range(1, 4)]).mean() * 57.29577951308232
+                    rot_i = [
+                        float(torch.acos((((Qs[i].T @ Qt[i]).diagonal().sum() - 1) / 2)
+                                         .clamp(-1, 1)) * 57.29577951308232)
+                        for i in range(1, 4)]
                     if cr_degen:
-                        pos_err = torch.zeros(())
+                        pos_i = [0.0, 0.0, 0.0]
                     else:
-                        pos_err = torch.stack([
-                            torch.linalg.vector_norm(cs[i] / max(m_s, 1e-6)
-                                                     - ct[i] / max(m_t, 1e-6))
-                            for i in range(1, 4)]).mean()
-                cr = dict(R=L_R, T=L_T, F=L_F, rot_err=float(rot_err),
-                          pos_err=float(pos_err), fov_err=float(L_F),
+                        pos_i = [
+                            float(torch.linalg.vector_norm(
+                                cs[i] / max(m_s, 1e-6) - ct[i] / max(m_t, 1e-6)))
+                            for i in range(1, 4)]
+                    dfov = (enc_s[0, :, 7:9] - enc_t[0, :, 7:9]).abs()  # [4,2]
+                cr = dict(R=L_R, T=L_T, F=L_F,
+                          rot_i=rot_i, pos_i=pos_i,
+                          rot_mean=sum(rot_i) / 3.0,
+                          pos_mean=sum(pos_i) / 3.0,
+                          fov_h=[float(dfov[k, 0]) for k in range(4)],
+                          fov_w=[float(dfov[k, 1]) for k in range(4)],
+                          fov_mean=float(dfov.mean()),
+                          m_s=float(m_s), m_t=float(m_t),
                           ms_mt=float(m_s) / max(m_t, 1e-12),
                           degen=int(cr_degen))
                 loss = loss + (args.camrel_rw * L_R + args.camrel_tw * L_T
@@ -591,10 +601,15 @@ def main():
                     _g = torch.autograd.grad(_t, params, retain_graph=True, allow_unused=True)
                     _gns.append(float(torch.cat([x.reshape(-1) for x in _g
                                                  if x is not None]).norm()))
-                cr_comp = (float(_terms[0]), float(cr["R"]), float(cr["T"]), float(cr["F"]),
-                           float(_terms[1]), float(_terms[2]), float(_terms[3]),
-                           *_gns, cr["rot_err"], cr["pos_err"], cr["fov_err"],
-                           cr["ms_mt"], cr["degen"])
+                cr_comp = dict(l_feat=float(_terms[0]), l_R=float(cr["R"]),
+                               l_T=float(cr["T"]), l_F=float(cr["F"]),
+                               w_R=float(_terms[1]), w_T=float(_terms[2]),
+                               w_F=float(_terms[3]),
+                               g_feat=_gns[0], g_R=_gns[1], g_T=_gns[2], g_F=_gns[3],
+                               **{k: cr[k] for k in ("rot_i", "pos_i", "rot_mean",
+                                                     "pos_mean", "fov_h", "fov_w",
+                                                     "fov_mean", "m_s", "m_t",
+                                                     "ms_mt", "degen")})
             (loss / args.accum).backward()
             visit += 1
         max_norm = P.CLIP if args.clip is None else (
@@ -616,30 +631,29 @@ def main():
                                   gg_m, gg_c, sg, dirg))
                 htxt = (f" | loc: gm={gl_m:.4f} gc={gl_c:.4f} cs={sl:.3f} dir={dirl:.3f}"
                         f" | glob: gm={gg_m:.4f} gc={gg_c:.4f} cs={sg:.3f} dir={dirg:.3f}")
-            rtxt = ""
+            rtxt = ctxt = crtxt = ""
             if rel_comp is not None:
                 lr_, lt_, gr_, gt2_ = rel_comp
                 rel_rows.append((upd + 1, pi_last, lr_, lt_, gr_, gt2_))
                 rtxt = (f" | rot: L={lr_:.4f} g={gr_:.4f}"
                         f" | tdir: L={lt_:.4f} g={gt2_:.4f}")
-                ctxt = ""
-                if cam_comp is not None:
-                    ch_l, cc_l, ch_g, cc_g = cam_comp
-                    rh = ch_g / max(comp[2], 1e-12)
-                    rc = cc_g / max(comp[3], 1e-12)
-                    cam_rows.append((upd + 1, pi_last, ch_l, cc_l, ch_g, cc_g, rh, rc))
-                    ctxt = (f" | camTok: Lh={ch_l:.4f} Lc={cc_l:.4f}"
-                            f" gh={ch_g:.4f} gc={cc_g:.4f} ratio h/p={rh:.2f} c/p={rc:.2f}")
-                crtxt = ""
-                if cr_comp is not None:
-                    (lf, lr, lt, lf_, wlr, wlt, wlf, gf, gr, gt, gfv,
-                     re_, pe_, fe_, msr, dg) = cr_comp
-                    cr_rows.append((upd + 1, pi_last, lf, lr, lt, lf_, wlr, wlt, wlf,
-                                    gf, gr, gt, gfv, re_, pe_, fe_, msr, dg))
-                    crtxt = (f" | camRel: Lfeat={lf:.3f} LR={lr:.4f} LT={lt:.4f} LF={lf_:.4f}"
-                             f" | g: feat={gf:.3f} R={gr:.3f} T={gt:.3f} F={gfv:.3f}"
-                             f" | rot={re_:.1f}deg pos={pe_:.3f} fov={fe_:.4f} ms/mt={msr:.3f}"
-                             + (" DEGEN" if dg else ""))
+            if cam_comp is not None:
+                ch_l, cc_l, ch_g, cc_g = cam_comp
+                rh = ch_g / max(comp[2], 1e-12)
+                rc = cc_g / max(comp[3], 1e-12)
+                cam_rows.append((upd + 1, pi_last, ch_l, cc_l, ch_g, cc_g, rh, rc))
+                ctxt = (f" | camTok: Lh={ch_l:.4f} Lc={cc_l:.4f}"
+                        f" gh={ch_g:.4f} gc={cc_g:.4f} ratio h/p={rh:.2f} c/p={rc:.2f}")
+            if cr_comp is not None:
+                c = cr_comp
+                cr_rows.append((upd + 1, pi_last, c))
+                crtxt = (f" | camRel: Lfeat={c['l_feat']:.3f} LR={c['l_R']:.4f} "
+                         f"LT={c['l_T']:.4f} LF={c['l_F']:.4f}"
+                         f" | g: feat={c['g_feat']:.3f} R={c['g_R']:.3f} "
+                         f"T={c['g_T']:.3f} F={c['g_F']:.3f}"
+                         f" | rot={c['rot_mean']:.1f}deg pos={c['pos_mean']:.3f} "
+                         f"fov={c['fov_mean']:.4f} ms/mt={c['ms_mt']:.3f}"
+                         + (" DEGEN" if c["degen"] else ""))
             print(f"[{args.scene}] update {upd+1}/{args.updates} pair={pi_last} "
                   f"L_mse={l_d:.4f} L_cos={l_c:.4f} g_mse={g_d:.4f} g_cos={g_c:.4f} "
                   f"cos_share={share_c:.3f} dir={gdir:.3f} gn={float(gn):.3f} "
@@ -681,12 +695,26 @@ def main():
         print(f"[{args.scene}] cam-token grads -> {csv4}")
     if cr_rows:
         csv5 = os.path.join(out, "grad_camrel.csv")
+        cols = ("update,pair,l_feat,l_R,l_T,l_F,w_R,w_T,w_F,"
+                "g_feat,g_R,g_T,g_F,"
+                "rot_deg_v1,rot_deg_v2,rot_deg_v3,rot_mean,"
+                "pos_err_v1,pos_err_v2,pos_err_v3,pos_mean,"
+                "fov_h_v0,fov_h_v1,fov_h_v2,fov_h_v3,"
+                "fov_w_v0,fov_w_v1,fov_w_v2,fov_w_v3,fov_mean,"
+                "m_s,m_t,ms_over_mt,degenerate\n")
         with open(csv5, "w") as f:
-            f.write("update,pair,l_feat,l_R,l_T,l_F,w_R,w_T,w_F,"
-                    "g_feat,g_R,g_T,g_F,rot_err_deg,pos_err,fov_err,ms_over_mt,degenerate\n")
-            for r in cr_rows:
+            f.write(cols)
+            for u, p_, c in cr_rows:
+                vals = [u, p_,
+                        c["l_feat"], c["l_R"], c["l_T"], c["l_F"],
+                        c["w_R"], c["w_T"], c["w_F"],
+                        c["g_feat"], c["g_R"], c["g_T"], c["g_F"],
+                        *c["rot_i"], c["rot_mean"],
+                        *c["pos_i"], c["pos_mean"],
+                        *c["fov_h"], *c["fov_w"], c["fov_mean"],
+                        c["m_s"], c["m_t"], c["ms_mt"], c["degen"]]
                 f.write(",".join(f"{x:.6f}" if isinstance(x, float) else str(x)
-                                 for x in r) + "\n")
+                                 for x in vals) + "\n")
         print(f"[{args.scene}] camrel grads -> {csv5}")
     if rel_rows:
         csv3 = os.path.join(out, "grad_rel.csv")
