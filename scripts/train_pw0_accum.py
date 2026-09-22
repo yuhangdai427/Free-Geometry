@@ -72,6 +72,24 @@ def main():
                     help="comma-separated manifest pair indices to KEEP "
                          "(e.g. '5,6,8'); vggt_sync only, everything else "
                          "unchanged")
+    ap.add_argument("--camtok", action="store_true",
+                    help="vggt_sync: REPLACE the rel-pose term with a camera-"
+                         "token KD loss (position-0 token, SAME form as the "
+                         "raw patch loss: SmoothL1(beta=1) + 2*(1-cos), same "
+                         "layers); records cam/patch gradient ratios")
+    ap.add_argument("--camrel", action="store_true",
+                    help="vggt_sync: REPLACE the six-pair rel-pose term with "
+                         "the camrel v1 loss: first-frame-reference rotation "
+                         "(chordal, /3 no /9), scale-normalized position "
+                         "SmoothL1(beta=1, /9, student scale NOT detached, "
+                         "m_t<=1e-6 -> skip+flag), raw-radian FoV L1 (/8). "
+                         "Weights --camrel_rw/--camrel_tw/--camrel_fw.")
+    ap.add_argument("--camrel_rw", type=float, default=1.0)
+    ap.add_argument("--camrel_tw", type=float, default=1.0)
+    ap.add_argument("--camrel_fw", type=float, default=0.5)
+    ap.add_argument("--camtok_w", type=float, default=1.0,
+                    help="camera-token term weight (calibration: g_cam/g_patch "
+                         "SmoothL1 ratio measured ~1.28 at w=1)")
     ap.add_argument("--resample", type=int, default=0,
                     help="screen N candidate pairs (16:4, protocol-generated): "
                          "measure step-0 rel-rot grad per pair at zero-LoRA, "
@@ -243,6 +261,8 @@ def main():
     grad_rows = []
     half_rows = []
     rel_rows = []
+    cam_rows = []
+    cr_rows = []
     t0 = time.time()
     for upd in range(args.updates):
         epoch = (upd * args.accum) // n_train
@@ -258,8 +278,12 @@ def main():
             images4_in, pmask = P.mask_image_blocks(images4, 0.5, patch_hw, gen)
             ones = torch.ones_like(pmask)  # allpos: supervise every position
             torch.manual_seed(P.stable_seed("cf_rng", args.scene, epoch, pi, 0))
-            tap_feats_s, ext_w2c, _ = P.student_forward_c2m(student, images4_in)
-            ext_s = ext_w2c[0].float() if torch.is_tensor(ext_w2c) else ext_w2c[0]
+            if args.camtok or args.camrel:
+                tap_feats_s, _, _, tap_cam = P.student_forward_c2m(
+                    student, images4_in, with_cam=True)
+            else:
+                tap_feats_s, ext_w2c, _ = P.student_forward_c2m(student, images4_in)
+                ext_s = ext_w2c[0].float() if torch.is_tensor(ext_w2c) else ext_w2c[0]
             cache = {"feats": {l: t.to(device) for l, t in caches[pi]["feats"].items()},
                      "conf4": caches[pi]["conf4"].to(device), "patch_hw": patch_hw}
             loss_d = loss_c = None  # set in the main branch below
@@ -398,7 +422,89 @@ def main():
                 else:
                     half_loss = None
             rel_rot = rel_tdir = None
-            if args.vggt_sync:
+            cam_h = cam_c = None
+            cr = None  # camrel v1 terms: dict(R=,T=,F=, diag...)
+            if args.camrel:
+                # camrel v1 (2026-09-22, user spec): first-frame-reference
+                # rotation + scale-normalized position + raw FoV. All geometry
+                # FP32; enc9 = cam_dec(camera token of LAST tap layer) on both
+                # sides (frozen head, shared weights -> teacher token through
+                # the same cam_dec, detached).
+                from depth_anything_3.model.utils.transform import \
+                    pose_encoding_to_extri_intri as _pe
+                from depth_anything_3.utils.geometry import affine_inverse as _ai
+                _tok_s = tap_cam[P.TAP_LAYERS[-1]].float()          # [1,4,3072]
+                _tok_t = caches[pi]["cam"][P.TAP_LAYERS[-1]].to(device).float()
+                enc_s = student.da3.model.cam_dec(_tok_s)            # [1,4,9] grad
+                enc_t = student.da3.model.cam_dec(_tok_t).detach()   # [1,4,9]
+
+                def _w2c_of(enc):
+                    c2w, _ = _pe(enc, (518, 518))  # H,W only shape intrinsics
+                    return _ai(c2w)[0][:, :3, :]   # [4,3,4] w2c (R|t)
+
+                Es, Et = _w2c_of(enc_s), _w2c_of(enc_t)
+                Rs, ts_ = Es[:, :3, :3], Es[:, :3, 3]
+                Rt, tt_ = Et[:, :3, :3], Et[:, :3, 3]
+                # A_i = E_0 @ inv(E_i):  Q_i = R_0 R_i^T,  c_i = t_0 - Q_i t_i
+                Qs = Rs[0] @ Rs.transpose(1, 2)                     # [4,3,3]
+                Qt = Rt[0] @ Rt.transpose(1, 2)
+                cs = ts_[0][None] - (Qs @ ts_[..., None]).squeeze(-1)   # [4,3]
+                ct = tt_[0][None] - (Qt @ tt_[..., None]).squeeze(-1)
+
+                # --- L_R: chordal on the LAST THREE relative rotations ---
+                L_R = ((Qs[1:] - Qt[1:]) ** 2).sum(dim=(1, 2)).mean()   # /3, no /9
+
+                # --- L_T: group-scale-normalized positions, SmoothL1(beta=1) ---
+                def _edges(c):
+                    return torch.stack([torch.linalg.vector_norm(c[j] - c[i])
+                                        for i in range(4) for j in range(i + 1, 4)])
+                m_s = _edges(cs).mean()          # NOT detached (spec)
+                m_t = float(_edges(ct).mean())
+                cr_degen = m_t <= 1e-6
+                if cr_degen:
+                    L_T = torch.zeros((), device=Es.device)
+                else:
+                    chat_s = cs / max(m_s, 1e-6)   # max() keeps grad path
+                    chat_t = ct / max(m_t, 1e-6)
+                    L_T = torch.nn.functional.smooth_l1_loss(
+                        chat_s[1:], chat_t[1:], beta=1.0)              # /9
+
+                # --- L_F: raw-radian FoV L1 over 4 frames x 2 angles ---
+                L_F = (enc_s[..., 7:9] - enc_t[..., 7:9]).abs().mean()  # /8
+
+                # diagnostics (no grad)
+                with torch.no_grad():
+                    rot_err = torch.stack([
+                        torch.acos(((Qs[i].T @ Qt[i]).diagonal().sum() - 1).clamp(-1, 1) / 2)
+                        for i in range(1, 4)]).mean() * 57.29577951308232
+                    if cr_degen:
+                        pos_err = torch.zeros(())
+                    else:
+                        pos_err = torch.stack([
+                            torch.linalg.vector_norm(cs[i] / max(m_s, 1e-6)
+                                                     - ct[i] / max(m_t, 1e-6))
+                            for i in range(1, 4)]).mean()
+                cr = dict(R=L_R, T=L_T, F=L_F, rot_err=float(rot_err),
+                          pos_err=float(pos_err), fov_err=float(L_F),
+                          ms_mt=float(m_s) / max(m_t, 1e-12),
+                          degen=int(cr_degen))
+                loss = loss + (args.camrel_rw * L_R + args.camrel_tw * L_T
+                               + args.camrel_fw * L_F)
+            elif args.camtok:
+                # camera-token KD: position-0 token per tap layer, SAME form
+                # as the raw patch loss (SmoothL1 beta=1 full-element mean +
+                # 2*(1-cos), no LN, no conf, /n_layers)
+                acc_ch, acc_cc = 0.0, 0.0
+                for l in P.TAP_LAYERS:
+                    cs = tap_cam[l][0].float()                       # [4,3072]
+                    ct = caches[pi]["cam"][l][0].to(device).float()  # teacher
+                    acc_ch = acc_ch + torch.nn.functional.smooth_l1_loss(cs, ct, beta=1.0)
+                    cc = torch.nn.functional.cosine_similarity(cs, ct, dim=-1).mean()
+                    acc_cc = acc_cc + 2.0 * (1.0 - cc)
+                cam_h = args.camtok_w * acc_ch / len(P.TAP_LAYERS)
+                cam_c = args.camtok_w * acc_cc / len(P.TAP_LAYERS)
+                loss = loss + cam_h + cam_c
+            elif args.vggt_sync:
                 # deployed rel-pose term, w2c CONVENTION throughout — identical
                 # to train_arms.loss_pose_rel. Both the DA3 model outputs and
                 # the VGGT pose decoder return w2c ([R|t], world->camera), and
@@ -467,6 +573,28 @@ def main():
                 rel_comp = (float(rel_rot), float(rel_tdir),
                             float(grf.norm()), float(gtf.norm()))
                 del gr, gt_, grf, gtf
+            cam_comp = None
+            if cam_h is not None and torch.is_tensor(cam_h) and cam_h.requires_grad:
+                gch = torch.autograd.grad(cam_h, params, retain_graph=True, allow_unused=True)
+                gcc = torch.autograd.grad(cam_c, params, retain_graph=True, allow_unused=True)
+                gchf = torch.cat([t.reshape(-1) for t in gch if t is not None])
+                gcf = torch.cat([t.reshape(-1) for t in gcc if t is not None])
+                cam_comp = (float(cam_h), float(cam_c), float(gchf.norm()), float(gcf.norm()))
+                del gch, gcc, gchf, gcf
+            cr_comp = None
+            if cr is not None and torch.is_tensor(cr["R"]) and cr["R"].requires_grad:
+                _terms = (loss_d + loss_c,                      # feature (weighted 1)
+                          args.camrel_rw * cr["R"], args.camrel_tw * cr["T"],
+                          args.camrel_fw * cr["F"])
+                _gns = []
+                for _t in _terms:
+                    _g = torch.autograd.grad(_t, params, retain_graph=True, allow_unused=True)
+                    _gns.append(float(torch.cat([x.reshape(-1) for x in _g
+                                                 if x is not None]).norm()))
+                cr_comp = (float(_terms[0]), float(cr["R"]), float(cr["T"]), float(cr["F"]),
+                           float(_terms[1]), float(_terms[2]), float(_terms[3]),
+                           *_gns, cr["rot_err"], cr["pos_err"], cr["fov_err"],
+                           cr["ms_mt"], cr["degen"])
             (loss / args.accum).backward()
             visit += 1
         max_norm = P.CLIP if args.clip is None else (
@@ -494,11 +622,29 @@ def main():
                 rel_rows.append((upd + 1, pi_last, lr_, lt_, gr_, gt2_))
                 rtxt = (f" | rot: L={lr_:.4f} g={gr_:.4f}"
                         f" | tdir: L={lt_:.4f} g={gt2_:.4f}")
+                ctxt = ""
+                if cam_comp is not None:
+                    ch_l, cc_l, ch_g, cc_g = cam_comp
+                    rh = ch_g / max(comp[2], 1e-12)
+                    rc = cc_g / max(comp[3], 1e-12)
+                    cam_rows.append((upd + 1, pi_last, ch_l, cc_l, ch_g, cc_g, rh, rc))
+                    ctxt = (f" | camTok: Lh={ch_l:.4f} Lc={cc_l:.4f}"
+                            f" gh={ch_g:.4f} gc={cc_g:.4f} ratio h/p={rh:.2f} c/p={rc:.2f}")
+                crtxt = ""
+                if cr_comp is not None:
+                    (lf, lr, lt, lf_, wlr, wlt, wlf, gf, gr, gt, gfv,
+                     re_, pe_, fe_, msr, dg) = cr_comp
+                    cr_rows.append((upd + 1, pi_last, lf, lr, lt, lf_, wlr, wlt, wlf,
+                                    gf, gr, gt, gfv, re_, pe_, fe_, msr, dg))
+                    crtxt = (f" | camRel: Lfeat={lf:.3f} LR={lr:.4f} LT={lt:.4f} LF={lf_:.4f}"
+                             f" | g: feat={gf:.3f} R={gr:.3f} T={gt:.3f} F={gfv:.3f}"
+                             f" | rot={re_:.1f}deg pos={pe_:.3f} fov={fe_:.4f} ms/mt={msr:.3f}"
+                             + (" DEGEN" if dg else ""))
             print(f"[{args.scene}] update {upd+1}/{args.updates} pair={pi_last} "
                   f"L_mse={l_d:.4f} L_cos={l_c:.4f} g_mse={g_d:.4f} g_cos={g_c:.4f} "
                   f"cos_share={share_c:.3f} dir={gdir:.3f} gn={float(gn):.3f} "
                   f"lr={lr_now:.2e} "
-                  f"peak={torch.cuda.max_memory_allocated()/2**20:.0f}MiB{htxt}{rtxt}",
+                  f"peak={torch.cuda.max_memory_allocated()/2**20:.0f}MiB{htxt}{rtxt}{ctxt}{crtxt}",
                   flush=True)
         else:
             print(f"[{args.scene}] update {upd+1}/{args.updates} "
@@ -524,6 +670,24 @@ def main():
                 f.write(f"{u},{p_},{glm:.6f},{glc:.6f},{sl:.6f},{dl:.6f},"
                         f"{ggm:.6f},{ggc:.6f},{sg:.6f},{dg:.6f}\n")
         print(f"[{args.scene}] per-half grads -> {csv2}")
+    if cam_rows:
+        csv4 = os.path.join(out, "grad_camtok.csv")
+        with open(csv4, "w") as f:
+            f.write("update,pair,l_cam_huber,l_cam_cos,g_cam_huber,g_cam_cos,"
+                    "ratio_camhuber_over_patchhuber,ratio_camcos_over_patchcos\n")
+            for u, p_, clh, clc, cgh, cgc, rh, rc in cam_rows:
+                f.write(f"{u},{p_},{clh:.6f},{clc:.6f},{cgh:.6f},{cgc:.6f},"
+                        f"{rh:.6f},{rc:.6f}\n")
+        print(f"[{args.scene}] cam-token grads -> {csv4}")
+    if cr_rows:
+        csv5 = os.path.join(out, "grad_camrel.csv")
+        with open(csv5, "w") as f:
+            f.write("update,pair,l_feat,l_R,l_T,l_F,w_R,w_T,w_F,"
+                    "g_feat,g_R,g_T,g_F,rot_err_deg,pos_err,fov_err,ms_over_mt,degenerate\n")
+            for r in cr_rows:
+                f.write(",".join(f"{x:.6f}" if isinstance(x, float) else str(x)
+                                 for x in r) + "\n")
+        print(f"[{args.scene}] camrel grads -> {csv5}")
     if rel_rows:
         csv3 = os.path.join(out, "grad_rel.csv")
         with open(csv3, "w") as f:

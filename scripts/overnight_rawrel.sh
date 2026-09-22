@@ -7,7 +7,7 @@ set -u
 cd /root/autodl-tmp/Free-Geometry
 PY=/root/miniconda3/envs/da3/bin/python
 DG=diagnostics/free_geometry
-ROOT=workspace/overnight
+ROOT=${OV_ROOT:-workspace/overnight}
 mkdir -p $ROOT
 SUM=$ROOT/SUMMARY.log
 pat() { echo "[$(date '+%F %T')] $*" >> $SUM; }
@@ -30,7 +30,7 @@ for DS in ${DATASETS:-eth3d 7scenes scannetpp hiroom}; do
   SCENES=$($PY -c "import json;print(' '.join(sorted(json.load(open('$MAN'))['scenes'])))")
   pat "==== DATASET $DS : $SCENES ===="
 
-  for STEPS in 100 50; do
+  for STEPS in ${STEPS_LIST:-100 50}; do
     EP=$((STEPS / 10))   # VGGT: epochs x 10 pairs = steps
 
     # ---------- DA3 ----------
@@ -38,11 +38,11 @@ for DS in ${DATASETS:-eth3d 7scenes scannetpp hiroom}; do
       SC_LOG=$(echo "$SC" | tr '/' '_')   # hiroom scene names contain slashes
       OUT=$ROOT/da3_${DS}_u${STEPS}/$SC
       pat "DA3 $DS/$SC u$STEPS start"
-      if run_retry logs/ov_da3_${DS}_${SC_LOG}_u${STEPS}.log \
+      if run_retry ${OV_LOGS:-logs}/ov_da3_${DS}_${SC_LOG}_u${STEPS}.log \
           $PY scripts/train_pw0_accum.py --dataset $DS --scene $SC --vggt_sync \
               --half_mode vggt --manifest $MAN --updates $STEPS --accum 1 \
               --out $OUT; then
-        grep "cam_dec" logs/ov_da3_${DS}_${SC_LOG}_u${STEPS}.log >> $SUM
+        grep "cam_dec" ${OV_LOGS:-logs}/ov_da3_${DS}_${SC_LOG}_u${STEPS}.log >> $SUM
       else
         pat "DA3 $DS/$SC u$STEPS FAILED rc!=0 (see log)"
       fi
@@ -68,7 +68,7 @@ PYEOF
     mkdir -p $VR
     cp $MAN $VR/scene_manifest.json
     pat "VGGT $DS u$STEPS train start (epochs=$EP)"
-    if run_retry logs/ov_vggt_${DS}_u${STEPS}.log \
+    if run_retry ${OV_LOGS:-logs}/ov_vggt_${DS}_u${STEPS}.log \
         $PY $DG/train_arms.py --run_root $VR --arms C2M_rawrel \
             --epochs $EP --seed 0 --no_eval32 --loss_all_pos --grad_components; then
       pat "VGGT $DS u$STEPS train OK"
@@ -78,10 +78,10 @@ PYEOF
     # TTA only — zero-shot baselines are frozen in protocol_v2/baselines.json
     SBF="--skip_baseline"
     pat "VGGT $DS u$STEPS eval start"
-    if run_retry logs/ov_vggt_eval_${DS}_u${STEPS}.log \
+    if run_retry ${OV_LOGS:-logs}/ov_vggt_eval_${DS}_u${STEPS}.log \
         $PY scripts/eval_vggt_cosw1.py --dataset $DS --scenes $SCENES \
             --run_root $VR --arm C2M_rawrel --step $STEPS --manifest $MAN $SBF; then
-      grep -E "AUC@3" logs/ov_vggt_eval_${DS}_u${STEPS}.log >> $SUM
+      grep -E "AUC@3" ${OV_LOGS:-logs}/ov_vggt_eval_${DS}_u${STEPS}.log >> $SUM
     else
       pat "VGGT $DS u$STEPS EVAL FAILED"
     fi
