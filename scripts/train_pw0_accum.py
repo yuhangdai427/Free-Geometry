@@ -39,7 +39,10 @@ def main():
                          "(deployed); half_mse=0.5*d^2 (tail unbounded)")
     ap.add_argument("--half_mode", default="joint",
                     choices=["joint", "split50", "local", "global", "g2", "g3",
-                             "cosw1", "cos_split", "cos_only", "mse_only", "half_resplit", "cwd", "vggt_cwd", "vggt_cwd_ln", "vggt_all3", "cwd_camtok",
+                             "cosw1", "cos_split", "cos_only", "mse_only", "half_resplit",
+                             "cwd", "vggt_cwd", "vggt_cwd_ln",
+                             "vggt_all3", "vggt_all3_ln",
+                             "cwd_camtok", "cwd_camtok_ln",
                              "vggt", "vggt_mse"],
                     help="which part of the DEPLOYED joint-LN(3072) normalized tensor "
                          "enters the loss: joint=whole 3072 (deployed); split50=huber "
@@ -114,8 +117,8 @@ def main():
     ap.add_argument("--lr", type=float, default=P.LR)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
-    if args.half_mode in ("vggt", "vggt_mse", "vggt_cwd", "vggt_all3", "cwd_camtok"):
-        args.space = "enc"  # raw-token space
+    if args.half_mode in ("vggt", "vggt_mse", "vggt_cwd", "vggt_all3", "cwd_camtok", "cwd"):
+        args.space = "enc"  # raw-token space (LN variants use default "head")
         print(f"[mode] {args.half_mode}: forcing --space enc (raw encoder tokens)")
     out = args.out or f"workspace/accum_{args.scene}_u{args.updates}k{args.accum}"
     os.makedirs(out + "/ckpts/" + args.scene, exist_ok=True)
@@ -375,18 +378,17 @@ def main():
                             ct.detach() / tau, dim=0)
                         return (log_pct.exp() * (log_pct - log_pcs)).sum(dim=0)
 
-                    if args.half_mode == "vggt_cwd_ln":
+                    if args.half_mode in ("vggt_cwd", "vggt_cwd_ln"):
+                        # CWD + 2cos on patch tokens (raw or LN by --space)
                         cosv = (torch.nn.functional.normalize(hs, dim=-1)
                                 * torch.nn.functional.normalize(ht, dim=-1)).sum(dim=-1).mean()
                         kl = _cwd_patch(hs, ht, args.cwd_tau)
                         acc_d = acc_d + (args.cwd_tau ** 2) * kl.mean()
                         acc_c = acc_c + 2.0 * (1.0 - cosv)
                         continue
-                    if args.half_mode == "cwd":
-                        kl = _cwd_patch(hs, ht, args.cwd_tau)
-                        acc_d = acc_d + (args.cwd_tau ** 2) * kl.mean()
-                        continue
-                    if args.half_mode == "cwd_camtok":
+                    if args.half_mode in ("cwd_camtok", "cwd_camtok_ln"):
+                        # CWD + 2cos on patches + CWD + 2cos on camera tokens
+                        # (all 4 tap layers, correct averaging)
                         cosv = (torch.nn.functional.normalize(hs, dim=-1)
                                 * torch.nn.functional.normalize(ht, dim=-1)).sum(dim=-1).mean()
                         kl = _cwd_patch(hs, ht, args.cwd_tau)
@@ -402,19 +404,13 @@ def main():
                                 acc_c = acc_c + (args.cwd_tau ** 2) * kl_c.mean() \
                                         + 2.0 * (1.0 - cc)
                         continue
-                    if args.half_mode == "vggt_all3":
+                    if args.half_mode in ("vggt_all3", "vggt_all3_ln"):
+                        # SmoothL1 + 2cos + CWD (all three patch terms)
                         dist = torch.nn.functional.smooth_l1_loss(hs, ht, beta=1.0)
                         cosv = (torch.nn.functional.normalize(hs, dim=-1)
                                 * torch.nn.functional.normalize(ht, dim=-1)).sum(dim=-1).mean()
                         kl = _cwd_patch(hs, ht, args.cwd_tau)
                         acc_d = acc_d + dist + (args.cwd_tau ** 2) * kl.mean()
-                        acc_c = acc_c + 2.0 * (1.0 - cosv)
-                        continue
-                    if args.half_mode == "vggt_cwd":
-                        cosv = (torch.nn.functional.normalize(hs, dim=-1)
-                                * torch.nn.functional.normalize(ht, dim=-1)).sum(dim=-1).mean()
-                        kl = _cwd_patch(hs, ht, args.cwd_tau)
-                        acc_d = acc_d + (args.cwd_tau ** 2) * kl.mean()
                         acc_c = acc_c + 2.0 * (1.0 - cosv)
                         continue
                     if args.half_mode in ("vggt", "vggt_mse"):
