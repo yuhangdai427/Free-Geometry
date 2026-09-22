@@ -39,7 +39,7 @@ def main():
                          "(deployed); half_mse=0.5*d^2 (tail unbounded)")
     ap.add_argument("--half_mode", default="joint",
                     choices=["joint", "split50", "local", "global", "g2", "g3",
-                             "cosw1", "cos_split", "cos_only", "mse_only", "half_resplit",
+                             "cosw1", "cos_split", "cos_only", "mse_only", "half_resplit", "cwd", "vggt_cwd", "vggt_cwd_ln", "vggt_all3", "cwd_camtok",
                              "vggt", "vggt_mse"],
                     help="which part of the DEPLOYED joint-LN(3072) normalized tensor "
                          "enters the loss: joint=whole 3072 (deployed); split50=huber "
@@ -84,9 +84,16 @@ def main():
                          "SmoothL1(beta=1, /9, student scale NOT detached, "
                          "m_t<=1e-6 -> skip+flag), raw-radian FoV L1 (/8). "
                          "Weights --camrel_rw/--camrel_tw/--camrel_fw.")
+    ap.add_argument("--cwd_tau", type=float, default=0.5,
+                    help="CWD softmax temperature (ICCV'21 default ~1.0 for "
+                         "segmentation; 0.5 sharper spatial distributions)")
     ap.add_argument("--camrel_rw", type=float, default=1.0)
     ap.add_argument("--camrel_tw", type=float, default=1.0)
     ap.add_argument("--camrel_fw", type=float, default=0.5)
+    ap.add_argument("--camrel_cap", type=float, default=0.0,
+                    help=">0: cap the WEIGHTED R and T term gradients each at "
+                         "this norm per update (lambda=min(1,cap/g)); 0=off. "
+                         "Applied to the actual backward loss.")
     ap.add_argument("--camtok_w", type=float, default=1.0,
                     help="camera-token term weight (calibration: g_cam/g_patch "
                          "SmoothL1 ratio measured ~1.28 at w=1)")
@@ -107,8 +114,8 @@ def main():
     ap.add_argument("--lr", type=float, default=P.LR)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
-    if args.half_mode in ("vggt", "vggt_mse"):
-        args.space = "enc"  # VGGT paradigm runs in the raw-token space
+    if args.half_mode in ("vggt", "vggt_mse", "vggt_cwd", "vggt_all3", "cwd_camtok"):
+        args.space = "enc"  # raw-token space
         print(f"[mode] {args.half_mode}: forcing --space enc (raw encoder tokens)")
     out = args.out or f"workspace/accum_{args.scene}_u{args.updates}k{args.accum}"
     os.makedirs(out + "/ckpts/" + args.scene, exist_ok=True)
@@ -278,9 +285,10 @@ def main():
             images4_in, pmask = P.mask_image_blocks(images4, 0.5, patch_hw, gen)
             ones = torch.ones_like(pmask)  # allpos: supervise every position
             torch.manual_seed(P.stable_seed("cf_rng", args.scene, epoch, pi, 0))
-            if args.camtok or args.camrel:
-                tap_feats_s, _, _, tap_cam = P.student_forward_c2m(
+            if args.camtok or args.camrel or args.half_mode == "cwd_camtok":
+                tap_feats_s, ext_w2c_cm, _, tap_cam = P.student_forward_c2m(
                     student, images4_in, with_cam=True)
+                ext_s = ext_w2c_cm[0].float() if torch.is_tensor(ext_w2c_cm) else ext_w2c_cm[0]
             else:
                 tap_feats_s, ext_w2c, _ = P.student_forward_c2m(student, images4_in)
                 ext_s = ext_w2c[0].float() if torch.is_tensor(ext_w2c) else ext_w2c[0]
@@ -346,6 +354,76 @@ def main():
                             t = torch.nn.functional.smooth_l1_loss(a, b, beta=1.0, reduction="none").mean(dim=-1)
                         return (t * w).mean()
 
+                    if args.half_mode == "vggt_cwd_ln":
+                        # CWD + cos on LAYER-NORMED tokens (head_norm space,
+                        # same LN the deployed loss uses) — vs vggt_cwd which
+                        # works on raw encoder tokens
+                        cosv = (torch.nn.functional.normalize(hs, dim=-1)
+                                * torch.nn.functional.normalize(ht, dim=-1)).sum(dim=-1).mean()
+                        ps = torch.softmax(hs.transpose(1, 2) / args.cwd_tau, dim=-1)
+                        pt = torch.softmax(ht.transpose(1, 2).detach() / args.cwd_tau, dim=-1)
+                        kl = (pt * (torch.log(pt + 1e-8) - torch.log(ps + 1e-8))).sum(dim=-1)
+                        acc_d = acc_d + (args.cwd_tau ** 2) * kl.mean()
+                        acc_c = acc_c + 2.0 * (1.0 - cosv)
+                        continue
+                    if args.half_mode == "cwd":
+                        # Channel-wise Distribution distillation (ICCV'21):
+                        # per channel, softmax over PATCH positions -> spatial
+                        # response distribution; tau^2 * KL(t||s), averaged
+                        # over frames+channels. Shift-invariant per channel.
+                        # hs/ht: [S, P, C] -> [S, C, P]
+                        ps = torch.softmax(hs.transpose(1, 2) / args.cwd_tau, dim=-1)
+                        pt = torch.softmax(ht.transpose(1, 2).detach() / args.cwd_tau, dim=-1)
+                        kl = (pt * (torch.log(pt + 1e-8) - torch.log(ps + 1e-8))).sum(dim=-1)
+                        acc_d = acc_d + (args.cwd_tau ** 2) * kl.mean()
+                        continue
+                    if args.half_mode == "cwd_camtok":
+                        # CWD on patch tokens + CWD+cos on camera tokens at
+                        # ALL 4 tapped layers (not just the last one)
+                        cosv = (torch.nn.functional.normalize(hs, dim=-1)
+                                * torch.nn.functional.normalize(ht, dim=-1)).sum(dim=-1).mean()
+                        ps = torch.softmax(hs.transpose(1, 2) / args.cwd_tau, dim=-1)
+                        pt = torch.softmax(ht.transpose(1, 2).detach() / args.cwd_tau, dim=-1)
+                        kl = (pt * (torch.log(pt + 1e-8) - torch.log(ps + 1e-8))).sum(dim=-1)
+                        acc_d = acc_d + (args.cwd_tau ** 2) * kl.mean()
+                        acc_c = acc_c + 2.0 * (1.0 - cosv)
+                        # camera token: same CWD + cos, averaged over 4 layers
+                        # (computed ONCE, not per patch layer — review fix)
+                        if layer == P.TAP_LAYERS[0]:
+                            for _cl in P.TAP_LAYERS:
+                                cs_tok = tap_cam[_cl][0].float()
+                                ct_tok = caches[pi]["cam"][_cl][0].to(device).float()
+                                pcs = torch.softmax(cs_tok / args.cwd_tau, dim=0)
+                                pct = torch.softmax(ct_tok.detach() / args.cwd_tau, dim=0)
+                                kl_c = (pct * (torch.log(pct + 1e-8)
+                                               - torch.log(pcs + 1e-8))).sum(dim=0)
+                                cc = (torch.nn.functional.normalize(cs_tok, dim=-1)
+                                      * torch.nn.functional.normalize(ct_tok, dim=-1)).sum(dim=-1).mean()
+                                acc_c = acc_c + (args.cwd_tau ** 2) * kl_c.mean() \
+                                        + 2.0 * (1.0 - cc)
+                        continue
+                    if args.half_mode == "vggt_all3":
+                        # ALL THREE: SmoothL1 + 2*(1-cos) + CWD (raw space)
+                        dist = torch.nn.functional.smooth_l1_loss(hs, ht, beta=1.0)
+                        cosv = (torch.nn.functional.normalize(hs, dim=-1)
+                                * torch.nn.functional.normalize(ht, dim=-1)).sum(dim=-1).mean()
+                        ps = torch.softmax(hs.transpose(1, 2) / args.cwd_tau, dim=-1)
+                        pt = torch.softmax(ht.transpose(1, 2).detach() / args.cwd_tau, dim=-1)
+                        kl = (pt * (torch.log(pt + 1e-8) - torch.log(ps + 1e-8))).sum(dim=-1)
+                        acc_d = acc_d + dist + (args.cwd_tau ** 2) * kl.mean()
+                        acc_c = acc_c + 2.0 * (1.0 - cosv)
+                        continue
+                    if args.half_mode == "vggt_cwd":
+                        # REPLACE SmoothL1 with CWD: patch loss = tau^2 * KL
+                        # (patch-softmax spatial distributions) + 2*(1-cos)
+                        cosv = (torch.nn.functional.normalize(hs, dim=-1)
+                                * torch.nn.functional.normalize(ht, dim=-1)).sum(dim=-1).mean()
+                        ps = torch.softmax(hs.transpose(1, 2) / args.cwd_tau, dim=-1)
+                        pt = torch.softmax(ht.transpose(1, 2).detach() / args.cwd_tau, dim=-1)
+                        kl = (pt * (torch.log(pt + 1e-8) - torch.log(ps + 1e-8))).sum(dim=-1)
+                        acc_d = acc_d + (args.cwd_tau ** 2) * kl.mean()
+                        acc_c = acc_c + 2.0 * (1.0 - cosv)
+                        continue
                     if args.half_mode in ("vggt", "vggt_mse"):
                         # VGGT paradigm on RAW encoder tokens: SmoothL1(beta=1)
                         # (vggt) or half-MSE (vggt_mse) FULL-element mean +
@@ -514,7 +592,7 @@ def main():
                 cam_h = args.camtok_w * acc_ch / len(P.TAP_LAYERS)
                 cam_c = args.camtok_w * acc_cc / len(P.TAP_LAYERS)
                 loss = loss + cam_h + cam_c
-            elif args.vggt_sync:
+            elif args.vggt_sync and args.half_mode != "cwd_camtok":
                 # deployed rel-pose term, w2c CONVENTION throughout — identical
                 # to train_arms.loss_pose_rel. Both the DA3 model outputs and
                 # the VGGT pose decoder return w2c ([R|t], world->camera), and
@@ -610,6 +688,15 @@ def main():
                                                      "pos_mean", "fov_h", "fov_w",
                                                      "fov_mean", "m_s", "m_t",
                                                      "ms_mt", "degen")})
+            if args.camrel_cap > 0 and cr is not None and cr_comp is not None:
+                # per-term gradient cap on the ACTUAL backward: rescale the
+                # weighted R/T terms by lambda = min(1, cap/g) measured above
+                lam_R = min(1.0, args.camrel_cap / max(cr_comp["g_R"], 1e-12))
+                lam_T = min(1.0, args.camrel_cap / max(cr_comp["g_T"], 1e-12))
+                cr_comp["lam_R"] = lam_R
+                cr_comp["lam_T"] = lam_T
+                loss = (loss_d + loss_c) + lam_R * args.camrel_rw * cr["R"] \
+                    + lam_T * args.camrel_tw * cr["T"] + args.camrel_fw * cr["F"]
             (loss / args.accum).backward()
             visit += 1
         max_norm = P.CLIP if args.clip is None else (
