@@ -634,14 +634,16 @@ def cache_teacher_pair(
 # Student forward (grad) + C2M loss
 # ---------------------------------------------------------------------------
 def student_forward_c2m(student, images4: torch.Tensor, ref_view_strategy: str = "first",
-                        with_depth: bool = False, with_cam: bool = False):
+                        with_depth: bool = False, with_cam: bool = False,
+                        with_conf: bool = False):
     """Student 4-view forward under bf16 autocast, tapping TAP_LAYERS
     (== HEAD_OUT_LAYERS since the v2 tap fix). Returns (tap_feats, ext_w2c,
     depth_s[, tap_cam]). Only the frozen CameraDec runs by default;
     with_depth=True also runs the frozen DualDPT head (needed by the couple
     term's student depth stat; head weights frozen, grads flow through to the
     tapped features). with_cam=True also returns {layer: camera_token
-    [1,S,3072]} (grad) for the ctk term."""
+    [1,S,3072]} (grad) for the ctk term. with_conf=True (implies with_depth)
+    additionally returns depth_conf (SelfEvo loss needs it)."""
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         feats, H, W = backbone_tapped_forward(student.da3, images4, TAP_LAYERS, ref_view_strategy)
     tap = split_tap_feats(feats, TAP_LAYERS)
@@ -649,15 +651,22 @@ def student_forward_c2m(student, images4: torch.Tensor, ref_view_strategy: str =
     with torch.autocast(device_type="cuda", enabled=False):
         ext_w2c = decode_pose_w2c(student.da3.model.cam_dec, cam_token_last.float(), H, W)
     depth_s = None
-    if with_depth:
+    conf_s = None
+    if with_depth or with_conf:
         hf = [(f.float(), c.float()) for f, c in head_feats(feats, TAP_LAYERS)]
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             preds = student.da3.model.forward_head_only(hf, H=H, W=W,
                                                         process_camera=False, process_sky=False)
         depth_s = preds["depth"]
+        if with_conf:
+            conf_s = preds["depth_conf"]
     if with_cam:
         tap_cam = {layer: feats[i][1] for i, layer in enumerate(TAP_LAYERS)}
+        if with_conf:
+            return tap, ext_w2c, depth_s, tap_cam, conf_s
         return tap, ext_w2c, depth_s, tap_cam
+    if with_conf:
+        return tap, ext_w2c, depth_s, conf_s
     return tap, ext_w2c, depth_s
 
 

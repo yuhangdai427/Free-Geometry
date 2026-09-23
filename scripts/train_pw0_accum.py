@@ -25,6 +25,98 @@ import common as fg_common
 from train_da3_protocol import make_dataset, get_scene_data, evaluate_scene
 
 
+def _rotmat_to_quat(R):
+    """[S,3,3] rotation -> [S,4] quaternion (w,x,y,z). Simple Shepperon branch
+    on trace; both teacher and student go through the same map, and quat signs
+    are aligned afterwards, so the L1 below is well-defined."""
+    m = R
+    tr = m[:, 0, 0] + m[:, 1, 1] + m[:, 2, 2]
+    w = torch.sqrt((1.0 + tr).clamp_min(1e-6)) / 2.0
+    x = (m[:, 2, 1] - m[:, 1, 2]) / (4.0 * w)
+    y = (m[:, 0, 2] - m[:, 2, 0]) / (4.0 * w)
+    z = (m[:, 1, 0] - m[:, 0, 1]) / (4.0 * w)
+    return torch.stack([w, x, y, z], dim=-1)
+
+
+def selfevo_losses(depth_s, conf_s, ext_s, cache, cam_w=5.0, gamma=1.0, alpha=0.2):
+    """SelfEvo-faithful output-space loss (port of Self-Evo/SelfEvo
+    training/loss.py + trainer._geom_pack) for the DA3 teacher-student setup.
+
+    camera (x cam_w): L1 on the gauge-aligned relative pose — camera-centre
+      difference (clamp@100, as SelfEvo's loss_T) and relative-rotation
+      quaternion (sign-aligned) — student vs teacher pseudo-label, both
+      relative to the student's first frame. Focal term omitted (no
+      intrinsics in the DA3 pair cache; SelfEvo weights it 0.5).
+    depth (x1.0): the three SelfEvo terms against the teacher pseudo-label
+      with point_masks = valid depth AND teacher-conf 5% low-quantile prune:
+        conf = gamma*|d|*conf_s - alpha*log(conf_s)  (aleatoric)
+        reg  = |d|                                    (L2 of a scalar map)
+        grad = 3-scale (2^k subsample) adjacent-pixel L1, conf-weighted
+      conf/reg are quantile-filtered at 0.98 with clamp@100
+      (filter_by_quantile); <100 valid pixels skips the batch (SelfEvo).
+    """
+    d_t = cache["depth4"].squeeze(0)                # [S,H,W] fp32
+    conf_t = cache["conf4"].squeeze(0)              # [S,H,W]
+    ext_t = cache["ext4"]                           # [S,3,4] w2c, teacher gauge
+    d_s = depth_s.squeeze(0).squeeze(-1).float()    # [S,H,W]
+    c_s = conf_s.reshape(d_s.shape).float().clamp(1e-3, 1e3)
+
+    valid = torch.isfinite(d_t) & (d_t > 0)
+    if int(valid.sum()) > 0:
+        q05 = torch.quantile(conf_t[valid].detach(), 0.05)
+        valid = valid & (conf_t >= q05)
+
+    # ---- depth: conf + reg (quantile-filtered) ----
+    r = torch.where(valid, (d_s - d_t).abs(), torch.zeros_like(d_t))
+    n_v = int(valid.sum())
+    if n_v > 100:
+        rv = r[valid].clamp(max=100)
+        q98 = torch.quantile(rv.detach(), 0.98)
+        reg_l = rv[rv < q98].mean()
+        ale = gamma * r * c_s - alpha * torch.log(c_s)
+        av = torch.where(valid, ale, torch.zeros_like(ale))[valid].clamp(max=100)
+        q98b = torch.quantile(av.detach(), 0.98)
+        conf_l = av[av < q98b].mean()
+    else:
+        zero = (0.0 * d_s).sum()
+        reg_l = conf_l = zero
+
+    # ---- depth: multi-scale gradient matching (scales=3) ----
+    diff = torch.where(valid, d_s - d_t, torch.zeros_like(d_t))
+    gl = 0.0
+    for stp in (1, 2, 4):
+        ds_ = diff[:, ::stp, ::stp]
+        ms_ = valid[:, ::stp, ::stp]
+        cs_ = c_s[:, ::stp, ::stp]
+        gx = (ds_[:, :, 1:] - ds_[:, :, :-1]).abs() * (ms_[:, :, 1:] & ms_[:, :, :-1])
+        gy = (ds_[:, 1:, :] - ds_[:, :-1, :]).abs() * (ms_[:, 1:, :] & ms_[:, :-1, :])
+        gxl = (gamma * gx * cs_[:, :, 1:] - alpha * torch.log(cs_[:, :, 1:])).clamp(max=100)
+        gyl = (gamma * gy * cs_[:, 1:, :] - alpha * torch.log(cs_[:, 1:, :])).clamp(max=100)
+        gl = gl + (gxl.sum() + gyl.sum()) / ms_.sum().clamp_min(1) / 2.0
+    grad_l = gl / 3.0
+    depth_loss = conf_l + reg_l + grad_l
+
+    # ---- camera: L1 on gauge-aligned relative pose ----
+    def _rel_parts(ext):
+        R, t = ext[:, :3, :3], ext[:, :3, 3]
+        centers = -(R.transpose(-1, -2) @ t.unsqueeze(-1)).squeeze(-1)  # cam centers
+        R0 = R[0].transpose(0, 1)
+        Rrel = R @ R0.unsqueeze(0)
+        return centers - centers[0:1], _rotmat_to_quat(Rrel)
+
+    c_s_rel, q_s = _rel_parts(ext_s)
+    with torch.no_grad():
+        c_t_rel, q_t = _rel_parts(ext_t)
+    q_t = torch.where((q_t * q_s).sum(-1, keepdim=True) >= 0, q_t, -q_t)
+    loss_T = (c_s_rel - c_t_rel).abs().clamp(max=100).mean()
+    loss_R = (q_s - q_t).abs().mean()
+    camera_loss = cam_w * (loss_T + loss_R)
+
+    total = camera_loss + depth_loss
+    return total, {"cam": float(camera_loss), "T": float(loss_T), "R": float(loss_R),
+                   "conf": float(conf_l), "reg": float(reg_l), "grad": float(grad_l)}
+
+
 def main():
     torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.deterministic = True
@@ -105,6 +197,14 @@ def main():
                          "measure step-0 rel-rot grad per pair at zero-LoRA, "
                          "keep those with g_rot < grot_max (cap 10, min 5 by "
                          "lowest), and set updates = 10 * kept")
+    ap.add_argument("--skip_eval", action="store_true",
+                    help="save the LoRA ckpt and skip the built-in cam_dec eval")
+    ap.add_argument("--train_loss", default="rawrel", choices=["rawrel", "selfevo"],
+                    help="rawrel = raw-token patch distill + rel-pose (campaign); "
+                         "selfevo = SelfEvo-faithful output-space loss "
+                         "(camera L1 x5.0 + depth conf/reg/grad x1.0 from teacher "
+                         "pseudo-labels, 5%% conf pruning, 98%% quantile filter, "
+                         "no input mask)")
     ap.add_argument("--no_mask", action="store_true",
                     help="disable the 50%% block input masking on student views "
                          "(clean input; supervision stays all-position)")
@@ -305,6 +405,26 @@ def main():
                  epoch_order(epoch + 1)[0]
             pi_last = pi  # which train pair this visit/update used (order is shuffled)
             images4 = imgs4[pi].unsqueeze(0).to(device)
+            if args.train_loss == "selfevo":
+                # SelfEvo-faithful: clean input (no block mask), output-space
+                # loss; backward here, unified clip/step after the k-loop.
+                torch.manual_seed(P.stable_seed("cf_rng", args.scene, epoch, pi, 0))
+                _, ext_w2c, depth_s, conf_s = P.student_forward_c2m(
+                    student, images4, with_conf=True)
+                ext_s = ext_w2c[0].float() if torch.is_tensor(ext_w2c) else ext_w2c[0]
+                loss, comp_se = selfevo_losses(
+                    depth_s, conf_s, ext_s,
+                    {"depth4": caches[pi]["depth4"].to(device).float(),
+                     "conf4": caches[pi]["conf4"].to(device).float(),
+                     "ext4": caches[pi]["ext4"].to(device).float()})
+                print(f"[{args.scene}] se-comp pair={pi} "
+                      f"L_cam={comp_se['cam']:.4f} L_dconf={comp_se['conf']:.4f} "
+                      f"L_dreg={comp_se['reg']:.4f} L_dgrad={comp_se['grad']:.4f} "
+                      f"peak={torch.cuda.max_memory_allocated()/2**20:.0f}MiB", flush=True)
+                (loss / args.accum).backward()
+                visit += 1
+                comp = hcomp = rel_comp = None  # skip rawrel diagnostics below
+                continue
             gen = torch.Generator(device=device).manual_seed(
                 P.stable_seed("mask", args.scene, epoch, pi, 0))
             if args.no_mask:
@@ -850,6 +970,12 @@ def main():
 
     ckpt = os.path.join(out, "ckpts", args.scene, "c2m_final_lora.pt")
     student.save_lora_weights(ckpt)
+
+    if args.skip_eval:
+        # scannetpp full-scene eval is outsourced to the probe pipeline; the
+        # in-trainer cam_dec eval would take 20-30 min/scene at N=300-500.
+        print(f"[{args.scene}] ckpt saved, eval skipped (--skip_eval)")
+        return
 
     # standard cam_dec evaluation with the trained adapter
     P.reset_lora_(student); student.load_lora_weights(ckpt)
