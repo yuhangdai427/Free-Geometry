@@ -26,34 +26,87 @@ from train_da3_protocol import make_dataset, get_scene_data, evaluate_scene
 
 
 def _rotmat_to_quat(R):
-    """[S,3,3] rotation -> [S,4] quaternion (w,x,y,z). Simple Shepperon branch
-    on trace; both teacher and student go through the same map, and quat signs
-    are aligned afterwards, so the L1 below is well-defined."""
-    m = R
-    tr = m[:, 0, 0] + m[:, 1, 1] + m[:, 2, 2]
-    w = torch.sqrt((1.0 + tr).clamp_min(1e-6)) / 2.0
-    x = (m[:, 2, 1] - m[:, 1, 2]) / (4.0 * w)
-    y = (m[:, 0, 2] - m[:, 2, 0]) / (4.0 * w)
-    z = (m[:, 1, 0] - m[:, 0, 1]) / (4.0 * w)
-    return torch.stack([w, x, y, z], dim=-1)
+    """[S,3,3] rotation -> [S,4] unit quaternion (w,x,y,z). Robust four-branch
+    extraction (largest of trace/R00/R11/R22), normalized; teacher and student
+    go through the same map and quat signs are aligned by the caller."""
+    S = R.shape[0]
+    q = torch.zeros(S, 4, device=R.device, dtype=R.dtype)
+    tr = R[:, 0, 0] + R[:, 1, 1] + R[:, 2, 2]
+    for i in range(S):
+        m = R[i]
+        if tr[i] > 0:
+            s = torch.sqrt((1.0 + tr[i]).clamp_min(1e-12)) * 2.0
+            w = 0.25 * s
+            x = (m[2, 1] - m[1, 2]) / s
+            y = (m[0, 2] - m[2, 0]) / s
+            z = (m[1, 0] - m[0, 1]) / s
+        elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+            s = torch.sqrt((1.0 + m[0, 0] - m[1, 1] - m[2, 2]).clamp_min(1e-12)) * 2.0
+            w = (m[2, 1] - m[1, 2]) / s
+            x = 0.25 * s
+            y = (m[0, 1] + m[1, 0]) / s
+            z = (m[0, 2] + m[2, 0]) / s
+        elif m[1, 1] > m[2, 2]:
+            s = torch.sqrt((1.0 + m[1, 1] - m[0, 0] - m[2, 2]).clamp_min(1e-12)) * 2.0
+            w = (m[0, 2] - m[2, 0]) / s
+            x = (m[0, 1] + m[1, 0]) / s
+            y = 0.25 * s
+            z = (m[1, 2] + m[2, 1]) / s
+        else:
+            s = torch.sqrt((1.0 + m[2, 2] - m[0, 0] - m[1, 1]).clamp_min(1e-12)) * 2.0
+            w = (m[1, 0] - m[0, 1]) / s
+            x = (m[0, 2] + m[2, 0]) / s
+            y = (m[1, 2] + m[2, 1]) / s
+            z = 0.25 * s
+        q[i] = torch.stack([w, x, y, z])
+    return q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def _filter_by_quantile(loss_tensor, valid_range=0.98, min_elements=1000, hard_max=100):
+    """Line-by-line port of SelfEvo training/loss.py:filter_by_quantile
+    (kthvalue 'nearest' interpolation)."""
+    if loss_tensor.numel() <= min_elements:
+        return loss_tensor
+    thresh = torch.kthvalue(loss_tensor.detach().reshape(-1),
+                            int(round(valid_range * (loss_tensor.numel() - 1))) + 1)[0]
+    thresh = min(float(thresh), hard_max)
+    mask = loss_tensor < thresh
+    if int(mask.sum()) > min_elements:
+        return loss_tensor[mask]
+    return loss_tensor
 
 
 def selfevo_losses(depth_s, conf_s, ext_s, cache, cam_w=5.0, gamma=1.0, alpha=0.2):
-    """SelfEvo-faithful output-space loss (port of Self-Evo/SelfEvo
-    training/loss.py + trainer._geom_pack) for the DA3 teacher-student setup.
+    """SelfEvo-style output loss UNDER OUR FROZEN-TEACHER PROTOCOL.
 
-    camera (x cam_w): L1 on the gauge-aligned relative pose — camera-centre
-      difference (clamp@100, as SelfEvo's loss_T) and relative-rotation
-      quaternion (sign-aligned) — student vs teacher pseudo-label, both
-      relative to the student's first frame. Focal term omitted (no
-      intrinsics in the DA3 pair cache; SelfEvo weights it 0.5).
-    depth (x1.0): the three SelfEvo terms against the teacher pseudo-label
-      with point_masks = valid depth AND teacher-conf 5% low-quantile prune:
-        conf = gamma*|d|*conf_s - alpha*log(conf_s)  (aleatoric)
-        reg  = |d|                                    (L2 of a scalar map)
-        grad = 3-scale (2^k subsample) adjacent-pixel L1, conf-weighted
-      conf/reg are quantile-filtered at 0.98 with clamp@100
-      (filter_by_quantile); <100 valid pixels skips the batch (SelfEvo).
+    This is NOT a faithful SelfEvo reproduction. Deliberate protocol gaps
+    (kept because this run is a loss-ablation inside the Free Geometry
+    protocol): (1) teacher is a frozen one-shot cache, not the official EMA
+    teacher (decay=0.995, per-step update); (2) pairs come from a static
+    manifest, not SelfEvo's per-batch online resampling; (3) context is our
+    16-frame teacher with endpoint-anchored students L in {2..6} (official:
+    24-64 frame temporal clips -> 2-12, first frame guaranteed, last NOT);
+    (4) LoRA-only student (official release freezes only the camera head and
+    trains the rest); (5) our wd=1e-5 / warmup 15% (official 0.05 / ~5%);
+    (6) the per-camera focal term is omitted (no teacher intrinsics cached;
+    official weight 0.5).
+
+    What IS ported from SelfEvo training/loss.py + trainer._geom_pack:
+      camera (x cam_w): L1 on the FULLY gauge-aligned relative SE(3) —
+        t_i0 = t_i - R_i R_0^T t_0 (first-camera relative translation, in
+        per-branch scale-normalized units: scale = mean ||camera_center - c_0||)
+        and relative-rotation quaternion L1 (sign-aligned). SelfEvo uses
+        first-camera + scene-scale normalization on the pseudo target
+        (scale_by_points over 3D points); we normalize BOTH branches by their
+        own camera-centre scale (no intrinsics in the pair cache).
+      depth (x1.0): conf (aleatoric gamma*|d|*conf_s - alpha*log conf_s) +
+        reg (plain |d|), each passed through filter_by_quantile (min_elements
+        1000, clamp@100 inside), + grad = plain adjacent-pixel L1 gradient
+        matching at 4 scales (1,2,4,8) — NOT conf-weighted (official default
+        gradient_loss_fn="grad" feeds no conf), no quantile filter.
+        Both depths are scale-normalized by their branch's camera-centre
+        scale before comparison. Teacher mask = valid depth AND 5%
+        low-teacher-conf prune (trainer._geom_pack).
     """
     d_t = cache["depth4"].squeeze(0)                # [S,H,W] fp32
     conf_t = cache["conf4"].squeeze(0)              # [S,H,W]
@@ -61,54 +114,60 @@ def selfevo_losses(depth_s, conf_s, ext_s, cache, cam_w=5.0, gamma=1.0, alpha=0.
     d_s = depth_s.squeeze(0).squeeze(-1).float()    # [S,H,W]
     c_s = conf_s.reshape(d_s.shape).float().clamp(1e-3, 1e3)
 
-    valid = torch.isfinite(d_t) & (d_t > 0)
+    def _branch_norm(ext, d):
+        """first-camera relative SE(3) + per-branch scale (mean camera-centre
+        distance to camera 0); depth divided by the same scale."""
+        R, t = ext[:, :3, :3], ext[:, :3, 3]
+        centers = -(R.transpose(-1, -2) @ t.unsqueeze(-1)).squeeze(-1)
+        rel_c = centers - centers[0:1]
+        s = rel_c[1:].norm(dim=-1).mean() if rel_c.shape[0] > 1 else rel_c.norm()
+        s = s.clamp_min(1e-6)
+        R0T = R[0].transpose(0, 1)
+        Rrel = R @ R0T.unsqueeze(0)
+        trel = t - (Rrel @ t[0].unsqueeze(-1)).squeeze(-1)
+        return trel / s, Rrel, (d / s), float(s)
+
+    t_s_n, R_s, d_s_n, _ = _branch_norm(ext_s, d_s)
+    with torch.no_grad():
+        t_t_n, R_t, d_t_n, _ = _branch_norm(ext_t, d_t)
+    d_t_n = d_t_n.detach()
+
+    # ---- depth mask: valid + 5% low teacher-conf prune ----
+    valid = torch.isfinite(d_t_n) & (d_t_n > 0)
     if int(valid.sum()) > 0:
-        q05 = torch.quantile(conf_t[valid].detach(), 0.05)
+        q05 = torch.kthvalue(conf_t[valid].detach().reshape(-1),
+                             max(1, int(0.05 * int(valid.sum()))))[0]
         valid = valid & (conf_t >= q05)
 
-    # ---- depth: conf + reg (quantile-filtered) ----
-    r = torch.where(valid, (d_s - d_t).abs(), torch.zeros_like(d_t))
-    n_v = int(valid.sum())
-    if n_v > 100:
-        rv = r[valid].clamp(max=100)
-        q98 = torch.quantile(rv.detach(), 0.98)
-        reg_l = rv[rv < q98].mean()
+    # ---- depth: conf + reg, quantile-filtered per filter_by_quantile ----
+    r = torch.where(valid, (d_s_n - d_t_n).abs(), torch.zeros_like(d_t_n))
+    zero = (0.0 * d_s).sum()
+    if int(valid.sum()) > 100:  # SelfEvo skips the batch under 100 valid px
+        reg_l = _filter_by_quantile(r[valid]).mean()
         ale = gamma * r * c_s - alpha * torch.log(c_s)
-        av = torch.where(valid, ale, torch.zeros_like(ale))[valid].clamp(max=100)
-        q98b = torch.quantile(av.detach(), 0.98)
-        conf_l = av[av < q98b].mean()
+        av = torch.where(valid, ale, torch.zeros_like(ale))[valid]
+        conf_l = _filter_by_quantile(av).mean()
     else:
-        zero = (0.0 * d_s).sum()
         reg_l = conf_l = zero
 
-    # ---- depth: multi-scale gradient matching (scales=3) ----
-    diff = torch.where(valid, d_s - d_t, torch.zeros_like(d_t))
+    # ---- depth: 4-scale plain gradient matching (official "grad", no conf) ----
+    diff = torch.where(valid, d_s_n - d_t_n, torch.zeros_like(d_t_n))
     gl = 0.0
-    for stp in (1, 2, 4):
+    for stp in (1, 2, 4, 8):
         ds_ = diff[:, ::stp, ::stp]
         ms_ = valid[:, ::stp, ::stp]
-        cs_ = c_s[:, ::stp, ::stp]
         gx = (ds_[:, :, 1:] - ds_[:, :, :-1]).abs() * (ms_[:, :, 1:] & ms_[:, :, :-1])
         gy = (ds_[:, 1:, :] - ds_[:, :-1, :]).abs() * (ms_[:, 1:, :] & ms_[:, :-1, :])
-        gxl = (gamma * gx * cs_[:, :, 1:] - alpha * torch.log(cs_[:, :, 1:])).clamp(max=100)
-        gyl = (gamma * gy * cs_[:, 1:, :] - alpha * torch.log(cs_[:, 1:, :])).clamp(max=100)
-        gl = gl + (gxl.sum() + gyl.sum()) / ms_.sum().clamp_min(1) / 2.0
-    grad_l = gl / 3.0
+        gl = gl + (gx.sum() + gy.sum()) / ms_.sum().clamp_min(1)
+    grad_l = gl / 4.0
     depth_loss = conf_l + reg_l + grad_l
 
-    # ---- camera: L1 on gauge-aligned relative pose ----
-    def _rel_parts(ext):
-        R, t = ext[:, :3, :3], ext[:, :3, 3]
-        centers = -(R.transpose(-1, -2) @ t.unsqueeze(-1)).squeeze(-1)  # cam centers
-        R0 = R[0].transpose(0, 1)
-        Rrel = R @ R0.unsqueeze(0)
-        return centers - centers[0:1], _rotmat_to_quat(Rrel)
-
-    c_s_rel, q_s = _rel_parts(ext_s)
+    # ---- camera: L1 on gauge+scale-normalized relative pose ----
+    q_s = _rotmat_to_quat(R_s)
     with torch.no_grad():
-        c_t_rel, q_t = _rel_parts(ext_t)
+        q_t = _rotmat_to_quat(R_t)
     q_t = torch.where((q_t * q_s).sum(-1, keepdim=True) >= 0, q_t, -q_t)
-    loss_T = (c_s_rel - c_t_rel).abs().clamp(max=100).mean()
+    loss_T = (t_s_n - t_t_n).abs().clamp(max=100).mean()
     loss_R = (q_s - q_t).abs().mean()
     camera_loss = cam_w * (loss_T + loss_R)
 
@@ -142,7 +201,7 @@ def main():
                          "mathematically IDENTICAL to joint (channel-mean of the concat "
                          "= average of per-half means); local/global=only that half; "
                          "g2=(L_l + 2*L_g)/3 — explicit 2x relative weight on the "
-                         "global half's residual (gradient share ~21%->~35%); "
+                         "global half's residual (gradient share ~21%% to ~35%%); "
                          "half_resplit=the earlier WRONG variant (re-LN per half)")
     ap.add_argument("--teacher_N", type=int, default=0,
                     help="0 = N-dispatch auto (N>=64 -> 16:4 else 8:4); explicit "
@@ -201,23 +260,19 @@ def main():
                     help="save the LoRA ckpt and skip the built-in cam_dec eval")
     ap.add_argument("--train_loss", default="rawrel", choices=["rawrel", "selfevo"],
                     help="rawrel = raw-token patch distill + rel-pose (campaign); "
-                         "selfevo = SelfEvo-faithful output-space loss "
-                         "(camera L1 x5.0 + depth conf/reg/grad x1.0 from teacher "
-                         "pseudo-labels, 5%% conf pruning, 98%% quantile filter, "
-                         "no input mask)")
+                         "selfevo = SelfEvo-style output loss under our "
+                         "frozen-teacher protocol (camera L1 x5.0 + depth "
+                         "conf/reg/grad x1.0 from teacher pseudo-labels, "
+                         "5%% conf pruning, 98%% quantile filter, no input mask)")
     ap.add_argument("--no_mask", action="store_true",
-                    help="disable the 50%% block input masking on student views "
-                         "(clean input; supervision stays all-position)")
+                    help="student sees CLEAN input (no block masking); with "
+                         "--train_loss selfevo this is implied")
     ap.add_argument("--grot_max", type=float, default=10.0,
                     help="screening upper bound: drop pairs with step-0 "
                          "g_rot above this (spikes)")
     ap.add_argument("--grot_min", type=float, default=0.02,
                     help="screening lower bound: drop pairs with step-0 "
                          "g_rot below this (no rel signal to teach)")
-    ap.add_argument("--no_mask", action="store_true",
-                    help="student sees CLEAN input (no block masking). The "
-                         "teacher still sees clean images; the loss becomes "
-                         "plain KD on identical inputs.")
     ap.add_argument("--n_shared", type=int, default=4,
                     help="student frame count per pair (4=16:4, 8=16:8)")
     ap.add_argument("--clip", type=float, default=None,
