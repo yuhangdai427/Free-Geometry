@@ -291,8 +291,14 @@ def load_pair_images(scene_data, teacher_frames: List[int], device="cuda"):
 
 def load_probe_gt(scene_data, student_frames: List[int], out_hw: Tuple[int, int]) -> np.ndarray:
     """[4,H,W] GT depth (NaN=invalid) for the shared/student views."""
+    gtf = scene_data.aux.gt_depth_files
+    # DTU/dtu64 carry no GT depth files (pose+recon protocol): all-invalid GT,
+    # e_depth() handles the empty omega by returning (nan, 0).
+    if not (gtf and isinstance(gtf, (list, tuple)) and isinstance(gtf[0], str)):
+        return np.full((len(student_frames), out_hw[0], out_hw[1]),
+                       np.nan, dtype=np.float32)
     return np.stack([
-        load_gt_depth(scene_data.aux.gt_depth_files[i], out_hw) for i in student_frames
+        load_gt_depth(gtf[i], out_hw) for i in student_frames
     ], axis=0)
 
 

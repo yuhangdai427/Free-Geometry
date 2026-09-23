@@ -105,6 +105,9 @@ def main():
                          "measure step-0 rel-rot grad per pair at zero-LoRA, "
                          "keep those with g_rot < grot_max (cap 10, min 5 by "
                          "lowest), and set updates = 10 * kept")
+    ap.add_argument("--no_mask", action="store_true",
+                    help="disable the 50%% block input masking on student views "
+                         "(clean input; supervision stays all-position)")
     ap.add_argument("--grot_max", type=float, default=10.0,
                     help="screening upper bound: drop pairs with step-0 "
                          "g_rot above this (spikes)")
@@ -224,7 +227,10 @@ def main():
             images4 = imgs4[i].unsqueeze(0).to(device)
             gen = torch.Generator(device=device).manual_seed(
                 P.stable_seed("mask", args.scene, 0, i, 0))
-            images4_in, _pm = P.mask_image_blocks(images4, 0.5, _phw, gen)
+            if args.no_mask:
+                images4_in = images4
+            else:
+                images4_in, _pm = P.mask_image_blocks(images4, 0.5, _phw, gen)
             _, ext_w2c, _ = P.student_forward_c2m(student, images4_in)
             ext_s = ext_w2c[0].float()
             ext_t = caches[i]["ext4"].to(device)
@@ -850,12 +856,17 @@ def main():
     student.to(device).eval()
     ev = evaluate_scene(student, sd, proto["eval_frames"], scene=args.scene,
                         dataset_obj=ds_obj, export_dir=os.path.join(out, "recon", args.scene))
+    with open(os.path.join(out, "eval.json"), "w") as f:
+        _json.dump(ev, f, indent=1)
     print(f"[{args.scene}] {args.loss_form}/{args.half_mode}"
           + ("/enc" if args.space == "enc" else "")
           + ("/noclip" if args.clip == 0 else "")
           + f" u{args.updates}k{args.accum} (cam_dec): "
-          f"AUC={ev['auc03']:.4f} F1={ev['recon_fscore']:.4f} "
-          f"abs_rel={ev.get('abs_rel', float('nan')):.4f}")
+          f"AUC={ev['auc03']:.4f} F1={ev.get('recon_fscore', float('nan')):.4f} "
+          f"abs_rel={ev.get('abs_rel', float('nan')):.4f} "
+          f"chamfer_acc={ev.get('recon_acc', float('nan')):.4f} "
+          f"chamfer_comp={ev.get('recon_comp', float('nan')):.4f} "
+          f"chamfer_overall={ev.get('recon_overall', float('nan')):.4f}")
 
 
 if __name__ == "__main__":

@@ -86,6 +86,7 @@ _loss_couple_orig = _apl.loss_couple
 # ones in the training loop, so mask_ratio reports 1.0 and every other pmask
 # consumer is affected).
 _V2_ALLPOS = False
+_FEAT_W = 1.0  # feature-distill weight for C2M_rawrel (1.0 = campaign default)
 _V2_QFEAT_OFF = False
 
 # Protocol v2 A/B (--v2_ab): dual teacher context (A/B) with FROZEN reliability
@@ -2378,12 +2379,17 @@ def compute_loss(arm, a1, base, teacher_cache, feats24_s, preds, patch_hw, step=
         return feat + rel, {**rel_extra}
     if arm == "C2M_rawrel":
         # raw-space patch distill (no LN, no conf; identical form to the DA3
-        # --half_mode vggt port) + the SAME deployed rel-pose term
+        # --half_mode vggt port) + the SAME deployed rel-pose term.
+        # DTU gradient analysis (2026-09-22): scenes whose probe disagreement
+        # is below the v2 gate threshold carry no rel signal (g_rot ~2e-4 vs
+        # ~2e-3 on informative scenes) and the ungated rel term is pure drift;
+        # apply the same pose_gate the v2 arms already use.
         feat, extra = loss_b_patchform(base.depth_head, teacher_cache, feats24_s,
                                        patch_hw, space="raw", cam_token=False)
         pt = teacher_cache["pose_enc8"][:, STUDENT_INDICES].float()
         rel, rel_extra = loss_pose_rel(preds["pose_enc"], pt)
-        return feat + rel, {**extra, **rel_extra}
+        g = float(teacher_cache.get("pose_gate", 1.0))
+        return _FEAT_W * feat + g * rel, {**extra, **rel_extra, "pose_gate": g}
     if arm == "C2M_ABS":
         feat, extra = loss_b5_maskdistill(base.depth_head, teacher_cache, feats24_s, patch_hw, patch_mask)
         abs_l, abs_extra = loss_abs_pose_norm(preds["pose_enc"], teacher_cache)
@@ -2922,6 +2928,15 @@ def main():
                     help="ablation: keep the 50%% masked student input but compute the "
                          "distill loss on ALL patch positions (default: MGD-style, "
                          "masked positions only)")
+    ap.add_argument("--no_pose_gate", action="store_true",
+                    help="disable the probe-disagreement pose_gate for rel terms "
+                         "(restores the pre-fix overnight campaign behavior)")
+    ap.add_argument("--no_mask", action="store_true",
+                    help="disable the 50%% block input masking on student views "
+                         "(clean input; --loss_all_pos supervision unchanged)")
+    ap.add_argument("--feat_weight", type=float, default=1.0,
+                    help="scale the raw-patch feature-distill term of C2M_rawrel "
+                         "(0.0 = rel-only; 1.0 = campaign default)")
     ap.add_argument("--mask_mode", default="image", choices=["image", "token"],
                     help="image = mask input pixels (default); token = clean input, "
                          "zero 50%% of patch tokens at aggregator.patch_embed output "
@@ -3027,12 +3042,13 @@ def main():
     if args.ema_teacher and args.teacher_consensus:
         raise ValueError("--ema_teacher and --teacher_consensus are mutually exclusive "
                          "(EMA refresh rebuilds single-context caches)")
-    global _V2_COUPLE_FIX, _V2_ALLPOS, _V2_AB, _V2_GEO_W, _V2_QFEAT_OFF
+    global _V2_COUPLE_FIX, _V2_ALLPOS, _V2_AB, _V2_GEO_W, _V2_QFEAT_OFF, _FEAT_W
     _V2_COUPLE_FIX = bool(args.v2_couple_fix)
     _V2_ALLPOS = bool(args.v2_allpos)
     _V2_QFEAT_OFF = bool(args.v2_qfeat_off)
     _V2_AB = bool(args.v2_ab)
     _V2_GEO_W = None
+    _FEAT_W = float(args.feat_weight)
     if args.v2_grad_cap and args.v2_rel_weight <= 0:
         raise ValueError("--v2_grad_cap requires --v2_rel_weight > 0")
     if args.v2_grad_cap and args.sam_rho > 0:
@@ -3281,7 +3297,8 @@ def main():
                 print(f"[{scene}] rel TAU-GATED off (tau={scene_tau:.3f} > "
                       f"{args.v2_rel_tau_gate})", flush=True)
             scene_rot_w = scene_tdir_w = 0.0
-        if any("pose_disagree_deg" in c for c in probe_caches):
+        if any("pose_disagree_deg" in c for c in probe_caches) \
+                and not getattr(args, "no_pose_gate", False):
             dg = float(np.median([c["pose_disagree_deg"] for c in probe_caches
                                   if "pose_disagree_deg" in c]))
             pg = 0.0 if dg < 3.0 else 1.0
@@ -3426,7 +3443,9 @@ def main():
                     torch.manual_seed(stable_seed("cf_rng", scene, epoch, pi, args.seed))
                     pmask = None
                     images4_in = images4
-                    if arm in ("B5_maskdistill", "C2M_maskrel", "C2M_rawrel", "C2M_chcwd", "C2M_chcwd_ln", "MD25", "MD75", "CONFD",
+                    if getattr(args, "no_mask", False):
+                        pass  # no input masking: clean student views, pmask stays None
+                    elif arm in ("B5_maskdistill", "C2M_maskrel", "C2M_rawrel", "C2M_chcwd", "C2M_chcwd_ln", "MD25", "MD75", "CONFD",
                                "C2M_CamRel", "CONFD_REL", "B5_CTK", "C2M_CTK", "C2M_REL10", "C2M_REL2", "C2M_TRIP", "C2M_TRIF", "C2M_TRIF2", "C2M_TRIF3", "C2M_HARD", "C2M_SCL", "C2M_CYC", "C2M_CONFP", "C2M_GATE", "C2M_ABS", "C2M_ABS_REL", "C2M_ABSR", "C2M_ABSW1", "C2M_ABSR5", "C2M_RELAT", "C2M_RABS1", "C2M_RABS5", "C2M_RABS3", "C2M_XSH", "C2M_XSHA", "C2M_XAC", "C2M_XAC2", "C2M_XSH1", "C2M_XSHS", "C2M_XSH1S", "C2M_NREL", "C2M_RKD15", "C2M_RKDC", "C2M_RKDS", "C2M_XEXT", "C2M_RKDC1", "C2M_RKDC1R", "C2M_RKDC1A", "C2M_RKDC1H", "C2M_RKDCR1H", "C2M_RKDC1HC", "C2M_ADAPTIVE", "C2M_maskrel_CTK", "C2M_RKDC2", "C2M_RKDC3", "C2M_RELC", "C2M_RKLH", "C2M_RELCH", "C2M_RKCX", "C2M_RKDCX", "C2M_RKDT16", "C2M_RKDCX3", "C2M_XAP", "C2M_RKDCL", "C2M_TGM"):
                         ratio = {"B5_maskdistill": 0.5, "C2M_maskrel": 0.5, "C2M_rawrel": 0.5, "CONFD": 0.5,
                                  "C2M_CamRel": 0.5, "CONFD_REL": 0.5, "B5_CTK": 0.5,

@@ -101,6 +101,17 @@ def main():
                           [files[i] for i in frames], frames,
                           conf=(conf if conf is not None else None),
                           dataset=args.dataset)
+            # DTU fuse3d/eval3d read mask_files from gt_meta (same as the DA3
+            # evaluate_scene recipe); save_eval_npz doesn't write them.
+            aux = scene_data.aux
+            if getattr(aux, "get", None) and aux.get("mask_files") is not None:
+                meta_path = os.path.join(args.run_root, "eval32", exp, "model_results",
+                                         args.dataset, scene, "unposed", "exports",
+                                         "gt_meta.npz")
+                _m = dict(np.load(meta_path, allow_pickle=True))
+                _m["mask_files"] = np.array([aux["mask_files"][i] for i in frames],
+                                            dtype=object)
+                np.savez_compressed(meta_path, **_m)
             result_path = os.path.join(args.run_root, "eval32", exp, "model_results",
                                       args.dataset, scene, "unposed", "exports",
                                       "mini_npz", "results.npz")
@@ -113,7 +124,9 @@ def main():
                 out.update({f"recon_{k}": v for k, v in recon.items()
                             if isinstance(v, (int, float))})
             except Exception as e:
-                out["recon_error"] = str(e)
+                import traceback
+                out["recon_error"] = str(e) + " || " + "|".join(
+                    traceback.format_exc().strip().splitlines()[-3:])
             print(f"[{scene}] {exp}: AUC@3={out['auc03']:.4f} "
                   f"F1={out.get('recon_fscore', float('nan')):.4f} "
                   f"abs_rel={out.get('abs_rel', float('nan')):.4f}", flush=True)
