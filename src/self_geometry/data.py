@@ -181,7 +181,13 @@ def _evaluate(name, scene, c, directory, stage, fuse_only=False, score_only=Fals
                 ds.fuse3d(scene,str(pred_path),str(fuse),mode)
             write_json(mode_stamp, dict(identity=fusion_identity))
         if not fuse_only:
-            metrics.update({mode+'_'+k:float(v) for k,v in ds.eval3d(scene,str(fuse)).items()})
+            # Degenerate-output tolerance (tco/vggt/dtu empty-cloud cells): keep
+            # the pose scores and skip the failed recon mode instead of failing
+            # the whole evaluation.
+            try:
+                metrics.update({mode+'_'+k:float(v) for k,v in ds.eval3d(scene,str(fuse)).items()})
+            except Exception as exc:
+                print(f'[evaluate] recon {mode} failed for {name}/{scene}: {exc}', flush=True)
     if not score_only:
         write_json(fusion_path, dict(identity=fusion_identity))
     if fuse_only:

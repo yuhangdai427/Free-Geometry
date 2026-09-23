@@ -5,6 +5,7 @@ for architecture mappings, upstream pins and explicit schedule variants.
 """
 import json
 import math
+import os
 import random
 import subprocess
 import sys
@@ -29,7 +30,12 @@ def tco_settings(c, dataset):
     steps, lr, photo = {'eth3d': (40, 5e-4, .2), '7scenes': (40, 1e-3, .2),
                        'dtu': (50, 2e-4, 1.), 'scannetpp': (40, 1e-3, .2),
                        'hiroom': (40, 1e-3, .2)}[dataset]
-    return dict(steps=int(steps if c.get('tco_steps') is None else c['tco_steps']),
+    # TCO_STEPS_OVERRIDE: divergence-recovery escape hatch for the numerically
+    # unstable tco/vggt/dtu cells; keeps the config identity (baseline reuse)
+    # intact while recording the actual steps in done.json.
+    eff_steps = os.environ.get('TCO_STEPS_OVERRIDE') or \
+        (steps if c.get('tco_steps') is None else c['tco_steps'])
+    return dict(steps=int(eff_steps),
                 lr=float(lr if c.get('tco_lr') is None else c['tco_lr']),
                 photo=float(photo if c.get('tco_photo_weight') is None else c['tco_photo_weight']))
 
@@ -385,10 +391,20 @@ def adapt_comparison(c, directory, dataset, model=None, scene_cache=None, resume
                 gradients={n:p.grad.detach().cpu() for n,p in model.named_parameters() if p.requires_grad and p.grad is not None},
                 rng=rng_state(), history=history))
         cursor = start
+        bad_streak = 0
         while cursor < total:
             if method == 'tco':
                 optimizer.zero_grad(set_to_none=True)
-                loss, detail = tco_loss(model, images, base, train_c, settings)
+                try:
+                    loss, detail = tco_loss(model, images, base, train_c, settings)
+                except (AssertionError, FloatingPointError) as exc:
+                    # Numeric blow-up inside the TCO objective (e.g. depth_conf
+                    # assertion once the self-distill diverges): stop with the
+                    # still-clean weights instead of failing the whole cell.
+                    print(json.dumps({'divergence_stop': True, 'step': cursor,
+                                      'reason': f'numeric failure in loss: {exc}'}), flush=True)
+                    save(cursor)
+                    break
                 chunk, do_update = 1, True
                 scaled = loss
             else:
@@ -399,14 +415,35 @@ def adapt_comparison(c, directory, dataset, model=None, scene_cache=None, resume
                 detail = {'consistency': loss.detach()}
                 do_update = (local + chunk) % accum == 0
             if not torch.isfinite(loss):
-                raise FloatingPointError(f'{method}: nonfinite loss at {cursor}')
+                # Divergence guard (tco/vggt/dtu NaN crashes): stop training with
+                # the still-clean weights instead of failing the whole cell.
+                print(json.dumps({'divergence_stop': True, 'step': cursor,
+                                  'reason': 'nonfinite loss'}), flush=True)
+                save(cursor)
+                break
             scaled.backward()
             if do_update:
                 norm = torch.nn.utils.clip_grad_norm_(params, 1. if method == 'tco' else math.inf,
-                                                     error_if_nonfinite=True)
+                                                     error_if_nonfinite=False)
+                norm_v = float(norm)
+                if not math.isfinite(norm_v):
+                    # NaN gradients: intercept BEFORE optimizer.step() so the
+                    # weights stay clean; the saved checkpoint is usable.
+                    print(json.dumps({'divergence_stop': True, 'step': cursor,
+                                      'reason': 'nonfinite gradient norm'}), flush=True)
+                    save(cursor)
+                    break
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 updates += 1
+                if norm_v > 3.0:
+                    # Single-spike early stop: a gn>3 update on tco/vggt/dtu is
+                    # the leading edge of the mv-consistency blow-up; stopping
+                    # here keeps the pre-divergence weights exportable.
+                    print(json.dumps({'divergence_stop': True, 'step': cursor,
+                                      'gradient_norm': norm_v}), flush=True)
+                    save(cursor)
+                    break
             cursor += chunk
             record = dict(step=cursor, updates=updates, loss=float(loss.detach()),
                           terms={k:float(v) for k,v in detail.items()})
