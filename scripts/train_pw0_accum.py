@@ -42,7 +42,7 @@ def main():
                              "cosw1", "cos_split", "cos_only", "mse_only", "half_resplit",
                              "cwd", "vggt_cwd", "vggt_cwd_ln",
                              "vggt_all3", "vggt_all3_ln",
-                             "cwd_camtok", "cwd_camtok_ln",
+                             "cwd_camtok", "cwd_camtok_ln", "chcwd", "chcwd_ln",
                              "vggt", "vggt_mse"],
                     help="which part of the DEPLOYED joint-LN(3072) normalized tensor "
                          "enters the loss: joint=whole 3072 (deployed); split50=huber "
@@ -111,13 +111,19 @@ def main():
     ap.add_argument("--grot_min", type=float, default=0.02,
                     help="screening lower bound: drop pairs with step-0 "
                          "g_rot below this (no rel signal to teach)")
+    ap.add_argument("--no_mask", action="store_true",
+                    help="student sees CLEAN input (no block masking). The "
+                         "teacher still sees clean images; the loss becomes "
+                         "plain KD on identical inputs.")
+    ap.add_argument("--n_shared", type=int, default=4,
+                    help="student frame count per pair (4=16:4, 8=16:8)")
     ap.add_argument("--clip", type=float, default=None,
                     help="None = deployed P.CLIP (1.0); 0 = NO clipping; "
                          ">0 = explicit value")
     ap.add_argument("--lr", type=float, default=P.LR)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
-    if args.half_mode in ("vggt", "vggt_mse", "vggt_cwd", "vggt_all3", "cwd_camtok", "cwd"):
+    if args.half_mode in ("vggt", "vggt_mse", "vggt_cwd", "vggt_all3", "cwd_camtok", "cwd", "chcwd"):
         args.space = "enc"  # raw-token space (LN variants use default "head")
         print(f"[mode] {args.half_mode}: forcing --space enc (raw encoder tokens)")
     out = args.out or f"workspace/accum_{args.scene}_u{args.updates}k{args.accum}"
@@ -134,6 +140,16 @@ def main():
         sc = man["scenes"][args.scene]
         train_pairs = sc["train_pairs"]
         proto = {"eval_frames": sc["eval32_frames"], "teacher_N": "manifest"}
+        if args.n_train > len(train_pairs):
+            # 100-pair mode: generate on-the-fly with the SAME seed (first
+            # 10 pairs identical to manifest, rest are new unique draws)
+            proto2 = P.build_scene_protocol(
+                files, args.scene, dataset=args.dataset,
+                n_train=args.n_train, n_shared=args.n_shared,
+                teacher_N=(args.teacher_N if args.teacher_N > 0 else None))
+            train_pairs = proto2["train_pairs"]
+            print(f"[{args.scene}] 100-PAIR MODE: {len(train_pairs)} pairs "
+                  f"(first {len(sc['train_pairs'])} = manifest)")
         if args.keep_pairs:
             keep = [int(x) for x in args.keep_pairs.split(",")]
             train_pairs = [train_pairs[i] for i in keep]
@@ -155,7 +171,7 @@ def main():
               f"eval_frames={len(sc['eval32_frames'])}")
     else:
         proto = P.build_scene_protocol(files, args.scene, dataset=args.dataset,
-                                       n_train=args.n_train, n_shared=4,
+                                       n_train=args.n_train, n_shared=args.n_shared,
                                        teacher_N=(args.teacher_N if args.teacher_N > 0 else None))
         train_pairs = proto["train_pairs"]
         print(f"[{args.scene}] N={len(files)} tN={proto['teacher_N']} "
@@ -285,10 +301,15 @@ def main():
             images4 = imgs4[pi].unsqueeze(0).to(device)
             gen = torch.Generator(device=device).manual_seed(
                 P.stable_seed("mask", args.scene, epoch, pi, 0))
-            images4_in, pmask = P.mask_image_blocks(images4, 0.5, patch_hw, gen)
+            if args.no_mask:
+                images4_in = images4  # clean input, no masking
+                pmask = torch.ones(1, images4.shape[1], patch_hw[0]*patch_hw[1],
+                                   device=device)
+            else:
+                images4_in, pmask = P.mask_image_blocks(images4, 0.5, patch_hw, gen)
             ones = torch.ones_like(pmask)  # allpos: supervise every position
             torch.manual_seed(P.stable_seed("cf_rng", args.scene, epoch, pi, 0))
-            if args.camtok or args.camrel or args.half_mode == "cwd_camtok":
+            if args.camtok or args.camrel or args.half_mode in ("cwd_camtok", "cwd_camtok_ln"):
                 tap_feats_s, ext_w2c_cm, _, tap_cam = P.student_forward_c2m(
                     student, images4_in, with_cam=True)
                 ext_s = ext_w2c_cm[0].float() if torch.is_tensor(ext_w2c_cm) else ext_w2c_cm[0]
@@ -378,6 +399,27 @@ def main():
                             ct.detach() / tau, dim=0)
                         return (log_pct.exp() * (log_pct - log_pcs)).sum(dim=0)
 
+                    def _chcwd_patch(hs_t, ht_t, tau):
+                        """CHANNEL CWD (the original 'bugged' form, now explicit):
+                        per patch, softmax over CHANNELS. Compares the channel
+                        distribution within each patch between teacher/student.
+                        Different from spatial CWD (_cwd_patch) which compares
+                        spatial (patch) distribution per channel."""
+                        log_ps = torch.nn.functional.log_softmax(
+                            hs_t / tau, dim=-1)
+                        log_pt = torch.nn.functional.log_softmax(
+                            ht_t.detach() / tau, dim=-1)
+                        return (log_pt.exp() * (log_pt - log_ps)).sum(dim=-1)
+
+                    if args.half_mode in ("chcwd", "chcwd_ln"):
+                        # Channel CWD + 2cos (the original 'bug' form, now as
+                        # an explicit variant with proper log_softmax)
+                        cosv = (torch.nn.functional.normalize(hs, dim=-1)
+                                * torch.nn.functional.normalize(ht, dim=-1)).sum(dim=-1).mean()
+                        kl = _chcwd_patch(hs, ht, args.cwd_tau)
+                        acc_d = acc_d + (args.cwd_tau ** 2) * kl.mean()
+                        acc_c = acc_c + 2.0 * (1.0 - cosv)
+                        continue
                     if args.half_mode in ("vggt_cwd", "vggt_cwd_ln"):
                         # CWD + 2cos on patch tokens (raw or LN by --space)
                         cosv = (torch.nn.functional.normalize(hs, dim=-1)

@@ -2342,6 +2342,40 @@ def compute_loss(arm, a1, base, teacher_cache, feats24_s, preds, patch_hw, step=
         pt = teacher_cache["pose_enc8"][:, STUDENT_INDICES].float()
         rel, rel_extra = loss_pose_rel(preds["pose_enc"], pt)
         return feat + rel, {**extra, **rel_extra}
+    if arm == "C2M_chcwd":
+        # Channel CWD (per-patch softmax over channels) + 2cos on RAW
+        # aggregator tokens + deployed rel-pose. tau=0.5 hardcoded.
+        tau = 0.5
+        total = 0.0
+        for layer in TAP_LAYERS:
+            hs = M.to_patch(feats24_s[layer].float())
+            ht = M.to_patch(teacher_cache["feats"][layer][:, STUDENT_INDICES].float())
+            log_ps = torch.nn.functional.log_softmax(hs / tau, dim=-1)
+            log_pt = torch.nn.functional.log_softmax(ht.detach() / tau, dim=-1)
+            kl = (log_pt.exp() * (log_pt - log_ps)).sum(dim=-1)
+            cosv = torch.nn.functional.cosine_similarity(hs, ht, dim=-1).mean()
+            total = total + (tau ** 2) * kl.mean() + 2.0 * (1.0 - cosv)
+        feat = total / len(TAP_LAYERS)
+        pt = teacher_cache["pose_enc8"][:, STUDENT_INDICES].float()
+        rel, rel_extra = loss_pose_rel(preds["pose_enc"], pt)
+        return feat + rel, {**rel_extra}
+    if arm == "C2M_chcwd_ln":
+        # Channel CWD + 2cos on LAYER-NORMED aggregator tokens + rel-pose
+        tau = 0.5
+        total = 0.0
+        for layer in TAP_LAYERS:
+            hs = M.to_norm(base.depth_head, M.to_patch(feats24_s[layer].float()))
+            ht = M.to_norm(base.depth_head,
+                           M.to_patch(teacher_cache["feats"][layer][:, STUDENT_INDICES].float()))
+            log_ps = torch.nn.functional.log_softmax(hs / tau, dim=-1)
+            log_pt = torch.nn.functional.log_softmax(ht.detach() / tau, dim=-1)
+            kl = (log_pt.exp() * (log_pt - log_ps)).sum(dim=-1)
+            cosv = torch.nn.functional.cosine_similarity(hs, ht, dim=-1).mean()
+            total = total + (tau ** 2) * kl.mean() + 2.0 * (1.0 - cosv)
+        feat = total / len(TAP_LAYERS)
+        pt = teacher_cache["pose_enc8"][:, STUDENT_INDICES].float()
+        rel, rel_extra = loss_pose_rel(preds["pose_enc"], pt)
+        return feat + rel, {**rel_extra}
     if arm == "C2M_rawrel":
         # raw-space patch distill (no LN, no conf; identical form to the DA3
         # --half_mode vggt port) + the SAME deployed rel-pose term
@@ -3392,7 +3426,7 @@ def main():
                     torch.manual_seed(stable_seed("cf_rng", scene, epoch, pi, args.seed))
                     pmask = None
                     images4_in = images4
-                    if arm in ("B5_maskdistill", "C2M_maskrel", "C2M_rawrel", "MD25", "MD75", "CONFD",
+                    if arm in ("B5_maskdistill", "C2M_maskrel", "C2M_rawrel", "C2M_chcwd", "C2M_chcwd_ln", "MD25", "MD75", "CONFD",
                                "C2M_CamRel", "CONFD_REL", "B5_CTK", "C2M_CTK", "C2M_REL10", "C2M_REL2", "C2M_TRIP", "C2M_TRIF", "C2M_TRIF2", "C2M_TRIF3", "C2M_HARD", "C2M_SCL", "C2M_CYC", "C2M_CONFP", "C2M_GATE", "C2M_ABS", "C2M_ABS_REL", "C2M_ABSR", "C2M_ABSW1", "C2M_ABSR5", "C2M_RELAT", "C2M_RABS1", "C2M_RABS5", "C2M_RABS3", "C2M_XSH", "C2M_XSHA", "C2M_XAC", "C2M_XAC2", "C2M_XSH1", "C2M_XSHS", "C2M_XSH1S", "C2M_NREL", "C2M_RKD15", "C2M_RKDC", "C2M_RKDS", "C2M_XEXT", "C2M_RKDC1", "C2M_RKDC1R", "C2M_RKDC1A", "C2M_RKDC1H", "C2M_RKDCR1H", "C2M_RKDC1HC", "C2M_ADAPTIVE", "C2M_maskrel_CTK", "C2M_RKDC2", "C2M_RKDC3", "C2M_RELC", "C2M_RKLH", "C2M_RELCH", "C2M_RKCX", "C2M_RKDCX", "C2M_RKDT16", "C2M_RKDCX3", "C2M_XAP", "C2M_RKDCL", "C2M_TGM"):
                         ratio = {"B5_maskdistill": 0.5, "C2M_maskrel": 0.5, "C2M_rawrel": 0.5, "CONFD": 0.5,
                                  "C2M_CamRel": 0.5, "CONFD_REL": 0.5, "B5_CTK": 0.5,
